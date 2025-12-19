@@ -1,0 +1,12 @@
+# --- Verified Environment (Python 3.9+) ---
+# Implementation of DL methods
+tensorflow>=2.15.0
+
+# Required for dynamic programming and markov chain
+quantecon==0.10.1
+
+# Core numerical and data tools
+numpy>=1.24.0
+scipy>=1.11.0
+pandas>=2.1.0
+matplotlib>=3.8.0
