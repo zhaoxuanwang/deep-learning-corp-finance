@@ -1,0 +1,20 @@
+# --- Project Specific Exclusions ---
+archive/
+.venv/
+.DS_Store
+
+# --- Python Standard Exclusions ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# --- IDE Settings ---
+.idea/
+.vscode/
+*.swp
+
+# --- Data & Results ---
+*.npz
+*.csv
+*.png
