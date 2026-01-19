@@ -3,7 +3,8 @@ import tensorflow as tf
 import numpy as np
 
 # Adjust imports to match your folder structure
-from src.ddp.utils import ModelParameters
+from src.economy.parameters import EconomicParams
+from src.ddp import DDPGridConfig
 from src.ddp.ddp_investment import InvestmentModelDDP
 
 
@@ -13,11 +14,9 @@ def model_ddp():
     Standard fixture for creating a DDP model instance.
     Uses a small grid to keep tests fast.
     """
-    params = ModelParameters(
-        z_size=5,
-        k_size=10,
-    )
-    return InvestmentModelDDP(params)
+    params = EconomicParams()
+    grid_config = DDPGridConfig(z_size=5, k_size=10)
+    return InvestmentModelDDP(params, grid_config)
 
 
 def test_initialization_shapes(model_ddp):
@@ -45,15 +44,13 @@ def test_reward_values_no_costs():
     """
     # Create a minimal model with no costs and full depreciation
     # If delta=1.0, then Investment I = k_next - (1-1)*k = k_next
-    params = ModelParameters(
-        k_size=5,
-        z_size=2,
+    params = EconomicParams(
         cost_fixed=0.0,
         cost_convex=0.0,
         delta=1.0,
-        grid_type="log_linear"
     )
-    model = InvestmentModelDDP(params)
+    grid_config = DDPGridConfig(k_size=5, z_size=2, grid_type="log_linear")
+    model = InvestmentModelDDP(params, grid_config)
 
     # Extract values
     z = model.z_grid[0]

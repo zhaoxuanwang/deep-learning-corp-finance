@@ -11,13 +11,11 @@ from typing import Tuple
 
 import tensorflow as tf
 
-from src.ddp.utils import (
-    ModelParameters,
-    convert_to_tf,
-    generate_bond_grid,
-    generate_capital_grid,
-    initialize_markov_process,
-)
+from src.economy.parameters import EconomicParams, convert_to_tf
+from src.ddp.ddp_config import DDPGridConfig
+from src.economy.shocks import initialize_markov_process
+from src.economy import logic
+from typing import Optional
 
 
 class DebtModelDDP:
@@ -38,7 +36,8 @@ class DebtModelDDP:
         4. Scalability: Uses tf.map_fn to handle large Z-grids without OOM errors.
 
     Attributes:
-        params (ModelParameters): Container for economic parameters.
+        params (EconomicParams): Container for economic parameters.
+        grid_config (DDPGridConfig): Grid discretization settings.
         beta (tf.Tensor): Discount factor.
         z_grid (tf.Tensor): Productivity grid (nz,).
         prob_matrix (tf.Tensor): Transition probability matrix (nz, nz).
@@ -50,20 +49,26 @@ class DebtModelDDP:
         static_flows (tf.Tensor): Precomputed 5D tensor of cash flows invariant to bond prices.
     """
 
-    def __init__(self, params: ModelParameters):
+    def __init__(
+        self, 
+        params: EconomicParams, 
+        grid_config: Optional[DDPGridConfig] = None
+    ):
         """
         Initialize the model, grids, and precompute static cash flows.
 
         Args:
-            params (ModelParameters): The economic parameters and grid settings.
+            params (EconomicParams): The economic parameters.
+            grid_config (DDPGridConfig): Grid settings (uses defaults if None).
         """
         self.params = params
+        self.grid_config = grid_config or DDPGridConfig()
         self.beta = tf.constant(1 / (1 + params.r_rate), dtype=tf.float32)
 
-        # --- 1. Import Raw Data ---
-        z_grid_np, prob_matrix_np = initialize_markov_process(params)
-        k_grid_np = generate_capital_grid(params)
-        b_grid_np = generate_bond_grid(
+        # --- 1. Generate Grids ---
+        z_grid_np, prob_matrix_np = initialize_markov_process(params, self.grid_config.z_size)
+        k_grid_np = self.grid_config.generate_capital_grid(params)
+        b_grid_np = self.grid_config.generate_bond_grid(
             params,
             k_max=k_grid_np.max(),
             z_max=z_grid_np.max()
@@ -75,14 +80,11 @@ class DebtModelDDP:
         )
 
         # --- 3. Store Dimensions ---
-        self.nz = params.z_size
+        self.nz = self.grid_config.z_size
         self.nk = len(k_grid_np)
-        self.nb = params.b_size
+        self.nb = self.grid_config.b_size
 
         # --- 4. Precompute Static Flows ---
-        # We calculate profits, investment costs, and old debt repayments only ONCE here.
-        # This prevents re-calculating them inside the bond price equilibrium loop.
-        # Note: No @tf.function used here to avoid unnecessary tracing during init.
         self.static_flows = self._build_static_cash_flows()
 
     def _build_static_cash_flows(self) -> tf.Tensor:
@@ -108,28 +110,21 @@ class DebtModelDDP:
 
         # 1. Investment and Adjustment Costs (z-invariant)
         # Shape: (nk, nk, 1, 1)
-        investment = k_next - (1 - params.delta) * k_curr
-        k_safe = tf.maximum(k_curr, 1e-6)
-
-        adj_convex = (params.cost_convex / 2) * (investment ** 2) / k_safe
-        inv_nonzero = tf.cast(tf.abs(investment) > 1e-6, tf.float32)
-        adj_fixed = params.cost_fixed * k_safe * inv_nonzero
-
-        total_inv_cost = investment + adj_convex + adj_fixed
+        investment = logic.compute_investment(k_curr, k_next, params)
+        adj_costs = logic.adjustment_costs(k_curr, k_next, params)
 
         # Define function to process a single Z
         def process_z_static(z_val):
             """Calculates the (nk, nk, nb, nb) static cash flow matrix for a given z scalar."""
             # 1. Operating Profit: Broadcasts to (nk, 1, 1, 1)
-            profit = (1 - params.tax) * z_val * (k_curr ** params.theta)
+            profit = logic.production_function(k_curr, z_val, params)
 
             # 2. Tax Shield (Face Value portion): Broadcasts to (1, 1, 1, nb)
             tax_shield_static = (params.tax * b_next) / (1 + params.r_rate)
 
-            # 3. Combine Components
-            # The calculation relies on broadcasting 4D tensors against each other:
-            # Profit(nk,...) - Cost(nk,nk,...) - b_curr(...,nb,...) + Shield(...,nb)
-            return profit - total_inv_cost - b_curr + tax_shield_static
+            # 3. Combine Components (Profit - Inv - Costs - Repay + Shield)
+            # Note: We calculate 'Cash Flow' excluding the NEW DEBT term (which depends on price)
+            return (1 - params.tax) * profit - investment - adj_costs - b_curr + tax_shield_static
 
         # Execute map_fn to iterate over the productivity grid (z_grid)
         # This replaces the Python loop, processing slices in parallel if possible.
@@ -209,15 +204,9 @@ class DebtModelDDP:
             dividends = div_static + financing_flow
 
             # D. Apply Equity Injection Costs
-            # If Dividends < 0, shareholders must inject cash + pay friction costs.
-            is_negative = tf.cast(dividends < 0, tf.float32)
-
-            # Cost = Fixed * k_curr + Linear * |Div|
-            # k_safe broadcasts from (nk, 1, 1, 1) to match is_negative (nk, nk, nb, nb)
-            injection_cost = is_negative * (
-                    params.cost_inject_fixed * k_safe
-                    + params.cost_inject_linear * tf.abs(dividends)
-            )
+            # Use shared logic: Cost = is_negative * (Fixed + Linear*|div|)
+            # NOTE: external_financing_cost follows outline_v2.md (η₀ + η₁|e|, no k scaling)
+            injection_cost = logic.external_financing_cost(dividends, params)
 
             return dividends - injection_cost
 
@@ -327,35 +316,26 @@ class DebtModelDDP:
         # Complementary probability: 1 - is_default
         is_solvent = tf.math.subtract(1.0, is_default)
 
-        # 2. Calculate Recovery Value R(z', k')
-        z_next = tf.reshape(self.z_grid, [self.nz, 1])
-        k_next = tf.reshape(self.k_grid, [1, self.nk])
-
-        profit_next = z_next * (k_next ** params.theta)
-
-        # Recover value (R in equation 3.27)
-        recover_next = (1 - params.cost_default) * (
-            (1 - params.tax) * profit_next + (1 - params.delta) * k_next
-        )
-
-        # Recovery cannot be negative
-        recover_non_neg = tf.maximum(recover_next, 0.0)
-
-        # Broadcast to match V shape (nz, nk, nb)
-        recover_broad = tf.reshape(recover_non_neg, [self.nz, self.nk, 1])
-
-        # 3. Lender Payoff
+        # 2. Calculate Lender Payoff (Solvent vs Default)
+        # is_default tells us which regime we are in.
+        
+        # We need to broadcast z_next and k_next for the payoff function
+        # z_grid: (nz,) -> (nz, 1, 1)
+        z_next_broad = tf.reshape(self.z_grid, [self.nz, 1, 1])
+        # k_grid: (nk,) -> (1, nk, 1) 
+        k_next_broad = tf.reshape(self.k_grid, [1, self.nk, 1])
+        # b_grid: (nb,) -> (1, 1, self.nb)
         b_next_broad = tf.reshape(self.b_grid, [1, 1, self.nb])
-
-        # Important Guardrail:
-        # If b' > 0 (Debt), lender gets min(recover, debt)
-        # If b' < 0 (Saving), lender (the firm itself) gets min(recover, saving)
-        # Since saving < 0 and recovery > 0, this correctly returns savings (full repayment).
-        recover_safe = tf.minimum(recover_broad, b_next_broad)
-
-        # Payoff = Solvent * FaceValue + Default * Recovery
-        # This 3D array represents payoff for all future triplets (z', k', b')
-        future_payoff = (is_solvent * b_next_broad) + (is_default * recover_safe)
+        
+        # Calculate Payoff using shared logic
+        # Note: logic.compute_lender_payoff handles Recovery, Min(Rec, Debt), and Smoothing
+        future_payoff = logic.compute_lender_payoff(
+            k_next_broad, 
+            b_next_broad, 
+            z_next_broad, 
+            is_default, 
+            params
+        )
 
         # 4. Expectation & Discounting
         # E[Payoff | z] = ProbMatrix @ FuturePayoff

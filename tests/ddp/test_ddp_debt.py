@@ -5,7 +5,8 @@ import dataclasses
 
 # Import key models
 from src.ddp.ddp_debt import DebtModelDDP
-from src.ddp.utils import ModelParameters, generate_bond_grid
+from src.ddp import DDPGridConfig
+from src.economy.parameters import EconomicParams
 
 
 def test_generate_bond_grid_refined():
@@ -14,21 +15,21 @@ def test_generate_bond_grid_refined():
     and components (collateral, tax shield, profit).
     """
     # 1. SETUP: Define parameters explicitly
-    params = ModelParameters(
-        b_size=5,
+    params = EconomicParams(
         r_rate=0.05,
         delta=0.1,
         theta=0.5,
         tax=0.2,
         frac_liquid=0.9
     )
+    grid_config = DDPGridConfig(b_size=5)
 
     # Define Economy Scale
     k_max = 100.0
     z_max = 2.0
 
     # 2. EXECUTE
-    b_grid = generate_bond_grid(params, k_max, z_max)
+    b_grid = grid_config.generate_bond_grid(params, k_max, z_max)
 
     # 3. VERIFY: LOWER BOUND (Savings)
     # Formula: b_min = -1.5 * k_max
@@ -62,7 +63,7 @@ def test_generate_bond_grid_refined():
         f"Upper Bound (Max Debt) incorrect. Expected {expected_b_max}, Got {b_grid[-1]}"
 
     # 5. VERIFY: Structure
-    assert len(b_grid) == params.b_size
+    assert len(b_grid) == grid_config.b_size
     assert np.all(np.diff(b_grid) > 0), "Grid must be strictly increasing"
 
 
@@ -73,14 +74,9 @@ def model_debt():
     Standard fixture for creating a DebtModelDDP instance.
     Uses small grids for speed, but real parameters.
     """
-    params = ModelParameters(
-        z_size=2,
-        k_size=5,
-        b_size=4,
-        r_rate=0.04,
-        grid_type="log_linear"
-    )
-    return DebtModelDDP(params)
+    params = EconomicParams(r_rate=0.04)
+    grid_config = DDPGridConfig(z_size=2, k_size=5, b_size=4, grid_type="log_linear")
+    return DebtModelDDP(params, grid_config)
 
 
 # --- 2. INITIALIZATION TESTS ---
@@ -113,15 +109,16 @@ def test_initialization_dynamic_grid_size():
     Verifies that self.nk correctly adapts when 'delta_rule' generates
     a different number of grid points than requested.
     """
+    params = EconomicParams()
+    
     # Case A: Log Linear (Fixed Request)
-    params_fixed = ModelParameters(k_size=10, grid_type="log_linear")
-    model_fixed = DebtModelDDP(params_fixed)
+    grid_fixed = DDPGridConfig(k_size=10, grid_type="log_linear")
+    model_fixed = DebtModelDDP(params, grid_fixed)
     assert model_fixed.nk == 10, "Log_linear should preserve requested k_size"
 
     # Case B: Delta Rule (Dynamic Request)
-    # We create a specific params where we know delta_rule might shift the count
-    params_dynamic = ModelParameters(k_size=10, grid_type="delta_rule")
-    model_dynamic = DebtModelDDP(params_dynamic)
+    grid_dynamic = DDPGridConfig(k_size=10, grid_type="delta_rule")
+    model_dynamic = DebtModelDDP(params, grid_dynamic)
 
     actual_tensor_len = model_dynamic.k_grid.shape[0]
 
@@ -312,7 +309,7 @@ def test_equity_issuance_cost_trigger(model_debt):
 
     # Re-initialize the model with these cheap parameters
     # (Since grids depend on params, it's safer to make a fresh instance)
-    model_cheap = DebtModelDDP(params_no_cost)
+    model_cheap = DebtModelDDP(params_no_cost, model_debt.grid_config)
 
     rewards_no_cost = model_cheap._compute_reward_matrix(q_mock)
     reward_no_cost = rewards_no_cost[cell_idx]

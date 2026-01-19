@@ -25,7 +25,8 @@ def run_parameter_sweep(
     base_params: Any,
     scenarios: Dict[str, Dict[str, float]],
     solver_method: str = "solve",
-    solver_kwargs: Optional[Dict[str, Any]] = None
+    solver_kwargs: Optional[Dict[str, Any]] = None,
+    base_grid_config: Optional[Any] = None
 ) -> Dict[str, Any]:
     """
     Executes a batch of scenarios (parameter sweep) for a given economic model.
@@ -40,6 +41,7 @@ def run_parameter_sweep(
             are dictionaries of parameter overrides (e.g., {"tax": 0.40}).
         solver_method (str): The name of the method to call on the model instance.
         solver_kwargs (Dict, optional): Additional arguments passed to the solver.
+        base_grid_config (Any, optional): Grid config for DDP models (DDPGridConfig).
 
     Returns:
         Dict[str, Any]: Raw simulation results containing:
@@ -69,7 +71,10 @@ def run_parameter_sweep(
         scenario_params = replace(base_params, **param_overrides)
 
         # 2. Instantiate Model
-        model = model_class(scenario_params)
+        if base_grid_config is not None:
+            model = model_class(scenario_params, base_grid_config)
+        else:
+            model = model_class(scenario_params)
 
         # 3. Solve (Reflection)
         if not hasattr(model, solver_method):

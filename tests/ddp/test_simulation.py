@@ -17,8 +17,8 @@ from typing import Literal
 # Ensure src is in path
 sys.path.append(os.path.abspath('..'))
 
-from src.ddp import simulation
-from src.ddp.utils import ModelParameters
+from src.ddp import simulation, DDPGridConfig
+from src.economy.parameters import EconomicParams
 from src.ddp.ddp_investment import InvestmentModelDDP
 from src.ddp.ddp_debt import DebtModelDDP
 
@@ -38,12 +38,8 @@ def test_investment_pipeline_consistency(
     input_n_k = 40
     scenario_name = f"Test-{grid_type}"
 
-    params = ModelParameters(
-        r_rate=0.04, delta=0.06, theta=0.65, sigma=0.15,
-        z_size=input_n_z,
-        k_size=input_n_k,
-        grid_type=grid_type
-    )
+    params = EconomicParams(r_rate=0.04, delta=0.06, theta=0.65, sigma=0.15)
+    grid_config = DDPGridConfig(z_size=input_n_z, k_size=input_n_k, grid_type=grid_type)
 
     # 2. Action: Run the Pipeline (Sweep -> Process)
     # Step A: Run Sweep (Returns Raw Tensors)
@@ -52,7 +48,8 @@ def test_investment_pipeline_consistency(
         base_params=params,
         scenarios={scenario_name: {}},  # Empty dict means no overrides
         solver_method="solve_invest_vfi",
-        solver_kwargs={"max_iter": 50}  # Reduced iters for speed
+        solver_kwargs={"max_iter": 50},  # Reduced iters for speed
+        base_grid_config=grid_config
     )
 
     # Step B: Process Output (Returns Clean NumPy)
@@ -112,12 +109,8 @@ def test_debt_pipeline_broadcasting(
     input_n_b = 10
     scenario_name = f"Debt-Test-{grid_type}"
 
-    params = ModelParameters(
-        z_size=input_n_z,
-        k_size=input_n_k,
-        b_size=input_n_b,
-        grid_type=grid_type  # Testing all types
-    )
+    params = EconomicParams()
+    grid_config = DDPGridConfig(z_size=input_n_z, k_size=input_n_k, b_size=input_n_b, grid_type=grid_type)
 
     # 2. Action: Run Pipeline
     raw_res = simulation.run_parameter_sweep(
@@ -125,7 +118,8 @@ def test_debt_pipeline_broadcasting(
         base_params=params,
         scenarios={scenario_name: {}},
         solver_method="solve_risky_debt_vfi",
-        solver_kwargs={"max_iter": 5}
+        solver_kwargs={"max_iter": 5},
+        base_grid_config=grid_config
     )
 
     clean_res = simulation.process_debt_output(raw_res)

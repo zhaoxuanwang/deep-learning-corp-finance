@@ -10,12 +10,11 @@ from typing import Tuple
 
 import tensorflow as tf
 
-from src.ddp.utils import (
-    ModelParameters,
-    convert_to_tf,
-    generate_capital_grid,
-    initialize_markov_process,
-)
+from src.economy.parameters import EconomicParams, convert_to_tf
+from src.ddp.ddp_config import DDPGridConfig
+from src.economy.shocks import initialize_markov_process
+from src.economy import logic
+from typing import Optional
 
 
 class InvestmentModelDDP:
@@ -25,7 +24,8 @@ class InvestmentModelDDP:
     accelerated by TensorFlow.
 
     Attributes:
-        params (ModelParameters): The economic configuration.
+        params (EconomicParams): The economic configuration.
+        grid_config (DDPGridConfig): Grid discretization settings.
         beta (tf.Tensor): Discount factor.
         z_grid (tf.Tensor): Productivity state grid (nz,).
         prob_matrix (tf.Tensor): Transition probability matrix (nz, nz).
@@ -35,19 +35,25 @@ class InvestmentModelDDP:
         reward_matrix (tf.Tensor): Precomputed payoff matrix of shape (nz, nk, nk).
     """
 
-    def __init__(self, params: ModelParameters):
+    def __init__(
+        self, 
+        params: EconomicParams, 
+        grid_config: Optional[DDPGridConfig] = None
+    ):
         """
         Initializes the model, generates grids, and precomputes rewards.
 
         Args:
-            params (ModelParameters): The model configuration object.
+            params (EconomicParams): The economic parameters.
+            grid_config (DDPGridConfig): Grid settings (uses defaults if None).
         """
         self.params = params
+        self.grid_config = grid_config or DDPGridConfig()
         self.beta = tf.constant(1 / (1 + params.r_rate), dtype=tf.float32)
 
-        # Import Raw Data (NumPy)
-        z_grid_np, prob_matrix_np = initialize_markov_process(params)
-        k_grid_np = generate_capital_grid(params)
+        # Generate grids using grid_config
+        z_grid_np, prob_matrix_np = initialize_markov_process(params, self.grid_config.z_size)
+        k_grid_np = self.grid_config.generate_capital_grid(params)
 
         # Convert to TensorFlow Constants
         self.z_grid, self.prob_matrix, self.k_grid = convert_to_tf(
@@ -55,8 +61,8 @@ class InvestmentModelDDP:
         )
 
         # Store dimensions
-        self.nz = params.z_size
-        self.nk = len(k_grid_np)  # Use actual length (important for Delta Rule)
+        self.nz = self.grid_config.z_size
+        self.nk = len(k_grid_np)
 
         # Precompute the Reward Matrix
         self.reward_matrix = self._compute_reward_matrix()
@@ -83,25 +89,16 @@ class InvestmentModelDDP:
         k_next_mesh = tf.reshape(self.k_grid, [1, 1, self.nk])
 
         # --- Economic Logic ---
-
-        # Investment: I = k' - (1 - delta) * k
-        investment = k_next_mesh - (1 - self.params.delta) * k_mesh
-
-        # Profit: pi = z * k^theta
-        profit = z_mesh * (k_mesh ** self.params.theta)
-
-        # Adjustment Costs
-        # Avoid division of zero capital
-        safe_k = tf.maximum(k_mesh, 1e-8)
-
-        # Boolean mask: cost is paid only if investment is non-zero
-        inv_nonzero = tf.cast(tf.abs(investment) > 1e-8, tf.float32)
-
-        adj_convex = (self.params.cost_convex / 2) * (investment ** 2) / safe_k
-        adj_fixed = self.params.cost_fixed * safe_k * inv_nonzero
-
-        # Total Payoff
-        net_cash_flow = profit - investment - adj_convex - adj_fixed
+        
+        # 1. Calculate Reward Components using shared 'logic' module
+        # Note: logic functions support broadcasting.
+        # k_mesh: (1, nk, 1) -> Current K
+        # k_next_mesh: (1, 1, nk) -> Next K
+        # z_mesh: (nz, 1, 1) -> Current Z
+        
+        # We can directly use the compute_cash_flow_basic function which wraps
+        # Profit - I - Costs
+        net_cash_flow = logic.compute_cash_flow_basic(k_mesh, k_next_mesh, z_mesh, self.params)
 
         return net_cash_flow
 
