@@ -1,25 +1,57 @@
-# Deep Learning Applications in Structural Corporate Finance Models
+# Deep Learning for Structural Corporate Finance Models
 
-This repository contains the implementation of deep learning methods for structural corporate finance models, based on the work of **Strebulaev (2012)** and **Maliar et al. (2021)**.
+This repository develops a Python and Tensorflow codebase for solving and estimating structural corporate finance models using deep learning, method of moments, Bayesian estimation methods, and discrete dynamic programming. The project is under active development.
 
-## Project Overview
-This project is divided into several key components:
-1. **Literature Survey:** Providing a brief review and discussion of the dynamic models in optimal investment and financing problems, and applying standard methods as solutions (e.g., discrete state value function iteration).
-2. **Deep Learning Application:** Implementing the Maliar et al. (2021) method that uses deep learning to solve for the dynamic programming problems in corporate finance.
-3. **Structural Estimation:** Implementing and comparing Generalized Method of Moments (GMM) and Simulated Method of Moments (SMM) for model estimation.
-4. **Extensions:** Bayesian estimation using MCMC, validation tests, and implementation in real-world datasets.
+## Goals
 
-## Roadmap & Status
-- [ ] **Part 1:** Python and TensorFlow implementation of the optimal investment problem and Maliar method (In Progress).
-- [ ] **Part 2:** Structural estimation based on GMM, SMM, and effectiveness tests.
-- [ ] **Extension 1:** Bayesian estimation using Hamiltonian Monte Carlo with filtering.
-- [ ] **Extension 2:** Empirical implementation of Cronqvist et al. (2024).
-- [ ] **Extension 3:** Empirical implementation of Nikolov et al. (2021) with real-world datasets.
+- Implementation of deep learning methods for dynamic economic models
+  - Lifetime Reward Maximization, Bellman Equation Residual Minimization
+  - Complete suite of tests and evaluations
+  - Benchmarked against conventional dynamic programming methods
+- Quantify the optimal capital structure and leverage level of a firm
+- Identify key model parameters
+- Extension to other model variants in corporate finance and economics
 
-## Key Technical Components
-* **Framework:** Python 3, TensorFlow
-* **Libraries:** NumPy, Pandas, Matplotlib, QuantEcon
-* **Methods:** Deep Learning, GMM, SMM, Bayesian estimation
+## Core Modules
 
-## How to Run
-*(Instructions will be provided upon final submission)*
+- **Model**: core economic logics, shocks, constraints, and simulation
+- **Deep learning solver**: train neural networks to approximate policy/value objects with constraint handling and stable optimization
+- **Structural estimation**: implement Generalized Method of Moments (GMM) and Simulated Method of Moments (SMM) to identify key model parameters
+- **Evaluation**: quantify accuracy, effectiveness, and robustness across different methods
+- **Extensions**: Bayesian estimation with TensorFlow Probability and additional model variants
+
+## Requirements
+- Python 3.x
+- TensorFlow 2.x
+- TensorFlow Probability
+
+## Install:
+`pip install -r requirements.txt`
+
+## Tests:
+`pytest -q`
+
+## Repository structure
+
+```
+├── experiments/                 # runnable experiments
+├── paper/                       # reports and references
+├── src/                         # core library code
+│   ├── dnn/                     # deep neural network solvers
+│   ├── ddp/                     # discrete dynamic programming solvers
+│   └── economy/                 # economic model logic
+├── tests/                       # unit and integration tests
+├── requirements.txt             # dependencies
+└── pytest.ini                   # pytest configuration
+```
+
+## References
+Cronqvist, H., Ladika, T., Pazaj, E., Sautner, Z., 2024. Limited attention to detail in financial markets: Evidence from reduced-form and structural estimation. Journal of Financial Economics 154, 103811. https://doi.org/10.1016/j.jfineco.2024.103811
+
+DeAngelo, H., 2022. The Capital Structure Puzzle: What Are We Missing? J. Financ. Quant. Anal. 57, 413–454. https://doi.org/10.1017/S002210902100079X
+
+Maliar, L., Maliar, S., Winant, P., 2021. Deep learning for solving dynamic economic models. Journal of Monetary Economics 122, 76–101. https://doi.org/10.1016/j.jmoneco.2021.07.004
+
+Nikolov, B., Schmid, L., Steri, R., 2021. The Sources of Financing Constraints. Journal of Financial Economics 139, 478–501. https://doi.org/10.1016/j.jfineco.2020.07.018
+
+Strebulaev, I.A., Whited, T.M., 2012. Dynamic Models and Structural Estimation in Corporate Finance. Foundations and trends in finance.
