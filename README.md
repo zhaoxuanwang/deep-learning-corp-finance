@@ -1,4 +1,4 @@
-# Deep Learning for Structural Corporate Finance Models
+# Deep Learning for Corporate Finance
 
 This repository develops a Python and Tensorflow codebase for solving and estimating structural corporate finance models using deep learning, method of moments, Bayesian estimation methods, and discrete dynamic programming. The project is under active development.
 
