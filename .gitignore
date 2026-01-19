@@ -1,5 +1,6 @@
 # --- Project Specific Exclusions ---
 archive/
+notebooks/
 .venv/
 .DS_Store
 
