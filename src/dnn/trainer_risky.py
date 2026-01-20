@@ -29,7 +29,7 @@ from src.dnn.losses import (
     compute_critic_objective,
     compute_actor_objective
 )
-from src.dnn.default_smoothing import DefaultSmoothingSchedule
+from src.dnn.annealing import AnnealingSchedule, smooth_default_prob
 from src.dnn.sampling import ReplayBuffer, draw_shocks, step_ar1_tf
 from src.economy.logic import (
     cash_flow_risky_debt,
@@ -112,7 +112,7 @@ class RiskyDebtTrainerLR:
         T: int = 32,
         batch_size: int = 128,
         lambda_price: float = 1.0,
-        smoothing: Optional[DefaultSmoothingSchedule] = None,
+        smoothing: Optional[AnnealingSchedule] = None,
         seed: Optional[int] = None
     ):
         self.policy_net = policy_net
@@ -123,7 +123,7 @@ class RiskyDebtTrainerLR:
         self.T = T
         self.batch_size = batch_size
         self.lambda_price = lambda_price
-        self.smoothing = smoothing or DefaultSmoothingSchedule()
+        self.smoothing = smoothing or AnnealingSchedule(init=0.1, min=1e-4, decay=0.99)
         self._rng = np.random.default_rng(seed)
         
         self.beta = 1.0 / (1.0 + params.r_rate)
@@ -142,7 +142,8 @@ class RiskyDebtTrainerLR:
         self,
         k_init: tf.Tensor,
         b_init: tf.Tensor,
-        z_init: tf.Tensor
+        z_init: tf.Tensor,
+        temperature: float = 0.1
     ) -> Dict[str, float]:
         """
         Perform one training step.
@@ -169,8 +170,10 @@ class RiskyDebtTrainerLR:
                 r_tilde = self.price_net(k_next, b_next, z)
                 
                 # Cash flow - delegated to economy
-                e = cash_flow_risky_debt(k, k_next, b, b_next, z, r_tilde, self.params)
-                eta = external_financing_cost(e, self.params)
+                e = cash_flow_risky_debt(
+                    k, k_next, b, b_next, z, r_tilde, self.params, temperature=temperature
+                )
+                eta = external_financing_cost(e, self.params, temperature=temperature)
                 utility = e - eta
                 utilities_list.append(utility)
                 
@@ -201,8 +204,8 @@ class RiskyDebtTrainerLR:
             if self._value_net is not None:
                 V_tilde_1 = self._value_net(k_next_term, b_next_term, z_next_1)
                 V_tilde_2 = self._value_net(k_next_term, b_next_term, z_next_2)
-                p_D_1 = self.smoothing.compute_default_prob(V_tilde_1)
-                p_D_2 = self.smoothing.compute_default_prob(V_tilde_2)
+                p_D_1 = smooth_default_prob(V_tilde_1, self.smoothing)
+                p_D_2 = smooth_default_prob(V_tilde_2, self.smoothing)
             else:
                 # Fall back to zero default probability if no value net
                 p_D_1 = tf.zeros_like(k_next_term)
@@ -299,7 +302,7 @@ class RiskyDebtTrainerBR:
         lambda_1: float = 1.0,
         lambda_2: float = 1.0,
         n_critic_steps: int = 1,
-        smoothing: Optional[DefaultSmoothingSchedule] = None,
+        smoothing: Optional[AnnealingSchedule] = None,
         seed: Optional[int] = None,
         leaky_actor: bool = False,
         collect_diagnostics: bool = False
@@ -314,7 +317,7 @@ class RiskyDebtTrainerBR:
         self.lambda_1 = lambda_1
         self.lambda_2 = lambda_2
         self.n_critic_steps = n_critic_steps
-        self.smoothing = smoothing or DefaultSmoothingSchedule()
+        self.smoothing = smoothing or AnnealingSchedule(init=0.1, min=1e-4, decay=0.99)
         self._rng = np.random.default_rng(seed)
         
         self.beta = 1.0 / (1.0 + params.r_rate)
@@ -334,7 +337,8 @@ class RiskyDebtTrainerBR:
         self,
         k: tf.Tensor,
         b: tf.Tensor,
-        z: tf.Tensor
+        z: tf.Tensor,
+        temperature: float = 0.1
     ) -> Tuple[tf.Tensor, tf.Tensor]:
         """
         Perform one critic/price update.
@@ -359,9 +363,9 @@ class RiskyDebtTrainerBR:
             
             # Cash flow (uses detached policy outputs) - delegated to economy
             e = cash_flow_risky_debt(
-                k, k_next_sg, b, b_next_sg, z, r_tilde, self.params
+                k, k_next_sg, b, b_next_sg, z, r_tilde, self.params, temperature=temperature
             )
-            eta = external_financing_cost(e, self.params)
+            eta = external_financing_cost(e, self.params, temperature=temperature)
             
             # Two z' draws
             z_next_1, z_next_2 = draw_shocks(
@@ -392,8 +396,8 @@ class RiskyDebtTrainerBR:
             
             # --- Price Loss ---
             # Default probabilities
-            p_D_1 = self.smoothing.compute_default_prob(V_tilde_next_1)
-            p_D_2 = self.smoothing.compute_default_prob(V_tilde_next_2)
+            p_D_1 = smooth_default_prob(V_tilde_next_1, self.smoothing)
+            p_D_2 = smooth_default_prob(V_tilde_next_2, self.smoothing)
             
             # Recovery - delegated to economy
             R_1 = recovery_value(k_next_sg, z_next_1, self.params)
@@ -425,7 +429,8 @@ class RiskyDebtTrainerBR:
         self,
         k: tf.Tensor,
         b: tf.Tensor,
-        z: tf.Tensor
+        z: tf.Tensor,
+        temperature: float = 0.1
     ) -> Tuple[tf.Tensor, tf.Tensor, Optional[TrainingDiagnostics]]:
         """
         Perform one actor update.
@@ -449,9 +454,9 @@ class RiskyDebtTrainerBR:
             
             # Cash flow - delegated to economy
             e = cash_flow_risky_debt(
-                k, k_next, b, b_next, z, r_tilde, self.params
+                k, k_next, b, b_next, z, r_tilde, self.params, temperature=temperature
             )
-            eta = external_financing_cost(e, self.params)
+            eta = external_financing_cost(e, self.params, temperature=temperature)
             
             # Two z' draws
             z_next_1, z_next_2 = draw_shocks(
@@ -471,8 +476,8 @@ class RiskyDebtTrainerBR:
             )
             
             # --- Price Loss ---
-            p_D_1 = self.smoothing.compute_default_prob(V_tilde_next_1)
-            p_D_2 = self.smoothing.compute_default_prob(V_tilde_next_2)
+            p_D_1 = smooth_default_prob(V_tilde_next_1, self.smoothing)
+            p_D_2 = smooth_default_prob(V_tilde_next_2, self.smoothing)
             
             # Recovery - delegated to economy
             R_1 = recovery_value(k_next, z_next_1, self.params)
@@ -527,7 +532,8 @@ class RiskyDebtTrainerBR:
         k: tf.Tensor,
         b: tf.Tensor,
         z: tf.Tensor,
-        update_smoothing: bool = True
+        update_smoothing: bool = True,
+        temperature: float = 0.1
     ) -> Dict[str, float]:
         """
         Perform one outer training step.
@@ -541,6 +547,7 @@ class RiskyDebtTrainerBR:
             b: Current debt (batch_size,)
             z: Current productivity (batch_size,)
             update_smoothing: Whether to update epsilon_D
+            temperature: Annealing temperature
         
         Returns:
             Dictionary with losses (and diagnostics if collect_diagnostics=True)
@@ -553,12 +560,12 @@ class RiskyDebtTrainerBR:
         critic_losses = []
         price_losses_critic = []
         for _ in range(self.n_critic_steps):
-            loss_c, loss_p = self._critic_step(k, b, z)
+            loss_c, loss_p = self._critic_step(k, b, z, temperature=temperature)
             critic_losses.append(float(loss_c))
             price_losses_critic.append(float(loss_p))
         
         # Actor update
-        loss_a, loss_p_a, diagnostics = self._actor_step(k, b, z)
+        loss_a, loss_p_a, diagnostics = self._actor_step(k, b, z, temperature=temperature)
         
         # Store last diagnostics
         if diagnostics is not None:
@@ -573,7 +580,7 @@ class RiskyDebtTrainerBR:
             "loss_actor": float(loss_a),
             "loss_price_critic": np.mean(price_losses_critic),
             "loss_price_actor": float(loss_p_a),
-            "epsilon_D": self.smoothing.epsilon_D
+            "epsilon_D": self.smoothing.value
         }
         
         # Add diagnostics to result if collecting

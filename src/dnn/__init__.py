@@ -36,10 +36,10 @@ from src.economy.logic import (
     pricing_residual_zero_profit
 )
 
-# Default Smoothing
-from src.dnn.default_smoothing import (
-    DefaultSmoothingSchedule,
-    compute_smooth_default_prob
+# Annealing Schedule (single source of truth)
+from src.dnn.annealing import (
+    AnnealingSchedule,
+    smooth_default_prob
 )
 
 # Sampling
@@ -80,18 +80,23 @@ from src.dnn.experiments import (
     train
 )
 
-from src.dnn.evaluation import (
+from src.dnn.evaluation.common import (
     get_eval_grids,
+    compute_moments,
+    compare_moments,
+    find_steady_state_k,
+)
+from src.dnn.evaluation.wrappers import (
     evaluate_basic_policy,
     evaluate_basic_value,
     evaluate_risky_policy,
     evaluate_risky_value,
-    compute_moments,
-    compare_moments,
-    # Steady-state and policy evaluation
-    find_steady_state_k,
+)
+from src.dnn.evaluation.simulation import (
     simulate_policy_path,
     evaluate_policy_return,
+)
+from src.dnn.evaluation.residuals import (
     eval_euler_residual_basic,
 )
 
@@ -129,9 +134,9 @@ __all__ = [
     "pricing_residual_zero_profit",
     "compute_critic_objective",
     "compute_actor_objective",
-    # Default Smoothing
-    "DefaultSmoothingSchedule",
-    "compute_smooth_default_prob",
+    # Annealing Schedule
+    "AnnealingSchedule",
+    "smooth_default_prob",
     # Sampling
     "AdaptiveBounds",
     "ReplayBuffer",

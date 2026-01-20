@@ -1,7 +1,7 @@
 """
 tests/dnn/test_default_smoothing.py
 
-Tests for default smoothing schedule and p^D computation.
+Tests for default smoothing with AnnealingSchedule and compute_smooth_default_prob.
 
 Reference: outline_v2.md lines 122-135
 """
@@ -10,127 +10,74 @@ import pytest
 import tensorflow as tf
 import numpy as np
 
-from src.dnn.default_smoothing import (
-    DefaultSmoothingSchedule,
-    compute_smooth_default_prob
-)
+from src.dnn.annealing import AnnealingSchedule, smooth_default_prob
 
 
 # =============================================================================
 # SCHEDULE TESTS
 # =============================================================================
 
-class TestDefaultSmoothingSchedule:
-    """Tests for DefaultSmoothingSchedule."""
+class TestAnnealingAsDefaultSmoothing:
+    """Tests for AnnealingSchedule used for default smoothing."""
     
     def test_initialization(self):
         """Schedule initializes with correct values."""
-        schedule = DefaultSmoothingSchedule(
-            epsilon_D_0=0.5,
-            epsilon_D_min=1e-4,
-            decay_d=0.95,
-            u_max=15.0
+        schedule = AnnealingSchedule(
+            init=0.5,
+            min=1e-4,
+            decay=0.95,
+            schedule="exponential"
         )
         
-        assert schedule.epsilon_D == 0.5
-        assert schedule.epsilon_D_0 == 0.5
-        assert schedule.epsilon_D_min == 1e-4
-        assert schedule.decay_d == 0.95
-        assert schedule.u_max == 15.0
+        assert schedule.value == 0.5
+        assert schedule.init == 0.5
+        assert schedule.min == 1e-4
+        assert schedule.decay == 0.95
     
-    def test_update_decays_epsilon(self):
-        """Each update should decay epsilon_D."""
-        schedule = DefaultSmoothingSchedule(
-            epsilon_D_0=1.0,
-            epsilon_D_min=0.01,
-            decay_d=0.9
-        )
+    def test_update_decays_value(self):
+        """Each update should decay value."""
+        schedule = AnnealingSchedule(init=1.0, min=0.01, decay=0.9)
         
         schedule.update()
-        assert np.isclose(schedule.epsilon_D, 0.9)
+        assert np.isclose(schedule.value, 0.9)
         
         schedule.update()
-        assert np.isclose(schedule.epsilon_D, 0.81)
+        assert np.isclose(schedule.value, 0.81)
     
     def test_update_respects_minimum(self):
-        """epsilon_D should not go below epsilon_D_min."""
-        schedule = DefaultSmoothingSchedule(
-            epsilon_D_0=0.1,
-            epsilon_D_min=0.05,
-            decay_d=0.5
-        )
+        """Value should not go below min."""
+        schedule = AnnealingSchedule(init=0.1, min=0.05, decay=0.5)
         
-        # After first update: 0.05
         schedule.update()
-        assert np.isclose(schedule.epsilon_D, 0.05)
+        assert np.isclose(schedule.value, 0.05)
         
-        # Should stay at minimum
         schedule.update()
-        assert np.isclose(schedule.epsilon_D, 0.05)
+        assert np.isclose(schedule.value, 0.05)
     
     def test_reset(self):
-        """reset() should restore initial epsilon_D."""
-        schedule = DefaultSmoothingSchedule(epsilon_D_0=0.5)
+        """reset() should restore initial value."""
+        schedule = AnnealingSchedule(init=0.5)
         
         schedule.update()
         schedule.update()
-        assert schedule.epsilon_D < 0.5
+        assert schedule.value < 0.5
         
         schedule.reset()
-        assert schedule.epsilon_D == 0.5
+        assert schedule.value == 0.5
     
     def test_get_and_set_state(self):
         """State should be saveable and restorable."""
-        schedule = DefaultSmoothingSchedule(epsilon_D_0=0.5, decay_d=0.9)
+        schedule = AnnealingSchedule(init=0.5, decay=0.9)
         schedule.update()
         schedule.update()
         
         state = schedule.get_state()
-        assert "epsilon_D" in state
+        assert "value" in state
         
-        new_schedule = DefaultSmoothingSchedule()
+        new_schedule = AnnealingSchedule()
         new_schedule.set_state(state)
         
-        assert new_schedule.epsilon_D == schedule.epsilon_D
-
-
-# =============================================================================
-# CLIPPED LOGIT TESTS
-# =============================================================================
-
-class TestClippedLogitSigmoid:
-    """Tests for clipped logit in p^D computation."""
-    
-    def test_clipping_bounds(self):
-        """p^D uses clipped logit u in [-u_max, u_max]."""
-        schedule = DefaultSmoothingSchedule(epsilon_D_0=0.1, u_max=5.0)
-        
-        # Very negative V_tilde -> large positive u -> p^D ~ 1
-        V_tilde_neg = tf.constant([[-100.0]])
-        p_neg = schedule.compute_default_prob(V_tilde_neg)
-        
-        # With clipping at u_max=5, sigmoid(5) ≈ 0.9933
-        expected_max = tf.nn.sigmoid(5.0).numpy()
-        assert np.isclose(p_neg.numpy()[0, 0], expected_max, rtol=0.01)
-        
-        # Very positive V_tilde -> large negative u -> p^D ~ 0
-        V_tilde_pos = tf.constant([[100.0]])
-        p_pos = schedule.compute_default_prob(V_tilde_pos)
-        
-        expected_min = tf.nn.sigmoid(-5.0).numpy()
-        assert np.isclose(p_pos.numpy()[0, 0], expected_min, rtol=0.01)
-    
-    def test_without_clipping_extreme_values(self):
-        """Without clipping, extreme V_tilde could cause numerical issues."""
-        # This test documents that clipping prevents overflow
-        schedule = DefaultSmoothingSchedule(epsilon_D_0=1e-6, u_max=50.0)
-        
-        V_tilde = tf.constant([[-1e10]])
-        p = schedule.compute_default_prob(V_tilde)
-        
-        # Should not be NaN or Inf
-        assert not np.isnan(p.numpy())
-        assert not np.isinf(p.numpy())
+        assert new_schedule.value == schedule.value
 
 
 # =============================================================================
@@ -142,21 +89,16 @@ class TestDefaultProbability:
     
     def test_pD_at_zero_V_tilde(self):
         """At V_tilde = 0, p^D = sigmoid(0) = 0.5."""
-        schedule = DefaultSmoothingSchedule(epsilon_D_0=0.1)
-        
         V_tilde = tf.constant([[0.0]])
-        p = schedule.compute_default_prob(V_tilde)
+        p = smooth_default_prob(V_tilde, temperature=0.1)
         
         assert np.isclose(p.numpy()[0, 0], 0.5)
     
     def test_pD_increases_as_V_decreases(self):
         """p^D should increase as V_tilde becomes more negative."""
-        schedule = DefaultSmoothingSchedule(epsilon_D_0=0.1)
-        
         V_values = tf.constant([[0.5], [0.0], [-0.5], [-1.0]])
-        p_values = schedule.compute_default_prob(V_values).numpy()
+        p_values = smooth_default_prob(V_values, temperature=0.1).numpy()
         
-        # p^D should be monotonically increasing
         assert p_values[0, 0] < p_values[1, 0]
         assert p_values[1, 0] < p_values[2, 0]
         assert p_values[2, 0] < p_values[3, 0]
@@ -167,48 +109,48 @@ class TestDefaultProbability:
         V_tilde_pos = tf.constant([[0.1]])
         
         # Large epsilon: smooth transition
-        schedule_large = DefaultSmoothingSchedule(epsilon_D_0=1.0)
-        p_neg_large = schedule_large.compute_default_prob(V_tilde_neg).numpy()
-        p_pos_large = schedule_large.compute_default_prob(V_tilde_pos).numpy()
+        p_neg_large = smooth_default_prob(V_tilde_neg, temperature=1.0).numpy()
+        p_pos_large = smooth_default_prob(V_tilde_pos, temperature=1.0).numpy()
         
         # Small epsilon: sharp transition
-        schedule_small = DefaultSmoothingSchedule(epsilon_D_0=0.001, u_max=100)
-        p_neg_small = schedule_small.compute_default_prob(V_tilde_neg).numpy()
-        p_pos_small = schedule_small.compute_default_prob(V_tilde_pos).numpy()
+        p_neg_small = smooth_default_prob(V_tilde_neg, temperature=0.001, u_max=100).numpy()
+        p_pos_small = smooth_default_prob(V_tilde_pos, temperature=0.001, u_max=100).numpy()
         
-        # With small epsilon, should be closer to hard threshold
-        assert p_neg_small > p_neg_large, "Small epsilon should give higher p^D for V<0"
-        assert p_pos_small < p_pos_large, "Small epsilon should give lower p^D for V>0"
+        assert p_neg_small > p_neg_large
+        assert p_pos_small < p_pos_large
     
     def test_pD_bounded_0_1(self):
         """p^D should always be in [0, 1]."""
-        schedule = DefaultSmoothingSchedule(epsilon_D_0=0.1)
-        
         V_tilde = tf.constant([[-100.0], [-1.0], [0.0], [1.0], [100.0]])
-        p = schedule.compute_default_prob(V_tilde)
+        p = smooth_default_prob(V_tilde, temperature=0.1)
         
         assert np.all(p.numpy() >= 0)
         assert np.all(p.numpy() <= 1)
 
 
-# =============================================================================
-# FUNCTIONAL INTERFACE TESTS
-# =============================================================================
-
-class TestFunctionalInterface:
-    """Tests for compute_smooth_default_prob function."""
+class TestClippedLogitSigmoid:
+    """Tests for clipped logit in p^D computation."""
     
-    def test_matches_class_method(self):
-        """Functional interface should match class method."""
-        V_tilde = tf.constant([[0.5], [-0.5]])
-        epsilon_D = 0.1
-        u_max = 10.0
+    def test_clipping_bounds(self):
+        """p^D uses clipped logit u in [-u_max, u_max]."""
+        # Very negative V_tilde -> large positive u -> p^D ~ 1
+        V_tilde_neg = tf.constant([[-100.0]])
+        p_neg = smooth_default_prob(V_tilde_neg, temperature=0.1, u_max=5.0)
         
-        # Class method
-        schedule = DefaultSmoothingSchedule(epsilon_D_0=epsilon_D, u_max=u_max)
-        p_class = schedule.compute_default_prob(V_tilde)
+        expected_max = tf.nn.sigmoid(5.0).numpy()
+        assert np.isclose(p_neg.numpy()[0, 0], expected_max, rtol=0.01)
         
-        # Functional
-        p_func = compute_smooth_default_prob(V_tilde, epsilon_D, u_max)
+        # Very positive V_tilde -> large negative u -> p^D ~ 0
+        V_tilde_pos = tf.constant([[100.0]])
+        p_pos = smooth_default_prob(V_tilde_pos, temperature=0.1, u_max=5.0)
         
-        np.testing.assert_allclose(p_class.numpy(), p_func.numpy())
+        expected_min = tf.nn.sigmoid(-5.0).numpy()
+        assert np.isclose(p_pos.numpy()[0, 0], expected_min, rtol=0.01)
+    
+    def test_without_clipping_extreme_values(self):
+        """Without clipping, extreme V_tilde could cause numerical issues."""
+        V_tilde = tf.constant([[-1e10]])
+        p = smooth_default_prob(V_tilde, temperature=1e-6, u_max=50.0)
+        
+        assert not np.isnan(p.numpy())
+        assert not np.isinf(p.numpy())

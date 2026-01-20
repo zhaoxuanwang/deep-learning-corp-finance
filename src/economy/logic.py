@@ -30,58 +30,24 @@ def compute_investment(k: Numeric, k_next: Numeric, params: EconomicParams) -> N
 def investment_gate_ste(
     investment: Numeric,
     eps: float = 1e-6,
-    temp: float = 0.1,
+    temperature: float = 0.1,
     mode: str = "ste"
 ) -> Numeric:
     """
     Investment indicator gate with optional STE for gradient flow.
     
-    Forward: Returns 1 when |I| > eps, 0 otherwise (hard gate).
-    Backward: Uses smooth sigmoid surrogate for gradient flow (STE mode).
-    
-    Args:
-        investment: I = k' - (1-δ)k, can be positive (investment) or negative (disinvestment)
-        eps: Threshold for "investing" (default 1e-6)
-        temp: Sigmoid temperature for soft gate (default 0.1, should be ~ typical |I| scale)
-        mode: Gate mode:
-            - "hard": Pure hard gate, zero gradient (for evaluation)
-            - "ste": Straight-Through Estimator (forward=hard, backward=soft gradient)
-            - "soft": Pure smooth sigmoid (for debugging)
-    
-    Returns:
-        g: Gate value in [0, 1]
-    
-    Note:
-        STE pattern: g = stop_gradient(g_hard - g_soft) + g_soft
-        - Forward pass uses g_hard (exact discrete gate)
-        - Backward pass uses grad(g_soft) (smooth gradient)
+    Delegates to src.dnn.annealing.indicator_abs_gt.
     """
-    abs_I = tf.abs(investment)
-    
-    # Hard gate (exact economic logic)
-    g_hard = tf.cast(abs_I > eps, tf.float32)
-    
-    if mode == "hard":
-        return g_hard
-    
-    # Soft gate (smooth sigmoid for gradients)
-    # sigmoid((|I| - eps) / temp): centered at |I| = eps, sharpness controlled by temp
-    g_soft = tf.nn.sigmoid((abs_I - eps) / temp)
-    
-    if mode == "soft":
-        return g_soft
-    
-    # STE: forward uses hard, backward uses soft gradient
-    # tf.stop_gradient(g_hard - g_soft) has value (g_hard - g_soft) but zero gradient
-    # Adding g_soft gives: forward = g_hard, backward = grad(g_soft)
-    return tf.stop_gradient(g_hard - g_soft) + g_soft
+    from src.dnn.annealing import indicator_abs_gt
+    return indicator_abs_gt(investment, threshold=eps, temperature=temperature, mode=mode)
 
 
 def adjustment_costs(
     k: Numeric,
     k_next: Numeric,
     params: EconomicParams,
-    fixed_cost_gate: str = "ste"
+    fixed_cost_gate: str = "ste",
+    temperature: float = 0.1
 ) -> Numeric:
     """
     Total Adjustment Costs (Convex + Fixed).
@@ -90,13 +56,8 @@ def adjustment_costs(
         k: Current capital
         k_next: Next period capital
         params: Model parameters (cost_convex, cost_fixed)
-        fixed_cost_gate: Gate mode for fixed cost indicator:
-            - "hard": Zero gradient (for evaluation)
-            - "ste": Straight-Through Estimator (default, for training)
-            - "soft": Pure smooth gate (for debugging)
-    
-    Returns:
-        Total adjustment cost: convex + fixed
+        fixed_cost_gate: Gate mode for fixed cost indicator
+        temperature: Temperature for fixed cost gate (if soft/ste)
     """
     investment = compute_investment(k, k_next, params)
     safe_k = tf.maximum(k, 1e-8)
@@ -106,18 +67,24 @@ def adjustment_costs(
 
     # 2. Fixed Costs: cost_fixed * k * 1{|I| > eps}
     # Uses STE gate for gradient flow during training
-    is_investing = investment_gate_ste(investment, mode=fixed_cost_gate)
+    is_investing = investment_gate_ste(investment, mode=fixed_cost_gate, temperature=temperature)
     adj_fixed = params.cost_fixed * safe_k * is_investing
 
     return adj_convex + adj_fixed
 
-def compute_cash_flow_basic(k: Numeric, k_next: Numeric, z: Numeric, params: EconomicParams) -> Numeric:
+def compute_cash_flow_basic(
+    k: Numeric, 
+    k_next: Numeric, 
+    z: Numeric, 
+    params: EconomicParams,
+    temperature: float = 0.1
+) -> Numeric:
     """
     Dividend d_t = Profit - Investment - Costs
     """
     profit = production_function(k, z, params)
     investment = compute_investment(k, k_next, params)
-    costs_adjust = adjustment_costs(k, k_next, params)
+    costs_adjust = adjustment_costs(k, k_next, params, temperature=temperature)
 
     return profit - investment - costs_adjust
 
@@ -125,7 +92,8 @@ def compute_cash_flow_basic(k: Numeric, k_next: Numeric, z: Numeric, params: Eco
 def external_financing_cost(
     e: Numeric,
     params: EconomicParams,
-    gate_mode: str = "ste"
+    gate_mode: str = "ste",
+    temperature: float = 0.1
 ) -> Numeric:
     """
     External equity injection cost per outline_v2.md.
@@ -133,20 +101,14 @@ def external_financing_cost(
     η(e) = (η₀ + η₁ · |e|) · 1_{e < 0}
     
     Args:
-        e: Cash flow / dividends (levels), shape (batch,) or (batch, 1)
+        e: Cash flow / dividends (levels)
         params: Contains cost_inject_fixed (η₀), cost_inject_linear (η₁)
-        gate_mode: "ste" (default, gradient flow), "hard" (no gradient), "soft"
-    
-    Returns:
-        η: Financing cost, same shape as e. Zero when e >= 0.
-    
-    Note:
-        Uses STE by default so gradients flow through the indicator during
-        training. For evaluation, use gate_mode="hard".
+        gate_mode: "ste" (default), "hard", "soft"
+        temperature: Sharpness of the < 0 gate
     """
-    from src.economy.indicators import ste_gate_lt
+    from src.dnn.annealing import indicator_lt
     
-    is_negative = ste_gate_lt(e, threshold=0.0, mode=gate_mode)
+    is_negative = indicator_lt(e, threshold=0.0, mode=gate_mode, temperature=temperature)
     return is_negative * (params.cost_inject_fixed + params.cost_inject_linear * tf.abs(e))
 
 
@@ -158,28 +120,15 @@ def cash_flow_risky_debt(
     z: Numeric,
     r_tilde: Numeric,
     params: EconomicParams,
+    temperature: float = 0.1
 ) -> Numeric:
     """
     Cash flow for risky debt model, using interest rate directly.
-    
-    e = (1-τ)π - ψ - I + b'/(1+r̃) + τ·r̃·b'/[(1+r̃)(1+r)] - b
-    
-    Args:
-        k: Current capital (levels)
-        k_next: Next period capital (levels)
-        b: Current debt (levels)
-        b_next: Next period debt (levels)
-        z: Productivity shock (levels)
-        r_tilde: Risky interest rate (NOT bond price)
-        params: Model parameters
-    
-    Returns:
-        e: Cash flow (same shape as inputs)
     """
     # Basic cash flow components
     profit = production_function(k, z, params)
     investment = compute_investment(k, k_next, params)
-    costs_adjust = adjustment_costs(k, k_next, params)
+    costs_adjust = adjustment_costs(k, k_next, params, temperature=temperature)
 
     # Bond price from rate: q = 1/(1+r̃)
     safe_r = tf.maximum(1.0 + r_tilde, 1e-8)
