@@ -35,8 +35,9 @@ if str(project_root) not in sys.path:
 from src.dnn import (
     TrainingConfig, EconomicScenario, SamplingBounds,
     train_basic_lr,
-    get_eval_grids, evaluate_basic_policy,
-    find_steady_state_k, evaluate_policy_return, 
+    get_eval_grids, find_steady_state_k,
+    evaluate_basic_policy,
+    evaluate_policy_return,
     eval_euler_residual_basic,
 )
 
@@ -59,7 +60,7 @@ SCENARIO_S1 = EconomicScenario.from_overrides(
     cost_convex=0.1,
     cost_inject_fixed=0.0,
     cost_inject_linear=0.0,
-    sampling=CUSTOM_BOUNDS
+    sampling=CUSTOM_BOUNDS  # Separate from param_overrides
 )
 
 
@@ -85,8 +86,6 @@ def run_lr_horizon_study(scenario: EconomicScenario, base_config: TrainingConfig
         print(f"done. final_loss={history['loss_LR'][-1]:.4f}")
     return results
 
-
-if __name__ == "__main__":
     # %%
     # =============================================================================
     # 1.1 Run LR Horizon Study
@@ -96,14 +95,14 @@ if __name__ == "__main__":
     print(f"LR HORIZON SENSITIVITY STUDY (Mode: {RUN_MODE})")
     print("="*70)
 
-    # Use smooth scenario for cleaner comparison
+    # Use smooth cost scenario for cleaner comparison
     LR_SCENARIO = SCENARIO_S1
 
     # Base config for LR study
     LR_BASE_CONFIG = TrainingConfig(
         n_layers=2, n_neurons=16, 
         n_iter=100 if RUN_MODE == "debug" else 300,
-        batch_size=512, learning_rate=3e-3, 
+        batch_size=256, learning_rate=3e-3, 
         log_every=10, seed=SEED, T=32
     )
 

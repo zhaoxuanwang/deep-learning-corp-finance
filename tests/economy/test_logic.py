@@ -390,7 +390,7 @@ class TestInvestmentGateSTE:
         I = tf.Variable([eps * 0.5, eps, eps * 2, eps * 10])
         
         with tf.GradientTape() as tape:
-            gate = logic.investment_gate_ste(I, eps=eps, temp=temp, mode="ste")
+            gate = logic.investment_gate_ste(I, eps=eps, temperature=temp, mode="ste")
             loss = tf.reduce_sum(gate)
         
         grad = tape.gradient(loss, I)

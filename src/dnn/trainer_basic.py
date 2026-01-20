@@ -74,7 +74,8 @@ class BasicTrainerLR:
     def train_step(
         self,
         k_init: tf.Tensor,
-        z_init: tf.Tensor
+        z_init: tf.Tensor,
+        temperature: float = 0.1
     ) -> Dict[str, float]:
         """
         Perform one training step.
@@ -82,6 +83,7 @@ class BasicTrainerLR:
         Args:
             k_init: Initial capital (batch_size,)
             z_init: Initial productivity (batch_size,)
+            temperature: Annealing temperature for smooth gates
         
         Returns:
             Dictionary with loss value
@@ -97,7 +99,7 @@ class BasicTrainerLR:
                 k_next = self.policy_net(k, z)
                 
                 # Reward - delegated to economy module
-                reward = compute_cash_flow_basic(k, k_next, z, self.params)
+                reward = compute_cash_flow_basic(k, k_next, z, self.params, temperature=temperature)
                 rewards_list.append(reward)
                 
                 # Transition: z' from AR(1) - use canonical implementation
@@ -346,7 +348,8 @@ class BasicTrainerBR:
     def _critic_step(
         self,
         k: tf.Tensor,
-        z: tf.Tensor
+        z: tf.Tensor,
+        temperature: float = 0.1
     ) -> tf.Tensor:
         """
         Perform one critic update.
@@ -364,7 +367,7 @@ class BasicTrainerBR:
             k_next_sg = tf.stop_gradient(k_next)
             
             # Cash flow (uses detached k') - delegated to economy
-            e = compute_cash_flow_basic(k, k_next_sg, z, self.params)
+            e = compute_cash_flow_basic(k, k_next_sg, z, self.params, temperature=temperature)
             
             # Two z' draws
             z_next_1, z_next_2 = draw_shocks(
@@ -407,7 +410,8 @@ class BasicTrainerBR:
     def _actor_step(
         self,
         k: tf.Tensor,
-        z: tf.Tensor
+        z: tf.Tensor,
+        temperature: float = 0.1
     ) -> tf.Tensor:
         """
         Perform one actor update.
@@ -424,7 +428,7 @@ class BasicTrainerBR:
             k_next = self.policy_net(k, z)
             
             # Cash flow - delegated to economy
-            e = compute_cash_flow_basic(k, k_next, z, self.params)
+            e = compute_cash_flow_basic(k, k_next, z, self.params, temperature=temperature)
             
             # Two z' draws
             z_next_1, z_next_2 = draw_shocks(
@@ -449,7 +453,8 @@ class BasicTrainerBR:
     def train_step(
         self,
         k: tf.Tensor,
-        z: tf.Tensor
+        z: tf.Tensor,
+        temperature: float = 0.1
     ) -> Dict[str, float]:
         """
         Perform one outer training step.
@@ -460,6 +465,7 @@ class BasicTrainerBR:
         Args:
             k: Current capital (batch_size,)
             z: Current productivity (batch_size,)
+            temperature: Annealing temperature
         
         Returns:
             Dictionary with losses
@@ -472,7 +478,7 @@ class BasicTrainerBR:
         mse_proxies = []
         mae_proxies = []
         for _ in range(self.n_critic_steps):
-            loss_c, diag = self._critic_step(k, z)
+            loss_c, diag = self._critic_step(k, z, temperature=temperature)
             critic_losses.append(float(loss_c))
             mse_proxies.append(diag["mse_proxy"])
             mae_proxies.append(diag["mae_proxy"])
@@ -481,7 +487,7 @@ class BasicTrainerBR:
         self._polyak_update_value_target()
         
         # Actor update
-        loss_a = self._actor_step(k, z)
+        loss_a = self._actor_step(k, z, temperature=temperature)
         
         # Compute terminal states for ergodic sampling (k', z')
         n = tf.shape(k)[0]

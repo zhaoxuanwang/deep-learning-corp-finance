@@ -28,7 +28,7 @@ from src.dnn.networks import (
 )
 from src.dnn.trainer_basic import BasicTrainerLR, BasicTrainerER, BasicTrainerBR
 from src.dnn.trainer_risky import RiskyDebtTrainerLR, RiskyDebtTrainerBR
-from src.dnn.default_smoothing import DefaultSmoothingSchedule
+from src.dnn.annealing import AnnealingSchedule, smooth_default_prob
 
 
 # =============================================================================
@@ -83,6 +83,12 @@ class TrainingConfig:
     # Network constraints
     k_min: float = 1e-4
     leverage_scale: float = 1.5
+    
+    # Temperature annealing for soft gates
+    temperature_init: float = 1.0          # Initial temperature τ₀
+    temperature_min: float = 0.01          # Minimum temperature floor
+    temperature_decay: float = 0.995       # Decay rate per iteration (exponential)
+    temperature_schedule: str = "exponential"  # "exponential" or "linear"
 
 
 @dataclass
@@ -194,7 +200,7 @@ def train_basic_lr(
         config: Training configuration
     
     Returns:
-        History dict with keys: iteration, loss_LR, mean_reward
+        History dict with keys: iteration, loss_LR, mean_reward, temperature
     """
     _set_seeds(config.seed)
     rng = np.random.default_rng(config.seed)
@@ -219,6 +225,15 @@ def train_basic_lr(
         seed=config.seed
     )
     
+    # Temperature schedule for soft gate annealing
+    temp_schedule = AnnealingSchedule(
+        init=config.temperature_init,
+        min=config.temperature_min,
+        decay=config.temperature_decay,
+        schedule=config.temperature_schedule,
+        total_steps=config.n_iter
+    )
+    
     # Training context for ergodic sampling
     ctx = TrainingContext(
         scenario=scenario,
@@ -230,7 +245,7 @@ def train_basic_lr(
     )
     
     # Training loop
-    history = {"iteration": [], "loss_LR": [], "mean_reward": []}
+    history = {"iteration": [], "loss_LR": [], "mean_reward": [], "temperature": []}
     
     for i in range(config.n_iter):
         # Sample with ergodic replay
@@ -238,15 +253,20 @@ def train_basic_lr(
         k = tf.constant(states["k"], dtype=tf.float32)
         z = tf.constant(states["z"], dtype=tf.float32)
         
-        metrics = trainer.train_step(k, z)
+        # Use current temperature from schedule
+        metrics = trainer.train_step(k, z, temperature=temp_schedule.value)
         
         # Feed back terminal states for next iteration
         ctx.update(metrics.get("terminal_states"))
+        
+        # Update temperature schedule
+        temp_schedule.update()
         
         if i % config.log_every == 0:
             history["iteration"].append(i)
             history["loss_LR"].append(metrics["loss"])
             history["mean_reward"].append(metrics["mean_reward"])
+            history["temperature"].append(temp_schedule.value)
     
     # Store trained networks
     history["_policy_net"] = policy_net
@@ -369,6 +389,15 @@ def train_basic_br(
         seed=config.seed
     )
     
+    # Temperature schedule for soft gate annealing
+    temp_schedule = AnnealingSchedule(
+        init=config.temperature_init,
+        min=config.temperature_min,
+        decay=config.temperature_decay,
+        schedule=config.temperature_schedule,
+        total_steps=config.n_iter
+    )
+    
     # Training context for ergodic sampling
     ctx = TrainingContext(
         scenario=scenario,
@@ -385,6 +414,7 @@ def train_basic_br(
         "loss_BR_actor": [],
         "mse_proxy": [],
         "mae_proxy": [],
+        "temperature": [],
     }
     
     for i in range(config.n_iter):
@@ -393,10 +423,13 @@ def train_basic_br(
         k = tf.constant(states["k"], dtype=tf.float32)
         z = tf.constant(states["z"], dtype=tf.float32)
         
-        metrics = trainer.train_step(k, z)
+        metrics = trainer.train_step(k, z, temperature=temp_schedule.value)
         
         # Feed back terminal states
         ctx.update(metrics.get("terminal_states"))
+        
+        # Update temperature schedule
+        temp_schedule.update()
         
         if i % config.log_every == 0:
             history["iteration"].append(i)
@@ -405,6 +438,7 @@ def train_basic_br(
             # Diagnostics (may not always be present)
             history["mse_proxy"].append(metrics.get("mse_proxy", metrics["loss_critic"]))
             history["mae_proxy"].append(metrics.get("mae_proxy", 0.0))
+            history["temperature"].append(temp_schedule.value)
     
     history["_policy_net"] = policy_net
     history["_value_net"] = value_net
@@ -445,11 +479,11 @@ def train_risky_lr(
         activation=config.activation
     )
     
-    smoothing = DefaultSmoothingSchedule(
-        epsilon_D_0=config.epsilon_D_0,
-        epsilon_D_min=config.epsilon_D_min,
-        decay_d=config.decay_d,
-        u_max=config.u_max
+    smoothing = AnnealingSchedule(
+        init=config.epsilon_D_0,
+        min=config.epsilon_D_min,
+        decay=config.decay_d,
+        schedule="exponential"
     )
     
     optimizer_policy = tf.keras.optimizers.Adam(config.learning_rate)
@@ -468,16 +502,29 @@ def train_risky_lr(
         seed=config.seed
     )
     
-    history = {"iteration": [], "loss_LR": [], "loss_price": [], "mean_utility": []}
+    # Temperature schedule for soft gate annealing
+    temp_schedule = AnnealingSchedule(
+        init=config.temperature_init,
+        min=config.temperature_min,
+        decay=config.temperature_decay,
+        schedule=config.temperature_schedule,
+        total_steps=config.n_iter
+    )
+    
+    history = {"iteration": [], "loss_LR": [], "loss_price": [], "mean_utility": [], "temperature": []}
     
     for i in range(config.n_iter):
         k, b, z = _sample_risky(scenario, config.batch_size, rng)
-        metrics = trainer.train_step(k, b, z)
+        metrics = trainer.train_step(k, b, z, temperature=temp_schedule.value)
+        
+        # Update temperature schedule
+        temp_schedule.update()
         
         if i % config.log_every == 0:
             history["iteration"].append(i)
             history["loss_LR"].append(metrics["loss_lr"])
             history["loss_price"].append(metrics["loss_price"])
+            history["temperature"].append(temp_schedule.value)
             history["mean_utility"].append(metrics["mean_utility"])
     
     history["_policy_net"] = policy_net
@@ -524,11 +571,11 @@ def train_risky_br(
         activation=config.activation
     )
     
-    smoothing = DefaultSmoothingSchedule(
-        epsilon_D_0=config.epsilon_D_0,
-        epsilon_D_min=config.epsilon_D_min,
-        decay_d=config.decay_d,
-        u_max=config.u_max
+    smoothing = AnnealingSchedule(
+        init=config.epsilon_D_0,
+        min=config.epsilon_D_min,
+        decay=config.decay_d,
+        schedule="exponential"
     )
     
     optimizer_policy = tf.keras.optimizers.Adam(config.learning_rate)
@@ -548,7 +595,16 @@ def train_risky_br(
         n_critic_steps=config.n_critic,
         smoothing=smoothing,
         seed=config.seed,
-        collect_diagnostics=True  # Always collect for debugging
+        collect_diagnostics=True
+    )
+    
+    # Temperature schedule for soft gate annealing
+    temp_schedule = AnnealingSchedule(
+        init=config.temperature_init,
+        min=config.temperature_min,
+        decay=config.temperature_decay,
+        schedule=config.temperature_schedule,
+        total_steps=config.n_iter
     )
     
     history = {
@@ -557,6 +613,7 @@ def train_risky_br(
         "loss_actor": [],
         "loss_price": [],
         "epsilon_D": [],
+        "temperature": [],
         # Gradient flow diagnostics
         "grad_norm_policy": [],
         "share_v_tilde_negative": [],
@@ -566,7 +623,10 @@ def train_risky_br(
     
     for i in range(config.n_iter):
         k, b, z = _sample_risky(scenario, config.batch_size, rng)
-        metrics = trainer.train_step(k, b, z, update_smoothing=True)
+        metrics = trainer.train_step(k, b, z, update_smoothing=True, temperature=temp_schedule.value)
+        
+        # Update temperature schedule
+        temp_schedule.update()
         
         if i % config.log_every == 0:
             history["iteration"].append(i)
@@ -574,6 +634,7 @@ def train_risky_br(
             history["loss_actor"].append(metrics["loss_actor"])
             history["loss_price"].append(metrics["loss_price_critic"])
             history["epsilon_D"].append(metrics["epsilon_D"])
+            history["temperature"].append(temp_schedule.value)
             # Log diagnostics
             history["grad_norm_policy"].append(metrics.get("grad_norm_policy", 0.0))
             history["share_v_tilde_negative"].append(metrics.get("share_v_tilde_negative", 0.0))

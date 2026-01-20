@@ -15,7 +15,8 @@ from src.dnn import (
     RiskyPolicyNetwork, RiskyValueNetwork, RiskyPriceNetwork,
     BasicTrainerBR,
     apply_limited_liability,
-    DefaultSmoothingSchedule,
+    AnnealingSchedule,
+    smooth_default_prob,
 )
 from src.economy.logic import investment_gate_ste, adjustment_costs
 
@@ -222,13 +223,13 @@ class TestBoundaryCases:
     
     def test_default_smoothing_at_zero(self):
         """Default smoothing should be stable at V_tilde = 0."""
-        schedule = DefaultSmoothingSchedule(epsilon_D_0=0.1)
+        epsilon_D = 0.1
         
         V_values = [0.0, 1e-8, -1e-8]
         
         for V_val in V_values:
             V_tilde = tf.constant([V_val], dtype=tf.float32)
-            p_D = schedule.compute_default_prob(V_tilde)
+            p_D = smooth_default_prob(V_tilde, epsilon_D)
             
             assert tf.reduce_all(tf.math.is_finite(p_D)).numpy(), \
                 f"Default prob should be finite at V_tilde = {V_val}"
