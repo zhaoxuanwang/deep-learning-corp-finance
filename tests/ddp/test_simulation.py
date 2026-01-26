@@ -18,7 +18,7 @@ from typing import Literal
 sys.path.append(os.path.abspath('..'))
 
 from src.ddp import simulation, DDPGridConfig
-from src.economy.parameters import EconomicParams
+from src.economy.parameters import EconomicParams, ShockParams
 from src.ddp.ddp_investment import InvestmentModelDDP
 from src.ddp.ddp_debt import DebtModelDDP
 
@@ -38,7 +38,8 @@ def test_investment_pipeline_consistency(
     input_n_k = 40
     scenario_name = f"Test-{grid_type}"
 
-    params = EconomicParams(r_rate=0.04, delta=0.06, theta=0.65, sigma=0.15)
+    params = EconomicParams(r_rate=0.04, delta=0.06, theta=0.65)
+    shock_params = ShockParams(sigma=0.15)
     grid_config = DDPGridConfig(z_size=input_n_z, k_size=input_n_k, grid_type=grid_type)
 
     # 2. Action: Run the Pipeline (Sweep -> Process)
@@ -49,7 +50,8 @@ def test_investment_pipeline_consistency(
         scenarios={scenario_name: {}},  # Empty dict means no overrides
         solver_method="solve_invest_vfi",
         solver_kwargs={"max_iter": 50},  # Reduced iters for speed
-        base_grid_config=grid_config
+        base_grid_config=grid_config,
+        base_shock_params=shock_params
     )
 
     # Step B: Process Output (Returns Clean NumPy)
@@ -110,6 +112,7 @@ def test_debt_pipeline_broadcasting(
     scenario_name = f"Debt-Test-{grid_type}"
 
     params = EconomicParams()
+    shock_params = ShockParams()
     grid_config = DDPGridConfig(z_size=input_n_z, k_size=input_n_k, b_size=input_n_b, grid_type=grid_type)
 
     # 2. Action: Run Pipeline
@@ -119,7 +122,8 @@ def test_debt_pipeline_broadcasting(
         scenarios={scenario_name: {}},
         solver_method="solve_risky_debt_vfi",
         solver_kwargs={"max_iter": 5},
-        base_grid_config=grid_config
+        base_grid_config=grid_config,
+        base_shock_params=shock_params
     )
 
     clean_res = simulation.process_debt_output(raw_res)

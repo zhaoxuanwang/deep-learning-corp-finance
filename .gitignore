@@ -3,17 +3,21 @@ archive/
 notebooks/
 .venv/
 .DS_Store
+src/evaluation/  # Work-in-progress evaluation module (not ready for commit)
 
 # --- Python Standard Exclusions ---
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
+.pytest_cache
 
 # --- IDE Settings ---
 .idea/
 .vscode/
 *.swp
+.claude/
+.agent/
 
 # --- Data & Results ---
 *.npz

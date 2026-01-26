@@ -27,6 +27,11 @@ def params_no_fixed_cost():
     """Parameters with zero fixed adjustment cost."""
     return EconomicParams(cost_fixed=0.0, cost_convex=0.5)
 
+@pytest.fixture
+def params_with_injection_costs():
+    """Parameters with non-zero equity injection costs."""
+    return EconomicParams(cost_inject_fixed=0.1, cost_inject_linear=0.1)
+
 
 # === SECTION 1: External Financing Cost Tests ===
 
@@ -41,13 +46,13 @@ class TestExternalFinancingCost:
         assert np.allclose(eta.numpy(), 0.0), \
             "External financing cost should be zero for non-negative cash flow"
     
-    def test_formula_for_negative_cashflow(self, params):
+    def test_formula_for_negative_cashflow(self, params_with_injection_costs):
         """η(e) = η₀ + η₁|e| when e < 0."""
         e = tf.constant([-5.0])
-        eta = logic.external_financing_cost(e, params)
+        eta = logic.external_financing_cost(e, params_with_injection_costs)
         
         # Expected: η₀ + η₁ * 5.0
-        expected = params.cost_inject_fixed + params.cost_inject_linear * 5.0
+        expected = params_with_injection_costs.cost_inject_fixed + params_with_injection_costs.cost_inject_linear * 5.0
         
         assert np.isclose(eta.numpy(), expected), \
             f"Expected η = {expected}, got {eta.numpy()}"
@@ -63,44 +68,30 @@ class TestExternalFinancingCost:
         assert 'e' in param_names and 'params' in param_names, \
             f"Expected e and params in signature, got {param_names}"
     
-    def test_vectorized(self, params):
+    def test_vectorized(self, params_with_injection_costs):
         """Works on batched inputs."""
-        e = tf.constant([-1.0, 0.0, 1.0, -10.0])
-        eta = logic.external_financing_cost(e, params)
+        e = tf.constant([-1.0, 5.0, 1.0, -10.0])
+        eta = logic.external_financing_cost(e, params_with_injection_costs)
         
         assert eta.shape == (4,)
         assert eta.numpy()[0] > 0  # negative e
-        assert eta.numpy()[1] == 0  # zero e
-        assert eta.numpy()[2] == 0  # positive e
+        assert eta.numpy()[1] < 1e-5  # positive e (5.0), cost should be ~0
+        assert eta.numpy()[2] < 1e-5  # positive e
         assert eta.numpy()[3] > 0  # negative e
     
-    def test_ste_gradient_nonzero_for_negative_e(self, params):
+    def test_ste_gradient_nonzero_for_negative_e(self, params_with_injection_costs):
         """STE should provide non-zero gradient when e < 0."""
         e = tf.Variable([-0.5], dtype=tf.float32)  # Negative
         
         with tf.GradientTape() as tape:
-            eta = logic.external_financing_cost(e, params, gate_mode="ste")
+            eta = logic.external_financing_cost(e, params_with_injection_costs)
             loss = tf.reduce_sum(eta)
         
         grad = tape.gradient(loss, e)
         
         assert grad is not None, "STE should provide gradient"
-        # Gradient should be non-zero for negative e
+        # Gradient should be non-zero for negative e (derivative of |e| * const)
         assert grad.numpy()[0] != 0, "STE gradient should be non-zero for e < 0"
-    
-    def test_hard_gate_zero_gradient(self, params):
-        """Hard gate should have zero gradient."""
-        e = tf.Variable([-0.5], dtype=tf.float32)
-        
-        with tf.GradientTape() as tape:
-            eta = logic.external_financing_cost(e, params, gate_mode="hard")
-            loss = tf.reduce_sum(eta)
-        
-        grad = tape.gradient(loss, e)
-        
-        # Hard gate has zero gradient through the indicator
-        # (gradient only from |e| term, not the gate itself)
-        assert grad is not None  # Still get gradient from |e| part
 
 
 # === SECTION 2: Primitives Tests ===
@@ -297,16 +288,13 @@ class TestRecoveryAndPricing:
         p_default = tf.constant([0.0])  # No default
         recovery = tf.constant([0.0])
         
-        # LHS = 1.04, RHS = 1.10 => f = 1.04 - 1.10 = -0.06
-        # Wait, that's negative. Let me reconsider.
-        # Actually LHS > RHS means lender profits (pays less than promised)
-        # When r_tilde > r, RHS > LHS, so f < 0 (lender overpays)
+        # If r_tilde > r, Lender payoff (1+r_tilde) > Cost (1+r).
+        # Residual f = Cost - Payoff < 0.
         
         f = logic.pricing_residual_zero_profit(
             b_next, r_risk_free, r_tilde, p_default, recovery
         )
         
-        # f = b'(1+r) - b'(1+r_tilde) = b'(r - r_tilde) < 0 when r_tilde > r
         assert f.numpy() < 0
 
 
@@ -433,7 +421,8 @@ class TestInvestmentGateSTE:
         k_next = tf.Variable([2.5])  # I = 2.5 - (1-δ)*2 > 0
         
         with tf.GradientTape() as tape:
-            psi = logic.adjustment_costs(k, k_next, params_fixed, fixed_cost_gate="ste")
+            # Note: adjustment_costs no longer accepts mode, uses internal or STE
+            psi = logic.adjustment_costs(k, k_next, params_fixed)
         
         grad = tape.gradient(psi, k_next)
         
@@ -441,15 +430,3 @@ class TestInvestmentGateSTE:
         assert np.isfinite(grad.numpy()), "Gradient should be finite"
         # Gradient should be non-zero (from both convex and fixed cost)
         assert grad.numpy() != 0, "Gradient should be non-zero with fixed cost"
-    
-    def test_adjustment_costs_hard_vs_ste_forward_match(self, params):
-        """adjustment_costs forward values match between hard and ste modes."""
-        params_fixed = replace(params, cost_fixed=0.5)
-        
-        k = tf.constant([2.0])
-        k_next = tf.constant([2.5])
-        
-        psi_hard = logic.adjustment_costs(k, k_next, params_fixed, fixed_cost_gate="hard")
-        psi_ste = logic.adjustment_costs(k, k_next, params_fixed, fixed_cost_gate="ste")
-        
-        np.testing.assert_allclose(psi_ste.numpy(), psi_hard.numpy())

@@ -6,6 +6,7 @@ Public API for economic model primitives.
 
 from src.economy.parameters import (
     EconomicParams,
+    ShockParams,
     convert_to_tf,
 )
 
@@ -13,10 +14,8 @@ from src.economy.parameters import (
 # Import directly: from src.ddp import DDPGridConfig
 
 from src.economy.shocks import (
-    simulate_productivity_next,
+    draw_AiO_shocks,
     draw_initial_states,
-    initialize_markov_process,
-    get_sampling_bounds,
 )
 
 from src.economy.logic import (
@@ -41,17 +40,27 @@ from src.economy.logic import (
     take_derivative,
 )
 
+from src.economy.rng import (
+    SeedSchedule,
+    SeedScheduleConfig,
+    VariableID,
+)
+
+from src.economy.data_generator import (
+    DataGenerator,
+    create_data_generator,
+)
+
 
 
 __all__ = [
     # Parameters
     "EconomicParams",
+    "ShockParams",
     "convert_to_tf",
     # Shocks
-    "simulate_productivity_next",
+    "draw_AiO_shocks",
     "draw_initial_states",
-    "initialize_markov_process",
-    "get_sampling_bounds",
     # Primitives
     "production_function",
     "compute_investment",
@@ -71,5 +80,12 @@ __all__ = [
     "pricing_residual_zero_profit",
     # AutoDiff
     "take_derivative",
+    # RNG & Reproducibility
+    "SeedSchedule",
+    "SeedScheduleConfig",
+    "VariableID",
+    # Data Generation
+    "DataGenerator",
+    "create_data_generator",
 ]
 

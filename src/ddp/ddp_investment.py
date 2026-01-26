@@ -10,9 +10,8 @@ from typing import Tuple
 
 import tensorflow as tf
 
-from src.economy.parameters import EconomicParams, convert_to_tf
-from src.ddp.ddp_config import DDPGridConfig
-from src.economy.shocks import initialize_markov_process
+from src.economy.parameters import EconomicParams, ShockParams, convert_to_tf
+from src.ddp.ddp_config import DDPGridConfig, initialize_markov_process
 from src.economy import logic
 from typing import Optional
 
@@ -38,6 +37,7 @@ class InvestmentModelDDP:
     def __init__(
         self, 
         params: EconomicParams, 
+        shock_params: ShockParams,
         grid_config: Optional[DDPGridConfig] = None
     ):
         """
@@ -45,14 +45,16 @@ class InvestmentModelDDP:
 
         Args:
             params (EconomicParams): The economic parameters.
+            shock_params (ShockParams): The shock parameters.
             grid_config (DDPGridConfig): Grid settings (uses defaults if None).
         """
         self.params = params
+        self.shock_params = shock_params
         self.grid_config = grid_config or DDPGridConfig()
         self.beta = tf.constant(1 / (1 + params.r_rate), dtype=tf.float32)
 
         # Generate grids using grid_config
-        z_grid_np, prob_matrix_np = initialize_markov_process(params, self.grid_config.z_size)
+        z_grid_np, prob_matrix_np = initialize_markov_process(shock_params, self.grid_config.z_size)
         k_grid_np = self.grid_config.generate_capital_grid(params)
 
         # Convert to TensorFlow Constants

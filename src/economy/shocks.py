@@ -7,58 +7,130 @@ Focuses on continuous sampling for Deep Learning (Direct Optimization).
 
 import tensorflow as tf
 import numpy as np
-import quantecon as qe
+import numpy as np
 from typing import Optional, Tuple
 from src.economy.parameters import EconomicParams
 from typing import Union
 
-from src.economy.parameters import EconomicParams
+from src.economy.parameters import EconomicParams, ShockParams
 from typing import Union
 
 
-def simulate_productivity_next(
-        z_current: tf.Tensor,
-        params: EconomicParams,
-        epsilon: Optional[tf.Tensor] = None
+def step_ar1_tf(
+    z: tf.Tensor,
+    rho: float,
+    sigma: float,
+    mu: float = 0.0,
+    eps: Optional[tf.Tensor] = None
 ) -> tf.Tensor:
     """
-    Computes next period productivity z' given current z and parameters.
-    Follows AR(1) process on log(z):
-
-        log(z') = (1 - rho)*mu + rho * log(z) + sigma * epsilon
-
+    Single-step AR(1) transition for productivity z (TensorFlow).
+    
+    Process:
+        log(z') = (1 - rho) * mu + rho * log(z) + sigma * eps
+    
     Args:
-        z_current (tf.Tensor): Current productivity levels (levels, not logs).
-        params (EconomicParams): Contains rho, sigma, mu.
-        epsilon (tf.Tensor, optional): Pre-drawn standard normal shocks.
-                                       If None, draws new random shocks internally.
-
+        z: Current productivity (any shape)
+        rho: AR(1) persistence
+        sigma: AR(1) volatility
+        mu: AR(1) unconditional mean of log(z)
+        eps: Pre-drawn standard normal shocks (default: draws internally)
+    
     Returns:
-        tf.Tensor: Next period productivity z' (levels).
+        z_next: Next period productivity (same shape as z)
     """
-    # 1. Ensure we have shocks
-    if epsilon is None:
-        # Generate shocks matching the shape of input z
-        epsilon = tf.random.normal(shape=tf.shape(z_current), dtype=tf.float32)
-
-    # 2. Extract parameters
-    rho = params.rho
-    sigma = params.sigma
-    mu = params.mu
-
-    # 3. Apply AR(1) in Log Space
-    log_z = tf.math.log(tf.maximum(z_current, 1e-8))  # Safety floor
-
-    log_z_next = (1 - rho) * mu + rho * log_z + sigma * epsilon
-
-    # 4. Return to Levels
+    log_z = tf.math.log(tf.maximum(z, 1e-8))
+    
+    if eps is None:
+        eps = tf.random.normal(tf.shape(z), dtype=tf.float32)
+    
+    log_z_next = (1 - rho) * mu + rho * log_z + sigma * eps
     return tf.exp(log_z_next)
+
+
+def step_ar1_numpy(
+    z: Union[float, np.ndarray],
+    rho: float,
+    sigma: float,
+    mu: float = 0.0,
+    rng: Optional[np.random.Generator] = None
+) -> Union[float, np.ndarray]:
+    """
+    Single-step AR(1) transition for productivity z (NumPy).
+    
+    Args:
+        z: Current productivity
+        rho: Persistence
+        sigma: Volatility
+        mu: Mean
+        rng: Random number generator (defaults to np.random.default_rng())
+        
+    Returns:
+        z_next
+    """
+    if rng is None:
+        rng = np.random.default_rng()
+        
+    log_z = np.log(np.maximum(z, 1e-8))
+    
+    if isinstance(z, np.ndarray):
+        eps = rng.standard_normal(size=z.shape)
+    else:
+        eps = rng.standard_normal()
+        
+    log_z_next = (1 - rho) * mu + rho * log_z + sigma * eps
+    
+    if isinstance(z, float):
+        return float(np.exp(log_z_next))
+    return np.exp(log_z_next)
+
+
+def draw_AiO_shocks(
+    n: int,
+    z_curr: tf.Tensor,
+    rho: float,
+    sigma: float,
+    mu: float = 0.0,
+    rng: Optional[np.random.Generator] = None
+) -> Tuple[tf.Tensor, tf.Tensor]:
+    """
+    Draw two independent next-period productivity shocks for AiO method.
+    
+    log(z') = (1 - rho) * mu + rho * log(z) + sigma * epsilon
+    
+    Args:
+        n: Batch size
+        z_curr: Current productivity (n,) or (n, 1)
+        rho: AR(1) persistence
+        sigma: AR(1) volatility
+        mu: AR(1) mean
+        rng: NumPy random generator (for reproducibility)
+    
+    Returns:
+        z_next_1, z_next_2: Two independent z' draws
+    """
+    z_curr = tf.reshape(z_curr, [-1, 1])
+    
+    # Use step_ar1_tf logic but with controlled shocks
+    # We manually generate shocks to ensure independence and support seed
+    if rng is not None:
+        eps1 = tf.constant(rng.standard_normal(size=(n, 1)), dtype=tf.float32)
+        eps2 = tf.constant(rng.standard_normal(size=(n, 1)), dtype=tf.float32)
+    else:
+        eps1 = tf.random.normal((n, 1), dtype=tf.float32)
+        eps2 = tf.random.normal((n, 1), dtype=tf.float32)
+    
+    z_next_1 = step_ar1_tf(z_curr, rho, sigma, mu, eps=eps1)
+    z_next_2 = step_ar1_tf(z_curr, rho, sigma, mu, eps=eps2)
+    
+    return z_next_1, z_next_2
+
 
 
 def draw_initial_states(
         n_samples: int,
         bounds: Tuple[Tuple[float, float], Tuple[float, float]],
-        params: EconomicParams,
+        shock_params: ShockParams,
         previous_states: Optional[Tuple[tf.Tensor, tf.Tensor]] = None
 ) -> Tuple[tf.Tensor, tf.Tensor]:
     """
@@ -71,7 +143,7 @@ def draw_initial_states(
     Args:
         n_samples (int): Batch size (required for random generation).
         bounds (Tuple): ((k_min, k_max), (b_min, b_max)).
-        params (EconomicParams): Model parameters.
+        shock_params (ShockParams): Shock parameters.
         previous_states (tuple, optional): (z_last, k_last) from previous batch.
                                            If provided, these are returned immediately.
 
@@ -98,11 +170,11 @@ def draw_initial_states(
 
     # 2. Draw Productivity from Ergodic Distribution
     # The ergodic distribution of log(z) is N(mu, sigma^2 / (1 - rho^2))
-    ergodic_std = params.sigma / np.sqrt(1 - params.rho ** 2)
+    ergodic_std = shock_params.sigma / np.sqrt(1 - shock_params.rho ** 2)
 
     log_z_init = tf.random.normal(
         shape=(n_samples,),
-        mean= (1 - params.rho) * params.mu,
+        mean= (1 - shock_params.rho) * shock_params.mu,
         stddev=ergodic_std,
         dtype=tf.float32
     )
@@ -113,69 +185,3 @@ def draw_initial_states(
     return z_init, k_init
 
 
-def initialize_markov_process(
-    params: EconomicParams, 
-    z_size: int = 15
-) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Discretizes the exogenous AR(1) shock process using Tauchen's method.
-
-    Args:
-        params (EconomicParams): The economic parameters containing rho, sigma, mu.
-        z_size (int): Number of grid points for discretization.
-
-    Returns:
-        Tuple[np.ndarray, np.ndarray]:
-            - z_grid: 1D array of state values (productivity levels).
-            - prob_matrix: 2D Transition probability matrix of shape (z_size, z_size).
-    """
-    mc = qe.tauchen(
-        n=z_size,
-        rho=params.rho,
-        sigma=params.sigma,
-        mu=params.mu,
-        n_std=3  # Standard width coverage
-    )
-
-    z_grid = np.exp(mc.state_values)  # Convert log-states to levels
-    prob_matrix = mc.P
-
-    # Ensure strict row normalization (handling potential float precision issues)
-    prob_matrix = prob_matrix / prob_matrix.sum(axis=1, keepdims=True)
-
-    return z_grid, prob_matrix
-
-
-def get_sampling_bounds(
-    params: EconomicParams,
-    grid_config: "DDPGridConfig" = None
-) -> Tuple[Tuple[float, float], Tuple[float, float]]:
-    """
-    Extracts the min/max bounds for DNN sampling using the existing grid logic.
-    This ensures the DNN and DDP solve over the EXACT same state space.
-
-    Args:
-        params: Economic parameters.
-        grid_config: Grid configuration (uses default if None).
-
-    Returns:
-        ((k_min, k_max), (b_min, b_max))
-    """
-    # Import here to avoid circular import
-    from src.ddp.ddp_config import DDPGridConfig
-    
-    grid_config = grid_config or DDPGridConfig()
-    
-    # Generate capital grid using grid_config
-    k_grid = grid_config.generate_capital_grid(params)
-    k_min, k_max = float(k_grid[0]), float(k_grid[-1])
-
-    # Get productivity bounds
-    z_grid, _ = initialize_markov_process(params, grid_config.z_size)
-    z_max = float(z_grid[-1])
-
-    # Generate bond grid
-    b_grid = grid_config.generate_bond_grid(params, k_max, z_max)
-    b_min, b_max = float(b_grid[0]), float(b_grid[-1])
-
-    return (k_min, k_max), (b_min, b_max)

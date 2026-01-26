@@ -3,7 +3,7 @@ import tensorflow as tf
 import numpy as np
 
 # Adjust imports to match your folder structure
-from src.economy.parameters import EconomicParams
+from src.economy.parameters import EconomicParams, ShockParams
 from src.ddp import DDPGridConfig
 from src.ddp.ddp_investment import InvestmentModelDDP
 
@@ -15,8 +15,9 @@ def model_ddp():
     Uses a small grid to keep tests fast.
     """
     params = EconomicParams()
+    shock_params = ShockParams()
     grid_config = DDPGridConfig(z_size=5, k_size=10)
-    return InvestmentModelDDP(params, grid_config)
+    return InvestmentModelDDP(params, shock_params, grid_config)
 
 
 def test_initialization_shapes(model_ddp):
@@ -50,7 +51,8 @@ def test_reward_values_no_costs():
         delta=1.0,
     )
     grid_config = DDPGridConfig(k_size=5, z_size=2, grid_type="log_linear")
-    model = InvestmentModelDDP(params, grid_config)
+    shock_params = ShockParams()
+    model = InvestmentModelDDP(params, shock_params, grid_config)
 
     # Extract values
     z = model.z_grid[0]
