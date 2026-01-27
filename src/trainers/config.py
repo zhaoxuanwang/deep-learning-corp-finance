@@ -40,9 +40,19 @@ class AnnealingConfig:
 @dataclass
 class RiskyDebtConfig:
     """Configuration specific to Risky Debt models."""
-    lambda_1: float = 1.0       # Price weight for critic
-    lambda_2: float = 1.0       # Price weight for actor
-    lambda_price: float = 1.0   # Price weight for LR
+    # BR method: price constraint weights
+    lambda_1: float = 1.0
+    lambda_2: float = 1.0
+
+    # LR method: adaptive Lagrange multiplier parameters
+    lambda_price_init: float = 1.0
+    learning_rate_lambda: float = 0.01
+    epsilon_price: float = 0.01
+    polyak_weight: float = 0.1
+    n_value_update_freq: int = 1
+    learning_rate_value: Optional[float] = None
+
+    # Default probability smoothing (shared by LR and BR)
     epsilon_D_0: float = 0.1
     epsilon_D_min: float = 1e-4
     decay_d: float = 0.99

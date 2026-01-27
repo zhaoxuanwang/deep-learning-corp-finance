@@ -41,132 +41,250 @@ logger = logging.getLogger(__name__)
 
 class RiskyDebtTrainerLR:
     """
-    LR Trainer for Risky Debt.
+    Lifetime Reward trainer for Risky Debt model with adaptive constraint enforcement.
+
+    Maximizes lifetime utility subject to zero-profit pricing constraint:
+        minimize: -E[Σ_t β^t·u_t] + λ_t·(L_price - ε)
+
+    where λ_t is adapted via Polyak-averaged gradient ascent on the Lagrangian.
+    The value network is trained jointly using temporal difference learning to
+    estimate default probabilities required for bond pricing.
     """
     def __init__(
         self,
         policy_net: RiskyPolicyNetwork,
         price_net: RiskyPriceNetwork,
+        value_net: RiskyValueNetwork,
         params: EconomicParams,
         shock_params: ShockParams,
         optimizer_policy: Optional[tf.keras.optimizers.Optimizer] = None,
         optimizer_price: Optional[tf.keras.optimizers.Optimizer] = None,
+        optimizer_value: Optional[tf.keras.optimizers.Optimizer] = None,
         T: int = 32,
         batch_size: int = 128,
-        lambda_price: float = 1.0,
+        lambda_price_init: float = 1.0,
+        learning_rate_lambda: float = 0.01,
+        epsilon_price: float = 0.01,
+        polyak_weight: float = 0.1,
+        n_value_update_freq: int = 1,
         smoothing: Optional[AnnealingSchedule] = None,
-        logit_clip: float = 20.0,
-        value_net_for_default: Optional[RiskyValueNetwork] = None
+        logit_clip: float = 20.0
     ):
         self.policy_net = policy_net
         self.price_net = price_net
+        self.value_net = value_net
         self.params = params
         self.shock_params = shock_params
         self.optimizer_policy = optimizer_policy or tf.keras.optimizers.Adam(1e-3)
         self.optimizer_price = optimizer_price or tf.keras.optimizers.Adam(1e-3)
+        self.optimizer_value = optimizer_value or tf.keras.optimizers.Adam(1e-3)
         self.T = T
         self.batch_size = batch_size
-        self.lambda_price = lambda_price
         self.smoothing = smoothing or AnnealingSchedule(init_temp=0.1, min=1e-4, decay=0.99)
         self.logit_clip = logit_clip
         self.beta = 1.0 / (1.0 + params.r_rate)
-        
-        # LR needs value estimate for default prob p^D
-        self._value_net = value_net_for_default
+
+        # Adaptive Lagrange multiplier state
+        self.lambda_price = tf.Variable(lambda_price_init, trainable=False, dtype=tf.float32)
+        self.learning_rate_lambda = learning_rate_lambda
+        self.epsilon_price = epsilon_price
+        self.polyak_weight = polyak_weight
+        self.n_value_update_freq = n_value_update_freq
+        self.price_loss_avg = tf.Variable(0.0, trainable=False, dtype=tf.float32)
+        self._step_counter = 0
     
-    def train_step(self, k: tf.Tensor, b: tf.Tensor, z_path: tf.Tensor, z_fork: Optional[tf.Tensor] = None, temperature: float = 0.1) -> Dict[str, float]:
+    def _update_value_network(
+        self,
+        k_init: tf.Tensor,
+        b_init: tf.Tensor,
+        z_path: tf.Tensor,
+        z_fork: tf.Tensor,
+        temperature: float
+    ) -> float:
         """
-        Executes one training step for the Lifetime Reward (LR) + Price Consistency method.
+        Update value network via temporal difference learning.
+
+        Uses current policy rollout to compute TD targets:
+            target = u_t + β·E[V(s_{t+1})]
+
+        where u_t is immediate utility and continuation values are averaged
+        over forked shock realizations for variance reduction.
 
         Args:
-            k (tf.Tensor): Initial capital batch. Shape: (Batch, 1) or (Batch,).
-            b (tf.Tensor): Initial debt batch. Shape: (Batch, 1) or (Batch,).
-            z_path (tf.Tensor): Productivity paths. Shape: (Batch, T+1).
-            z_fork (Optional[tf.Tensor]): Forked productivity paths for pricing expectation. Shape: (Batch, T).
-            temperature (float): Annealing temperature for smooth gates.
+            k_init: Initial capital (Batch, 1)
+            b_init: Initial debt (Batch, 1)
+            z_path: Main productivity trajectory (Batch, T+1)
+            z_fork: Forked productivity for variance reduction (Batch, T)
+            temperature: Annealing temperature for smooth gates
 
         Returns:
-            Dict[str, float]: Dictionary of losses and metrics.
+            Mean squared TD error across trajectory
         """
-        n = tf.shape(k)[0]
-        utilities_list = []
-        
-        # 1. Rollout for LR
-        with tf.GradientTape(persistent=True) as tape:
-            k = tf.reshape(k, [-1, 1])
-            b = tf.reshape(b, [-1, 1])
-            z = tf.reshape(z_path[:, 0], [-1, 1])
-            
-            # 2. Price Loss (Lifetime Consistency)
-            # Accumulate price loss at every step t using deterministic next states from dataset.
-            # z_next_main: from z_path (t -> t+1) used for R_1
-            # z_next_fork: from z_fork (t) used for R_2 (alternative realization for expectation)
-            loss_price_accum = 0.0
-            
+        with tf.GradientTape() as tape:
+            k_curr = tf.reshape(k_init, [-1, 1])
+            b_curr = tf.reshape(b_init, [-1, 1])
+
+            value_losses = []
+
             for t in range(self.T):
                 z_curr = tf.reshape(z_path[:, t], [-1, 1])
                 z_next_main = tf.reshape(z_path[:, t+1], [-1, 1])
-                
-                # Strict usage of z_fork implies we must have it for pricing
-                if z_fork is None:
-                    raise ValueError("z_fork is required for Risky Debt pricing but was not provided.")
-                z_next_fork = tf.reshape(z_fork[:, t], [-1, 1]) 
+                z_next_fork = tf.reshape(z_fork[:, t], [-1, 1])
 
-                # Policy Step: (k, b, z) -> (k', b')
-                k_next, b_next = self.policy_net(k, b, z_curr)
-                
-                # Pricing Step: (k', b', z) -> r_tilde
-                r_tilde = self.price_net(k_next, b_next, z_curr)
-                
-                # Cash Flow Calculation
+                # Policy rollout (detached from value gradient)
+                k_next = tf.stop_gradient(self.policy_net(k_curr, b_curr, z_curr)[0])
+                b_next = tf.stop_gradient(self.policy_net(k_curr, b_curr, z_curr)[1])
+                r_tilde = tf.stop_gradient(self.price_net(k_next, b_next, z_curr))
+
+                # Current value estimate (trainable)
+                V_curr = self.value_net(k_curr, b_curr, z_curr)
+
+                # Compute immediate utility
                 e = cash_flow_risky_debt(
-                    k, k_next, b, b_next, z_curr, 
+                    k_curr, k_next, b_curr, b_next, z_curr,
+                    r_tilde, self.params, temperature=temperature, logit_clip=self.logit_clip
+                )
+                eta = external_financing_cost(
+                    e, self.params, temperature=temperature, logit_clip=self.logit_clip
+                )
+                u_curr = e - eta
+
+                # Continuation values (detached, averaged over two forks)
+                V_next_1 = tf.stop_gradient(self.value_net(k_next, b_next, z_next_main))
+                V_next_2 = tf.stop_gradient(self.value_net(k_next, b_next, z_next_fork))
+                V_next_avg = 0.5 * (V_next_1 + V_next_2)
+
+                # TD target
+                target = u_curr + self.beta * V_next_avg
+                target = tf.stop_gradient(target)
+
+                # MSE loss
+                value_losses.append((V_curr - target) ** 2)
+
+                k_curr, b_curr = k_next, b_next
+
+            value_loss = tf.reduce_mean(value_losses)
+
+        # Update value network only
+        grads = tape.gradient(value_loss, self.value_net.trainable_variables)
+        self.optimizer_value.apply_gradients(zip(grads, self.value_net.trainable_variables))
+
+        return float(value_loss)
+
+    def train_step(
+        self,
+        k: tf.Tensor,
+        b: tf.Tensor,
+        z_path: tf.Tensor,
+        z_fork: Optional[tf.Tensor] = None,
+        temperature: float = 0.1
+    ) -> Dict[str, float]:
+        """
+        Execute one training iteration with adaptive constraint enforcement.
+
+        Training sequence:
+        1. Rollout policy and compute lifetime reward loss and pricing residual
+        2. Update policy/price networks via augmented Lagrangian
+        3. Adapt Lagrange multiplier based on Polyak-averaged constraint violation
+        4. Update value network periodically via TD learning
+
+        Args:
+            k: Initial capital (Batch,) or (Batch, 1)
+            b: Initial debt (Batch,) or (Batch, 1)
+            z_path: Main productivity trajectory (Batch, T+1)
+            z_fork: Forked productivity for All-in-One estimation (Batch, T)
+            temperature: Annealing temperature for smooth indicator gates
+
+        Returns:
+            Dictionary containing:
+                - loss_lr: Lifetime reward loss
+                - loss_price: Current pricing constraint residual
+                - loss_price_avg: Polyak-averaged pricing residual
+                - loss_value: Value network TD loss (if updated this step)
+                - lambda_price: Current Lagrange multiplier value
+                - mean_utility: Average per-period utility
+                - epsilon_D: Current default probability smoothing temperature
+        """
+        if z_fork is None:
+            raise ValueError("z_fork is required for Risky Debt pricing.")
+
+        k = tf.reshape(k, [-1, 1])
+        b = tf.reshape(b, [-1, 1])
+
+        # Policy/price network update
+        utilities_list = []
+        loss_price_accum = 0.0
+
+        with tf.GradientTape(persistent=True) as tape:
+            k_curr, b_curr = k, b
+
+            for t in range(self.T):
+                z_curr = tf.reshape(z_path[:, t], [-1, 1])
+                z_next_main = tf.reshape(z_path[:, t+1], [-1, 1])
+                z_next_fork = tf.reshape(z_fork[:, t], [-1, 1])
+
+                k_next, b_next = self.policy_net(k_curr, b_curr, z_curr)
+                r_tilde = self.price_net(k_next, b_next, z_curr)
+
+                e = cash_flow_risky_debt(
+                    k_curr, k_next, b_curr, b_next, z_curr,
                     r_tilde, self.params, temperature=temperature, logit_clip=self.logit_clip
                 )
                 eta = external_financing_cost(
                     e, self.params, temperature=temperature, logit_clip=self.logit_clip
                 )
                 utilities_list.append(e - eta)
-                
-                # --- Price Loss (Deterministic via Data) ---
-                if self._value_net is not None:
-                    V_tilde_1 = self._value_net(k_next, b_next, z_next_main)
-                    V_tilde_2 = self._value_net(k_next, b_next, z_next_fork)
-                    p_D_1 = smooth_default_prob(V_tilde_1, self.smoothing, logit_clip=self.logit_clip)
-                    p_D_2 = smooth_default_prob(V_tilde_2, self.smoothing, logit_clip=self.logit_clip)
-                else:
-                    p_D_1 = tf.zeros_like(k_next)
-                    p_D_2 = tf.zeros_like(k_next)
-                
+
+                # Compute pricing residual using value network for default probability
+                V_tilde_1 = self.value_net(k_next, b_next, z_next_main)
+                V_tilde_2 = self.value_net(k_next, b_next, z_next_fork)
+                p_D_1 = smooth_default_prob(V_tilde_1, self.smoothing, logit_clip=self.logit_clip)
+                p_D_2 = smooth_default_prob(V_tilde_2, self.smoothing, logit_clip=self.logit_clip)
+
                 R_1 = recovery_value(k_next, z_next_main, self.params)
                 R_2 = recovery_value(k_next, z_next_fork, self.params)
-                
+
                 f_p1 = pricing_residual_zero_profit(b_next, self.params.r_rate, r_tilde, p_D_1, R_1)
                 f_p2 = pricing_residual_zero_profit(b_next, self.params.r_rate, r_tilde, p_D_2, R_2)
                 l_p = compute_price_loss_aio(f_p1, f_p2)
                 loss_price_accum += l_p
-                # -------------------------------------------
 
-                k = k_next
-                b = b_next
-            
+                k_curr, b_curr = k_next, b_next
+
             utilities = tf.concat(utilities_list, axis=1)
             loss_lr = compute_lr_loss(utilities, self.beta)
             loss_price = loss_price_accum / tf.cast(self.T, tf.float32)
-            
-            loss_policy = loss_lr + self.lambda_price * loss_price
-            
+            loss_policy = loss_lr + self.lambda_price * (loss_price - self.epsilon_price)
+
         grads_policy = tape.gradient(loss_policy, self.policy_net.trainable_variables)
         self.optimizer_policy.apply_gradients(zip(grads_policy, self.policy_net.trainable_variables))
-        
-        grads_price = tape.gradient(loss_price, self.price_net.trainable_variables)
+
+        grads_price = tape.gradient(loss_policy, self.price_net.trainable_variables)
         self.optimizer_price.apply_gradients(zip(grads_price, self.price_net.trainable_variables))
-        
+
         del tape
+
+        # Lagrange multiplier update with Polyak averaging
+        loss_price_detached = tf.stop_gradient(loss_price)
+        self.price_loss_avg.assign(
+            (1.0 - self.polyak_weight) * self.price_loss_avg + self.polyak_weight * loss_price_detached
+        )
+        lambda_update = self.learning_rate_lambda * (self.price_loss_avg - self.epsilon_price)
+        self.lambda_price.assign(tf.maximum(0.0, self.lambda_price + lambda_update))
+
+        # Periodic value network update
+        loss_value = 0.0
+        self._step_counter += 1
+        if self._step_counter % self.n_value_update_freq == 0:
+            loss_value = self._update_value_network(k, b, z_path, z_fork, temperature)
         return {
             "loss_lr": float(loss_lr),
             "loss_price": float(loss_price),
-            "mean_utility": float(tf.reduce_mean(utilities))
+            "loss_price_avg": float(self.price_loss_avg),
+            "loss_value": float(loss_value),
+            "lambda_price": float(self.lambda_price),
+            "mean_utility": float(tf.reduce_mean(utilities)),
+            "epsilon_D": float(self.smoothing.value)
         }
 
 
@@ -395,66 +513,104 @@ def train_risky_lr(
     shock_params: ShockParams,
     bounds: Dict[str, Tuple[float, float]]
 ) -> Dict[str, Any]:
-    """Train Risky Debt Model using LR + Price."""
+    """
+    Train Risky Debt model via constrained lifetime reward maximization.
+
+    Uses adaptive Lagrange multiplier to enforce zero-profit bond pricing
+    constraint while maximizing firm value. The value network is trained
+    jointly to provide default probability estimates required for pricing.
+
+    Args:
+        dataset: Training data with trajectories
+        net_config: Network architecture configuration
+        opt_config: Optimization hyperparameters
+        method_config: Method-specific configuration (must include risky field)
+        anneal_config: Annealing schedule for smooth gates
+        params: Economic parameters
+        shock_params: Shock process parameters
+        bounds: State space bounds (k, b, log_z)
+
+    Returns:
+        Dictionary with training history and trained networks
+    """
     k_bounds = bounds['k']
     b_bounds = bounds['b']
-    
+
     # Check for risky config
     if method_config.risky is None:
         raise ValueError("RiskyDebtConfig required in method_config.risky for train_risky_lr")
     risky_cfg = method_config.risky
 
-    # 0. Data Setup
+    # Data Setup
     if 'z_path' in dataset:
         T = dataset['z_path'].shape[1] - 1
     else:
         raise ValueError("Cannot infer Horizon T from dataset.")
-        
+
     # Create batched iterator
     tf_dataset = tf.data.Dataset.from_tensor_slices(dataset)
     tf_dataset = tf_dataset.shuffle(buffer_size=dataset['k0'].shape[0]).batch(opt_config.batch_size).repeat()
     data_iter = iter(tf_dataset)
 
+    # Build all three networks
     policy_net, value_net, price_net = build_risky_networks(
         k_min=k_bounds[0], k_max=k_bounds[1],
         b_min=b_bounds[0], b_max=b_bounds[1],
         r_risk_free=params.r_rate,
         n_layers=net_config.n_layers, n_neurons=net_config.n_neurons, activation=net_config.activation
     )
-    
-    # Pre-build value net for default prob? LR usually doesn't train Value.
-    # We pass None or strict separation. Here we pass None to replicate original behavior unless we add value training.
-    # Original trainer_risky used `self._value_net` but didn't train it in LR mode.
-    
+
+    # Setup annealing schedule for default probability
+    smoothing = AnnealingSchedule(
+        init_temp=risky_cfg.epsilon_D_0,
+        min=risky_cfg.epsilon_D_min,
+        decay=risky_cfg.decay_d,
+        schedule="exponential"
+    )
+
+    # Determine value network learning rate
+    lr_value = risky_cfg.learning_rate_value if risky_cfg.learning_rate_value is not None else opt_config.learning_rate
+
+    # Create trainer with adaptive Lagrange multiplier
     trainer = RiskyDebtTrainerLR(
         policy_net=policy_net,
         price_net=price_net,
+        value_net=value_net,  # Now trained jointly
         params=params,
         shock_params=shock_params,
+        optimizer_policy=tf.keras.optimizers.Adam(opt_config.learning_rate),
+        optimizer_price=tf.keras.optimizers.Adam(opt_config.learning_rate),
+        optimizer_value=tf.keras.optimizers.Adam(lr_value),
         T=T,
         batch_size=opt_config.batch_size,
-        lambda_price=risky_cfg.lambda_price,
-        logit_clip=anneal_config.logit_clip,
-        value_net_for_default=value_net # Passed but not trained here
+        lambda_price_init=risky_cfg.lambda_price_init,
+        learning_rate_lambda=risky_cfg.learning_rate_lambda,
+        epsilon_price=risky_cfg.epsilon_price,
+        polyak_weight=risky_cfg.polyak_weight,
+        n_value_update_freq=risky_cfg.n_value_update_freq,
+        smoothing=smoothing,
+        logit_clip=anneal_config.logit_clip
     )
-    
+
     history = execute_training_loop(
-        trainer, 
-        data_iter, 
+        trainer,
+        data_iter,
         opt_config,
-        anneal_config, 
+        anneal_config,
         method_name="risky_lr"
     )
-    
+
     return {
         "history": history,
-        "_policy_net": policy_net, "_price_net": price_net, "_value_net": value_net,
+        "_policy_net": policy_net,
+        "_price_net": price_net,
+        "_value_net": value_net,
         "_configs": {
             "network": net_config,
             "optimization": opt_config,
             "method": method_config,
             "annealing": anneal_config
-        }, 
+        },
         "_params": params
     }
 

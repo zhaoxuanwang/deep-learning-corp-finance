@@ -81,16 +81,17 @@ def test_basic_trainer_lr_step(data_gen, params, shock_params):
     assert isinstance(metrics["loss_LR"], float)
 
 def test_risky_trainer_lr_step(data_gen, params, shock_params):
+    """Test RiskyDebtTrainerLR with adaptive multiplier and joint value training."""
     # 1. Get Batch
     batch = next(data_gen.get_training_batches())
     k0 = batch['k0']
     b0 = batch['b0']
     z_path = batch['z_path']
     z_fork = batch['z_fork'] # Required for Risky LR (pricing)
-    
+
     T = z_path.shape[1] - 1
-    
-    # 2. Build Networks
+
+    # 2. Build Networks (all three are required now)
     policy_net, value_net, price_net = build_risky_networks(
         k_min=0.1, k_max=10.0,
         b_min=0.0, b_max=1.0,
@@ -98,24 +99,44 @@ def test_risky_trainer_lr_step(data_gen, params, shock_params):
         n_layers=2, n_neurons=16,
         activation='relu'
     )
-    
-    # 3. Init Trainer
+
+    # 3. Init Trainer with new parameters
     trainer = RiskyDebtTrainerLR(
         policy_net=policy_net,
         price_net=price_net,
+        value_net=value_net,  # Now required and trained jointly
         params=params,
         shock_params=shock_params,
         T=T,
         batch_size=32,
-        logit_clip=20.0,
-        value_net_for_default=None # Optional, but good to test default None
+        lambda_price_init=1.0,
+        learning_rate_lambda=0.01,
+        epsilon_price=0.01,
+        polyak_weight=0.1,
+        n_value_update_freq=1,
+        logit_clip=20.0
     )
-    
-    # 4. Train Step
-    metrics = trainer.train_step(k0, b0, z_path, z_fork, temperature=0.1)
-    
-    print(f"Risky LR Metrics: {metrics}")
-    
+
+    # 4. Run multiple train steps to test Lagrange multiplier adaptation
+    for i in range(3):
+        metrics = trainer.train_step(k0, b0, z_path, z_fork, temperature=0.1)
+        print(f"Risky LR Step {i+1} Metrics: {metrics}")
+
+    # 5. Assertions
     assert "loss_lr" in metrics
     assert "loss_price" in metrics
+    assert "loss_price_avg" in metrics
+    assert "loss_value" in metrics
+    assert "lambda_price" in metrics
+    assert "mean_utility" in metrics
+
     assert isinstance(metrics["loss_lr"], float)
+    assert isinstance(metrics["loss_price"], float)
+    assert isinstance(metrics["lambda_price"], float)
+
+    # Check that lambda is non-negative (constraint)
+    assert metrics["lambda_price"] >= 0.0
+
+    print(f"\nFinal lambda: {metrics['lambda_price']:.4f}")
+    print(f"Final price_loss_avg: {metrics['loss_price_avg']:.4f}")
+    print(f"Target epsilon_price: {trainer.epsilon_price:.4f}")
