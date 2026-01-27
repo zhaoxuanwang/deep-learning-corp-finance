@@ -20,13 +20,16 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 
+from dataclasses import fields
+
 def run_parameter_sweep(
     model_class: Type,
     base_params: Any,
     scenarios: Dict[str, Dict[str, float]],
     solver_method: str = "solve",
     solver_kwargs: Optional[Dict[str, Any]] = None,
-    base_grid_config: Optional[Any] = None
+    base_grid_config: Optional[Any] = None,
+    base_shock_params: Optional[Any] = None
 ) -> Dict[str, Any]:
     """
     Executes a batch of scenarios (parameter sweep) for a given economic model.
@@ -36,24 +39,16 @@ def run_parameter_sweep(
 
     Args:
         model_class (Type): The class of the model to run (e.g., DebtModelDDP).
-        base_params (Any): The baseline parameter dataclass.
+        base_params (Any): The baseline parameter dataclass (EconomicParams).
         scenarios (Dict): A dictionary where keys are scenario names and values
             are dictionaries of parameter overrides (e.g., {"tax": 0.40}).
         solver_method (str): The name of the method to call on the model instance.
         solver_kwargs (Dict, optional): Additional arguments passed to the solver.
         base_grid_config (Any, optional): Grid config for DDP models (DDPGridConfig).
+        base_shock_params (Any, optional): The baseline shock parameters (ShockParams).
 
     Returns:
-        Dict[str, Any]: Raw simulation results containing:
-            {
-                "ScenarioName": {
-                    "params": UpdatedParams,
-                    "solution": (v_star, policy, ...), # Raw Tensors/Arrays
-                    "model": ModelInstance,
-                    "duration": float
-                },
-                ...
-            }
+        Dict[str, Any]: Raw simulation results.
     """
     if solver_kwargs is None:
         solver_kwargs = {}
@@ -61,22 +56,59 @@ def run_parameter_sweep(
     results = {}
     total_scenarios = len(scenarios)
 
-    print(f"\n--- Starting Parameter Sweep for {model_class.__name__} ---")
+    logger.info(f"\n--- Starting Parameter Sweep for {model_class.__name__} ---")
+    
+    # Introspect fields to route overrides correctly
+    econ_fields = {f.name for f in fields(base_params)}
+    shock_fields = set()
+    if base_shock_params:
+        shock_fields = {f.name for f in fields(base_shock_params)}
 
     for i, (name, param_overrides) in enumerate(scenarios.items(), 1):
         start_time = time.time()
-        print(f"[{i}/{total_scenarios}] Running Scenario: '{name}'...")
+        logger.info(f"[{i}/{total_scenarios}] Running Scenario: '{name}'...")
 
-        # 1. Update Parameters (Immutable replacement to prevent side effects)
-        scenario_params = replace(base_params, **param_overrides)
+        # 1. Split Overrides
+        econ_overrides = {}
+        shock_overrides = {}
+        
+        for key, val in param_overrides.items():
+            if key in econ_fields:
+                econ_overrides[key] = val
+            elif key in shock_fields:
+                shock_overrides[key] = val
+            else:
+                # Fallback: Ignore or warn? For now assume it might be handled differently or error
+                logger.warning(f"Parameter '{key}' not found in EconomicParams or ShockParams.")
 
-        # 2. Instantiate Model
-        if base_grid_config is not None:
-            model = model_class(scenario_params, base_grid_config)
-        else:
-            model = model_class(scenario_params)
+        # 2. Update Parameters (Immutable replacement)
+        scenario_params = replace(base_params, **econ_overrides)
+        
+        scenario_shock_params = None
+        if base_shock_params:
+            scenario_shock_params = replace(base_shock_params, **shock_overrides)
 
-        # 3. Solve (Reflection)
+        # 3. Instantiate Model
+        # Models now expect (params, shock_params, grid_config)
+        # We need to handle cases where shock_params might not be used by older models (if any)
+        # But we know DeptModelDDP and InvestmentModelDDP depend on it now.
+        
+        try:
+            if base_grid_config is not None:
+                if base_shock_params:
+                    model = model_class(scenario_params, scenario_shock_params, base_grid_config)
+                else:
+                    model = model_class(scenario_params, base_grid_config)
+            else:
+                if base_shock_params:
+                    model = model_class(scenario_params, scenario_shock_params)
+                else:
+                    model = model_class(scenario_params)
+        except TypeError as e:
+             # Fallback for models or calls that might differ
+             raise TypeError(f"Model instantiation failed. check overrides and signature. Error: {e}")
+
+        # 4. Solve (Reflection)
         if not hasattr(model, solver_method):
             raise AttributeError(f"Model {model_class.__name__} has no method '{solver_method}'")
 
@@ -84,11 +116,12 @@ def run_parameter_sweep(
         solution = solve_func(**solver_kwargs)
 
         duration = time.time() - start_time
-        print(f"   > Completed in {duration:.2f} seconds.")
+        logger.info(f"   > Completed in {duration:.2f} seconds.")
 
-        # 4. Store Raw Results
+        # 5. Store Raw Results
         results[name] = {
             "params": scenario_params,
+            "shock_params": scenario_shock_params,
             "solution": solution,
             "model": model,
             "duration": duration
@@ -112,7 +145,7 @@ def process_investment_output(raw_results: Dict[str, Any]) -> Dict[str, Any]:
     Returns:
         Dict: Clean dictionary with NumPy arrays and derived moments.
     """
-    print("\n--- Processing Investment Output ---")
+    logger.info("\n--- Processing Investment Output ---")
     processed_data = {}
 
     for name, data in raw_results.items():
@@ -184,7 +217,7 @@ def process_debt_output(raw_results: Dict[str, Any]) -> Dict[str, Any]:
     Returns:
         Dict: Clean dictionary with NumPy arrays and derived moments.
     """
-    print("\n--- Processing Debt Output ---")
+    logger.info("\n--- Processing Debt Output ---")
     processed_data = {}
 
     for name, data in raw_results.items():

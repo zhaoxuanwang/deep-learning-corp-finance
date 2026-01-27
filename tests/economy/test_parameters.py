@@ -13,7 +13,7 @@ from dataclasses import replace
 
 # Import the module under test
 from src.economy import parameters as params_module
-from src.economy.parameters import EconomicParams
+from src.economy.parameters import EconomicParams, ShockParams
 from src.ddp import DDPGridConfig
 
 
@@ -36,10 +36,11 @@ def test_input_validation_logic():
     Test that the __post_init__ validator catches invalid economic values.
     """
     base = EconomicParams()
+    shock_base = ShockParams()
 
-    # Case 1: Negative Volatility
+    # Case 1: Negative Volatility (ShockParams now)
     with pytest.raises(ValueError, match="sigma"):
-        replace(base, sigma=-0.1)
+        replace(shock_base, sigma=-0.1)
 
     # Case 2: Production returns non-diminishing
     with pytest.raises(ValueError, match="theta"):

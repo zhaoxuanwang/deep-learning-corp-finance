@@ -31,23 +31,22 @@ def investment_gate_ste(
     investment: Numeric,
     eps: float = 1e-6,
     temperature: float = 0.1,
-    mode: str = "ste"
+    logit_clip: float = 20.0,
+    mode: str = "soft"
 ) -> Numeric:
     """
-    Investment indicator gate with optional STE for gradient flow.
-    
-    Delegates to src.dnn.annealing.indicator_abs_gt.
+    Investment indicator gate with smooth function and annealing.
     """
-    from src.dnn.annealing import indicator_abs_gt
-    return indicator_abs_gt(investment, threshold=eps, temperature=temperature, mode=mode)
+    from src.utils.annealing import indicator_abs_gt
+    return indicator_abs_gt(investment, threshold=eps, temperature=temperature, logit_clip=logit_clip, mode=mode)
 
 
 def adjustment_costs(
     k: Numeric,
     k_next: Numeric,
     params: EconomicParams,
-    fixed_cost_gate: str = "ste",
-    temperature: float = 0.1
+    temperature: float = 0.1,
+    logit_clip: float = 20.0
 ) -> Numeric:
     """
     Total Adjustment Costs (Convex + Fixed).
@@ -56,7 +55,6 @@ def adjustment_costs(
         k: Current capital
         k_next: Next period capital
         params: Model parameters (cost_convex, cost_fixed)
-        fixed_cost_gate: Gate mode for fixed cost indicator
         temperature: Temperature for fixed cost gate (if soft/ste)
     """
     investment = compute_investment(k, k_next, params)
@@ -67,7 +65,7 @@ def adjustment_costs(
 
     # 2. Fixed Costs: cost_fixed * k * 1{|I| > eps}
     # Uses STE gate for gradient flow during training
-    is_investing = investment_gate_ste(investment, mode=fixed_cost_gate, temperature=temperature)
+    is_investing = investment_gate_ste(investment, temperature=temperature, logit_clip=logit_clip)
     adj_fixed = params.cost_fixed * safe_k * is_investing
 
     return adj_convex + adj_fixed
@@ -77,14 +75,15 @@ def compute_cash_flow_basic(
     k_next: Numeric, 
     z: Numeric, 
     params: EconomicParams,
-    temperature: float = 0.1
+    temperature: float = 0.1,
+    logit_clip: float = 20.0
 ) -> Numeric:
     """
     Dividend d_t = Profit - Investment - Costs
     """
     profit = production_function(k, z, params)
     investment = compute_investment(k, k_next, params)
-    costs_adjust = adjustment_costs(k, k_next, params, temperature=temperature)
+    costs_adjust = adjustment_costs(k, k_next, params, temperature=temperature, logit_clip=logit_clip)
 
     return profit - investment - costs_adjust
 
@@ -92,8 +91,8 @@ def compute_cash_flow_basic(
 def external_financing_cost(
     e: Numeric,
     params: EconomicParams,
-    gate_mode: str = "ste",
-    temperature: float = 0.1
+    temperature: float = 0.1,
+    logit_clip: float = 20.0
 ) -> Numeric:
     """
     External equity injection cost per outline_v2.md.
@@ -103,12 +102,11 @@ def external_financing_cost(
     Args:
         e: Cash flow / dividends (levels)
         params: Contains cost_inject_fixed (η₀), cost_inject_linear (η₁)
-        gate_mode: "ste" (default), "hard", "soft"
         temperature: Sharpness of the < 0 gate
     """
-    from src.dnn.annealing import indicator_lt
+    from src.utils.annealing import indicator_lt
     
-    is_negative = indicator_lt(e, threshold=0.0, mode=gate_mode, temperature=temperature)
+    is_negative = indicator_lt(e, threshold=0.0, temperature=temperature, logit_clip=logit_clip)
     return is_negative * (params.cost_inject_fixed + params.cost_inject_linear * tf.abs(e))
 
 
@@ -120,7 +118,8 @@ def cash_flow_risky_debt(
     z: Numeric,
     r_tilde: Numeric,
     params: EconomicParams,
-    temperature: float = 0.1
+    temperature: float = 0.1,
+    logit_clip: float = 20.0
 ) -> Numeric:
     """
     Cash flow for risky debt model, using interest rate directly.
@@ -128,7 +127,7 @@ def cash_flow_risky_debt(
     # Basic cash flow components
     profit = production_function(k, z, params)
     investment = compute_investment(k, k_next, params)
-    costs_adjust = adjustment_costs(k, k_next, params, temperature=temperature)
+    costs_adjust = adjustment_costs(k, k_next, params, temperature=temperature, logit_clip=logit_clip)
 
     # Bond price from rate: q = 1/(1+r̃)
     safe_r = tf.maximum(1.0 + r_tilde, 1e-8)

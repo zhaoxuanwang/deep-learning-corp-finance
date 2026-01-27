@@ -11,9 +11,8 @@ from typing import Tuple
 
 import tensorflow as tf
 
-from src.economy.parameters import EconomicParams, convert_to_tf
-from src.ddp.ddp_config import DDPGridConfig
-from src.economy.shocks import initialize_markov_process
+from src.economy.parameters import EconomicParams, ShockParams, convert_to_tf
+from src.ddp.ddp_config import DDPGridConfig, initialize_markov_process
 from src.economy import logic
 from typing import Optional
 
@@ -39,10 +38,10 @@ class DebtModelDDP:
         params (EconomicParams): Container for economic parameters.
         grid_config (DDPGridConfig): Grid discretization settings.
         beta (tf.Tensor): Discount factor.
-        z_grid (tf.Tensor): Productivity grid (nz,).
-        prob_matrix (tf.Tensor): Transition probability matrix (nz, nz).
-        k_grid (tf.Tensor): Capital grid (nk,).
-        b_grid (tf.Tensor): Bond/Debt grid (nb,).
+        z_grid (tf.Tensor): Productivity grid. Shape: (nz,).
+        prob_matrix (tf.Tensor): Transition probability matrix. Shape: (nz, nz).
+        k_grid (tf.Tensor): Capital grid. Shape: (nk,).
+        b_grid (tf.Tensor): Bond/Debt grid. Shape: (nb,).
         nz (int): Size of productivity grid.
         nk (int): Size of capital grid.
         nb (int): Size of bond grid.
@@ -52,6 +51,7 @@ class DebtModelDDP:
     def __init__(
         self, 
         params: EconomicParams, 
+        shock_params: ShockParams,
         grid_config: Optional[DDPGridConfig] = None
     ):
         """
@@ -59,14 +59,16 @@ class DebtModelDDP:
 
         Args:
             params (EconomicParams): The economic parameters.
+            shock_params (ShockParams): The shock parameters.
             grid_config (DDPGridConfig): Grid settings (uses defaults if None).
         """
         self.params = params
+        self.shock_params = shock_params
         self.grid_config = grid_config or DDPGridConfig()
         self.beta = tf.constant(1 / (1 + params.r_rate), dtype=tf.float32)
 
         # --- 1. Generate Grids ---
-        z_grid_np, prob_matrix_np = initialize_markov_process(params, self.grid_config.z_size)
+        z_grid_np, prob_matrix_np = initialize_markov_process(shock_params, self.grid_config.z_size)
         k_grid_np = self.grid_config.generate_capital_grid(params)
         b_grid_np = self.grid_config.generate_bond_grid(
             params,
@@ -492,8 +494,8 @@ class DebtModelDDP:
                 rhs, perm=[axis_k_curr, axis_b_curr, axis_k_next, axis_b_next]
             )
 
-            # C. CRITICAL: Runtime Shape Assertion
-            # This ensures dimensions are exactly where we think they are.
+            # C. Runtime Shape Assertion
+            # Ensures dimensions are exactly where we think they are.
             tf.debugging.assert_shapes(
                 [(rhs_ordered, (self.nk, self.nb, self.nk, self.nb))],
                 message="Permutation Error: Dimensions are not aligned!",

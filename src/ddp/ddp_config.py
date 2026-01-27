@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from typing import Literal, Tuple
 
 import numpy as np
+import quantecon as qe
 
 from src.economy.parameters import EconomicParams
 
@@ -124,3 +125,72 @@ class DDPGridConfig:
         b_min = -1.5 * k_max
         
         return np.linspace(b_min, b_max, self.b_size)
+
+
+from src.economy.parameters import EconomicParams, ShockParams
+
+def initialize_markov_process(
+    shock_params: ShockParams, 
+    z_size: int = 15
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Discretizes the exogenous AR(1) shock process using Tauchen's method.
+
+    Args:
+        shock_params (ShockParams): The shock parameters containing rho, sigma, mu.
+        z_size (int): Number of grid points for discretization.
+
+    Returns:
+        Tuple[np.ndarray, np.ndarray]:
+            - z_grid: 1D array of state values (productivity levels).
+            - prob_matrix: 2D Transition probability matrix of shape (z_size, z_size).
+    """
+    mc = qe.tauchen(
+        n=z_size,
+        rho=shock_params.rho,
+        sigma=shock_params.sigma,
+        mu=shock_params.mu,
+        n_std=3  # Standard width coverage
+    )
+
+    z_grid = np.exp(mc.state_values)  # Convert log-states to levels
+    prob_matrix = mc.P
+
+    # Ensure strict row normalization (handling potential float precision issues)
+    prob_matrix = prob_matrix / prob_matrix.sum(axis=1, keepdims=True)
+
+    return z_grid, prob_matrix
+
+
+def get_sampling_bounds(
+    params: EconomicParams,
+    shock_params: ShockParams,
+    grid_config: "DDPGridConfig" = None
+) -> Tuple[Tuple[float, float], Tuple[float, float]]:
+    """
+    Extracts the min/max bounds for DNN sampling using the existing grid logic.
+    This ensures the DNN and DDP solve over the EXACT same state space.
+    
+    Args:
+        params: Economic parameters.
+        shock_params: Shock parameters.
+        grid_config: Grid configuration (uses default if None).
+    
+    Returns:
+        ((k_min, k_max), (b_min, b_max))
+    """
+    grid_config = grid_config or DDPGridConfig()
+    
+    # Generate capital grid using grid_config
+    k_grid = grid_config.generate_capital_grid(params)
+    k_min, k_max = float(k_grid[0]), float(k_grid[-1])
+
+    # Get productivity bounds
+    z_grid, _ = initialize_markov_process(shock_params, grid_config.z_size)
+    z_max = float(z_grid[-1])
+
+    # Generate bond grid
+    b_grid = grid_config.generate_bond_grid(params, k_max, z_max)
+    b_min, b_max = float(b_grid[0]), float(b_grid[-1])
+
+    return (k_min, k_max), (b_min, b_max)

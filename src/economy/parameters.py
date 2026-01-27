@@ -20,6 +20,63 @@ import tensorflow as tf
 
 logger = logging.getLogger(__name__)
 
+# =============================================================================
+# SHOCK PARAMS (Single Source of Truth)
+# =============================================================================
+
+@dataclass(frozen=True)
+class ShockParams:
+    """
+    Immutable container for shock process parameters (AR(1)).
+    Separated from EconomicParams to ensure data generation consistency.
+    """
+    rho: float = 0.7
+    sigma: float = 0.15
+    mu: float = 0.0
+
+    def __post_init__(self):
+        if self.sigma <= 0:
+            raise ValueError(f"sigma must be > 0. Got {self.sigma}")
+        
+        if not (-1.0 < self.rho < 1.0):
+            raise ValueError(f"rho must be in (-1, 1). Got {self.rho}")
+       
+    @classmethod
+    def with_overrides(
+        cls,
+        base: Optional[ShockParams] = None,
+        log_changes: bool = True,
+        **overrides
+    ) -> ShockParams:
+        """
+        Update ShockParams with strict validation and logging.
+        
+        Args:
+            base: Existing parameters to update. If None, uses defaults.
+            log_changes: Whether to log the differences.
+            **overrides: Key-value pairs of parameters to update.
+            
+        Returns:
+            New ShockParams instance.
+        """
+        base = base or cls()
+
+        # 1. Validate keys to prevent typos
+        valid_keys = {f.name for f in dataclasses.fields(cls)}
+        if unknown := set(overrides) - valid_keys:
+            raise ValueError(f"Invalid override keys: {unknown}. Valid: {sorted(valid_keys)}")
+
+        # 2. Log significant changes
+        if log_changes:
+            changes = [
+                f"{k}: {getattr(base, k)} -> {v}"
+                for k, v in overrides.items()
+                if getattr(base, k) != v
+            ]
+            if changes:
+                logger.info(f"ShockParams overrides: {', '.join(changes)}")
+
+        return dataclasses.replace(base, **overrides)
 
 # =============================================================================
 # ECONOMIC PARAMS (Single Source of Truth)
@@ -39,9 +96,6 @@ class EconomicParams:
         theta: Production elasticity/returns to scale
         cost_convex: Coefficient for convex adjustment costs (φ₀)
         cost_fixed: Coefficient for fixed adjustment costs (φ₁)
-        rho: Persistence of AR(1) shock process
-        sigma: Volatility of AR(1) shock process
-        mu: Unconditional mean of shock process
         tax: Corporate income tax rate
         cost_default: Default/bankruptcy cost (α)
         cost_inject_fixed: Fixed cost of external equity (η₀)
@@ -62,16 +116,11 @@ class EconomicParams:
     cost_convex: float = 0.01
     cost_fixed: float = 0.0
     
-    # Shock process
-    rho: float = 0.7
-    sigma: float = 0.15
-    mu: float = 0.0
-    
     # Risky debt
     tax: float = 0.3
     cost_default: float = 0.4
-    cost_inject_fixed: float = 0.01
-    cost_inject_linear: float = 0.01
+    cost_inject_fixed: float = 0.0
+    cost_inject_linear: float = 0.0
     frac_liquid: float = 0.5
     
     def __post_init__(self):
@@ -92,13 +141,6 @@ class EconomicParams:
         if self.cost_fixed < 0:
             raise ValueError(f"cost_fixed must be >= 0. Got {self.cost_fixed}")
         
-        # Shock process
-        if self.sigma <= 0:
-            raise ValueError(f"sigma must be > 0. Got {self.sigma}")
-        
-        if not (-1.0 < self.rho < 1.0):
-            raise ValueError(f"rho must be in (-1, 1). Got {self.rho}")
-        
         # Risky debt
         if not (0.0 <= self.cost_default <= 1.0):
             raise ValueError(f"cost_default must be in [0, 1]. Got {self.cost_default}")
@@ -114,7 +156,7 @@ class EconomicParams:
         
         if self.cost_inject_linear < 0:
             raise ValueError(f"cost_inject_linear must be >= 0. Got {self.cost_inject_linear}")
-    
+
     @classmethod
     def with_overrides(
         cls,
@@ -123,37 +165,33 @@ class EconomicParams:
         **overrides
     ) -> EconomicParams:
         """
-        Create new EconomicParams with explicit overrides.
+        Create (or update) EconomicParams with strict validation and logging.
         
         Args:
-            base: Base params to override (default: use class defaults)
-            log_changes: If True, log all parameter changes
-            **overrides: Field overrides
-        
+            base: Existing parameters to update. If None, uses defaults.
+            log_changes: Whether to log the differences.
+            **overrides: Key-value pairs of parameters to update.
+            
         Returns:
-            New EconomicParams with overrides applied
-        
-        Example:
-            params = EconomicParams.with_overrides(cost_convex=1.0, cost_fixed=0.0)
+            New EconomicParams instance.
         """
         base = base or cls()
-        
-        # Validate override keys
-        valid_fields = {f.name for f in dataclasses.fields(cls)}
-        invalid = set(overrides.keys()) - valid_fields
-        if invalid:
-            raise ValueError(f"Invalid override fields: {invalid}. Valid: {valid_fields}")
-        
-        # Log changes
-        if log_changes and overrides:
-            changes = []
-            for k, new_val in overrides.items():
-                old_val = getattr(base, k)
-                if old_val != new_val:
-                    changes.append(f"{k}: {old_val} → {new_val}")
+
+        # 1. Validate keys to prevent typos
+        valid_keys = {f.name for f in dataclasses.fields(cls)}
+        if unknown := set(overrides) - valid_keys:
+            raise ValueError(f"Invalid override keys: {unknown}. Valid: {sorted(valid_keys)}")
+
+        # 2. Log significant changes
+        if log_changes:
+            changes = [
+                f"{k}: {getattr(base, k)} -> {v}"
+                for k, v in overrides.items()
+                if getattr(base, k) != v
+            ]
             if changes:
                 logger.info(f"EconomicParams overrides: {', '.join(changes)}")
-        
+
         return dataclasses.replace(base, **overrides)
     
     def steady_state_k(self) -> float:

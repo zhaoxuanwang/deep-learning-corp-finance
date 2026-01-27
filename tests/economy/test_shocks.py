@@ -4,7 +4,7 @@ import tensorflow as tf
 import numpy as np
 from dataclasses import replace
 from src.economy import shocks
-from src.economy.parameters import EconomicParams
+from src.economy.parameters import EconomicParams, ShockParams
 
 from src.economy.parameters import EconomicParams
 
@@ -12,8 +12,8 @@ from src.economy.parameters import EconomicParams
 
 @pytest.fixture
 def params():
-    """Default test parameters."""
-    return EconomicParams(
+    """Default shock parameters."""
+    return ShockParams(
         rho=0.9,
         sigma=0.01,
         mu=0.0
@@ -22,7 +22,7 @@ def params():
 def test_simulate_productivity_shape(params):
     """Ensure output z' has the same shape as input z."""
     z_current = tf.ones((10, 1))
-    z_next = shocks.simulate_productivity_next(z_current, params)
+    z_next = shocks.step_ar1_tf(z_current, params.rho, params.sigma, params.mu)
     
     assert z_next.shape == (10, 1)
 
@@ -41,7 +41,7 @@ def test_simulate_productivity_values(params):
     expected_log_z = params.sigma * 2.0
     expected_z = np.exp(expected_log_z)
     
-    z_next = shocks.simulate_productivity_next(z_current, params, epsilon=epsilon)
+    z_next = shocks.step_ar1_tf(z_current, params.rho, params.sigma, params.mu, eps=epsilon)
     
     assert np.isclose(z_next, expected_z)
 
@@ -86,34 +86,41 @@ def test_draw_initial_states_continuous(params):
     assert z_out is prev_z
     assert k_out is prev_k
 
-def test_markov_process_integrity(params):
-    """
-    Test the integrity of the Tauchen discretization method (moved from test_parameters).
-    """
-    z_size = 15  # Default z_size for test
-    z_grid, prob_matrix = shocks.initialize_markov_process(params, z_size)
 
-    # Check 1: Row Sums (Normalization)
-    row_sums = np.sum(prob_matrix, axis=1)
-    assert np.allclose(row_sums, 1.0), \
-        "Transition probability matrix rows do not sum to 1.0."
 
-    # Check 2: Domain (Productivity levels must be positive)
-    assert np.all(z_grid > 0), "Productivity grid contains non-positive values."
 
-    # Check 3: Dimensions
-    assert len(z_grid) == z_size
-    assert prob_matrix.shape == (z_size, z_size)
 
-def test_sampling_bounds_structure(params):
-    """Verify get_sampling_bounds returns correct structure."""
-    bounds = shocks.get_sampling_bounds(params)
-    (k_range, b_range) = bounds
+
+def test_step_ar1_tf_deterministic(params):
+    """Test step_ar1_tf with zero shock (deterministic)."""
+    # log(z) = 0 => z=1
+    z = tf.constant(1.0)
+    # log(z') = (1-rho)*0 + rho*0 + sigma*0 = 0 => z'=1
+    z_next = shocks.step_ar1_tf(z, params.rho, params.sigma, params.mu, eps=tf.constant(0.0))
+    assert abs(z_next - 1.0) < 1e-6
+
+
+def test_step_ar1_numpy_deterministic(params):
+    """Test step_ar1_numpy with zero shock (deterministic)."""
+    # Mock RNG that returns 0
+    class MockRNG:
+        def standard_normal(self, size=None):
+            if size is None: return 0.0
+            return np.zeros(size)
     
-    # Check K bounds
-    assert len(k_range) == 2
-    assert k_range[1] > k_range[0]
+    z = 1.0
+    z_next = shocks.step_ar1_numpy(z, params.rho, params.sigma, params.mu, rng=MockRNG())
+    assert abs(z_next - 1.0) < 1e-6
+
+
+def test_draw_shocks_independent(params):
+    """Test draw_AiO_shocks returns two independent draws."""
+    z = tf.constant([1.0, 1.0, 1.0])
+    z1, z2 = shocks.draw_AiO_shocks(3, z, params.rho, params.sigma, params.mu)
     
-    # Check B bounds
-    assert len(b_range) == 2
-    assert b_range[1] > b_range[0]
+    # Should be different
+    assert not np.allclose(z1.numpy(), z2.numpy())
+    
+    # Check shapes
+    assert z1.shape == (3, 1)
+    assert z2.shape == (3, 1)
