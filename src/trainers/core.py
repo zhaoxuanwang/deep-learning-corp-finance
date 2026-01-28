@@ -26,22 +26,77 @@ def execute_training_loop(
 ) -> Dict[str, Any]:
     """
     Execute the common training loop:
-    1. Iterate for n_iter
-    2. Updates annealing schedule
-    3. Calls trainer.train_step()
-    4. Logs metrics
-    
+    1. Validate dataset format matches method requirements
+    2. Iterate for n_iter
+    3. Updates annealing schedule
+    4. Calls trainer.train_step()
+    5. Logs metrics
+
     Args:
         trainer: Object with .train_step(**kwargs) method
         dataset: Iterator yielding batch dictionaries
         opt_config: Optimization configuration
         anneal_config: Annealing configuration
         method_name: Name of the method for logging
-    
+
     Returns:
         History dictionary containing lists of metrics.
+
+    Raises:
+        ValueError: If dataset format doesn't match method requirements
     """
     logger.info(f"Starting Training Loop: Method={method_name}, Iterations={opt_config.n_iter}")
+
+    # ===================================================================
+    # Dataset Format Validation
+    # ===================================================================
+    # Peek at first batch to validate format without consuming it
+    first_batch = next(dataset)
+
+    # Detect method family from name (e.g., "basic_lr" -> "lr")
+    method_parts = method_name.lower().split('_')
+    method_family = None
+    for part in ['lr', 'er', 'br']:
+        if part in method_parts:
+            method_family = part
+            break
+
+    if method_family is None:
+        logger.warning(f"Could not detect method family from '{method_name}', skipping format validation")
+    else:
+        # Validate based on method family
+        batch_keys = set(first_batch.keys())
+
+        if method_family == 'lr':
+            # LR methods require trajectory data
+            required_keys = {'k0', 'z_path'}
+            if not required_keys.issubset(batch_keys):
+                raise ValueError(
+                    f"Method '{method_name}' (LR family) requires TRAJECTORY data with keys {required_keys}.\n"
+                    f"Found keys: {batch_keys}\n"
+                    f"Use DataGenerator.get_training_dataset() or get_training_batches() for LR methods."
+                )
+
+        elif method_family in ['er', 'br']:
+            # ER/BR methods require flattened data
+            required_keys = {'k', 'z', 'z_next_main', 'z_next_fork'}
+            if not required_keys.issubset(batch_keys):
+                raise ValueError(
+                    f"Method '{method_name}' ({method_family.upper()} family) requires FLATTENED data with keys {required_keys}.\n"
+                    f"Found keys: {batch_keys}\n"
+                    f"Use DataGenerator.get_flattened_training_dataset() for ER/BR methods."
+                )
+
+        logger.info(f"Dataset format validation passed for {method_family.upper()} method")
+
+    # Create new iterator that includes the first batch
+    # Use a generator to prepend the first batch
+    def prepend_first_batch(source_iter):
+        yield first_batch
+        yield from source_iter
+
+    dataset = prepend_first_batch(dataset)
+
     start_time = time.time()
     
     # Annealing Schedule
