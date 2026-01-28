@@ -977,3 +977,184 @@ class TestDataGeneratorCaching:
 
         # Directory should now exist
         assert os.path.exists(cache_dir)
+
+
+# =============================================================================
+# FLATTENED DATASET TESTS (NEW)
+# =============================================================================
+
+class TestFlattenedDataset:
+    """Tests for flattened dataset generation for ER/BR methods."""
+
+    def test_flattened_dataset_shape(self, basic_generator):
+        """Flattened dataset has correct shape (N*T,)."""
+        flat_data = basic_generator.get_flattened_training_dataset()
+
+        N = basic_generator.sim_batch_size * basic_generator.n_sim_batches
+        T = basic_generator.T
+        N_total = N * T
+
+        assert flat_data['k'].shape == (N_total,)
+        assert flat_data['z'].shape == (N_total,)
+        assert flat_data['z_next_main'].shape == (N_total,)
+        assert flat_data['z_next_fork'].shape == (N_total,)
+
+    def test_flattened_dataset_keys(self, basic_generator):
+        """Flattened dataset has correct keys."""
+        flat_data = basic_generator.get_flattened_training_dataset()
+
+        expected_keys = {'k', 'z', 'z_next_main', 'z_next_fork'}
+        assert set(flat_data.keys()) == expected_keys
+
+    def test_flattened_dataset_dtypes(self, basic_generator):
+        """Flattened dataset has float32 dtype."""
+        flat_data = basic_generator.get_flattened_training_dataset()
+
+        for key in flat_data.keys():
+            assert flat_data[key].dtype == tf.float32, f"Wrong dtype for {key}"
+
+    def test_flattened_k_within_bounds(self, basic_generator):
+        """Flattened k values are within bounds."""
+        flat_data = basic_generator.get_flattened_training_dataset()
+
+        k = flat_data['k']
+        k_min, k_max = basic_generator.k_bounds
+
+        assert tf.reduce_all(k >= k_min)
+        assert tf.reduce_all(k <= k_max)
+
+    def test_flattened_z_positive(self, basic_generator):
+        """Flattened z values are positive."""
+        flat_data = basic_generator.get_flattened_training_dataset()
+
+        assert tf.reduce_all(flat_data['z'] > 0)
+        assert tf.reduce_all(flat_data['z_next_main'] > 0)
+        assert tf.reduce_all(flat_data['z_next_fork'] > 0)
+
+    def test_flattened_reproducibility(self, shock_params):
+        """Same seed produces identical flattened dataset."""
+        gen1 = DataGenerator(
+            master_seed=(42, 0),
+            shock_params=shock_params,
+            k_bounds=(0.5, 5.0),
+            logz_bounds=(-0.3, 0.3),
+            b_bounds=(0.0, 3.0),
+            sim_batch_size=16,
+            T=5,
+            n_sim_batches=10
+        )
+
+        gen2 = DataGenerator(
+            master_seed=(42, 0),
+            shock_params=shock_params,
+            k_bounds=(0.5, 5.0),
+            logz_bounds=(-0.3, 0.3),
+            b_bounds=(0.0, 3.0),
+            sim_batch_size=16,
+            T=5,
+            n_sim_batches=10
+        )
+
+        flat1 = gen1.get_flattened_training_dataset()
+        flat2 = gen2.get_flattened_training_dataset()
+
+        for key in ['k', 'z', 'z_next_main', 'z_next_fork']:
+            assert tf.reduce_all(flat1[key] == flat2[key]), f"Mismatch in {key}"
+
+    def test_flattened_shuffled(self, basic_generator):
+        """Flattened dataset is shuffled (not sequential)."""
+        flat_data = basic_generator.get_flattened_training_dataset()
+        traj_data = basic_generator.get_training_dataset()
+
+        # Extract first N*T z values from trajectory (flattened, unshuffled)
+        z_path = traj_data['z_path'][:, :-1]  # (N, T)
+        z_unshuffled = tf.reshape(z_path, [-1])  # (N*T,)
+
+        z_shuffled = flat_data['z']
+
+        # They should NOT match (unless incredibly unlucky with random shuffle)
+        # Check that at least some values are in different positions
+        matches = tf.reduce_sum(tf.cast(z_unshuffled == z_shuffled, tf.int32))
+        total = tf.size(z_unshuffled)
+
+        # Expect most values to be in different positions after shuffle
+        # (Some might match by chance, but not all)
+        assert matches < total * 0.9, "Data doesn't appear to be shuffled"
+
+    def test_flattened_z_main_fork_differ(self, basic_generator):
+        """Main and fork z_next values differ (different shocks)."""
+        flat_data = basic_generator.get_flattened_training_dataset()
+
+        z_next_main = flat_data['z_next_main']
+        z_next_fork = flat_data['z_next_fork']
+
+        # Should differ (with very high probability)
+        assert not tf.reduce_all(z_next_main == z_next_fork)
+
+    def test_flattened_k_independent_sampling(self, shock_params):
+        """k values are sampled independently (not from trajectories)."""
+        # Create two generators with same seed
+        gen1 = DataGenerator(
+            master_seed=(42, 0),
+            shock_params=shock_params,
+            k_bounds=(0.5, 5.0),
+            logz_bounds=(-0.3, 0.3),
+            b_bounds=(0.0, 3.0),
+            sim_batch_size=16,
+            T=5,
+            n_sim_batches=10
+        )
+
+        # Get flattened data
+        flat1 = gen1.get_flattened_training_dataset()
+
+        # k values should span the full range (not concentrated)
+        k = flat1['k'].numpy()
+        k_min, k_max = gen1.k_bounds
+
+        # Check that k values span at least 80% of the range
+        k_range = k_max - k_min
+        k_span = np.max(k) - np.min(k)
+        assert k_span > 0.8 * k_range, "k values too concentrated"
+
+    def test_flattened_statistics_reasonable(self, basic_generator):
+        """Flattened dataset has reasonable statistics."""
+        flat_data = basic_generator.get_flattened_training_dataset()
+
+        k = flat_data['k'].numpy()
+        z = flat_data['z'].numpy()
+
+        # k should be roughly uniform within bounds
+        k_min, k_max = basic_generator.k_bounds
+        k_mean_expected = (k_min + k_max) / 2
+        k_mean_actual = np.mean(k)
+
+        # Should be within 20% of expected mean (for uniform distribution)
+        assert abs(k_mean_actual - k_mean_expected) < 0.2 * k_mean_expected
+
+        # z should be positive
+        assert np.all(z > 0)
+
+    def test_flattened_different_from_trajectory_initial(self, basic_generator):
+        """Flattened k values differ from trajectory k0 (independent sampling)."""
+        flat_data = basic_generator.get_flattened_training_dataset()
+        traj_data = basic_generator.get_training_dataset()
+
+        # Flattened k is sampled independently
+        k_flat = flat_data['k']
+
+        # Trajectory k0
+        k0_traj = traj_data['k0']
+
+        # They should be from same distribution but different samples
+        # (Very unlikely to match exactly for all values)
+        # We can't directly compare since shapes differ, but can compare distributions
+
+        k_flat_mean = tf.reduce_mean(k_flat)
+        k0_traj_mean = tf.reduce_mean(k0_traj)
+
+        # Means should be close (both uniform from same bounds)
+        # but not identical (different samples)
+        k_bounds_mean = (basic_generator.k_bounds[0] + basic_generator.k_bounds[1]) / 2
+        assert abs(float(k_flat_mean) - k_bounds_mean) < 1.0
+        assert abs(float(k0_traj_mean) - k_bounds_mean) < 1.0

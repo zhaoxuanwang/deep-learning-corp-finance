@@ -11,10 +11,14 @@ from src.economy.parameters import EconomicParams
 
 @dataclass
 class NetworkConfig:
-    """Configuration for neural network architectures."""
+    """
+    Configuration for neural network architectures.
+
+    Defaults follow report_brief.md lines 341-357 (Common Configs).
+    """
     n_layers: int = 2
     n_neurons: int = 16
-    activation: str = "swish"
+    activation: str = "swish"  # Default per report lines 352-354: "use SiLU (swish) to improve stability"
 
 
 @dataclass
@@ -60,7 +64,13 @@ class RiskyDebtConfig:
 
 @dataclass
 class MethodConfig:
-    """Configuration for the solution method (Algorithm)."""
+    """
+    Configuration for the solution method (Algorithm).
+
+    References:
+        - report_brief.md lines 407-644: Algorithm specifications for LR, ER, BR
+    """
     name: str  # e.g., "basic_lr", "basic_er", "risky_br", etc.
     n_critic: int = 5   # Critic updates per actor update (BR methods)
+    polyak_tau: float = 0.995  # Polyak averaging coefficient for target networks (ER/BR methods)
     risky: Optional[RiskyDebtConfig] = None

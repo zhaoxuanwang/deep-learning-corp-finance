@@ -143,7 +143,28 @@ z^{(2)}_{t+1} = (1-\rho)\mu + \rho \log z^{(1)}_{t} + \sigma  \varepsilon_{t,i}^
 $$
 It is critical to note that $z^{(2)}_{t+1}$ is generated as forks from $z^{(1)}_{t}$ instead of $z^{(2)}_{t}$, so that the rollout of the alternative lifetime shocks $\{z^{(2)}_{t,i}\}^T_{t=1}$ are NOT parallel to the main path $\{z^{(1)}_{t,i}\}^T_{t=1}$.
 
-This nuance is critical because it matches the theoretical transition law in the inter-temporal Euler equation and Bellman equation. This ensures that the ER and BR method can be applied to every period $t$ in the simulated dataset with horizon $T$. 
+This nuance is critical because it matches the theoretical transition law in the inter-temporal Euler equation and Bellman equation. This ensures that the ER and BR method can be applied to every period $t$ in the simulated dataset with horizon $T$. However, for the LR method we must use the main path to be consistent with the continuous AR(1) chain.
+
+```
+Main (AR1 Chain):  z0 -> z1 -> z2 -> z3 -> ... -> zT
+                     \     \     \    ...     \
+Fork (1-step AR1):   z1F   z2F   z3F          zTF
+
+Lifetime reward (LR) only use the main path (z0, z1, ..., zT)
+Cross-product calculation in ER and BR use (z1 * z1F), ..., (zT * zTF)
+```
+
+### Flatten Data for ER and BR
+
+The simulation generates training data by rolling out full trajectories of length $T$ for $N$ i.i.d. firms. While the Lifetime Reward (LR) method requires preserving these trajectories to calculate cumulative lifetime returns, the Euler Residual (ER) and Bellman Residual (BR) methods operate on individual state transitions. To ensure the samples used for Stochastic Gradient Descent (SGD) are independent and identically distributed (i.i.d.), I transform the sequential trajectory data into a randomized experience replay buffer. This is achieved by:
+
+- **Flattening**: The dataset of shape $(N, T)$ is reshaped into a pooled dataset of size $N \times T$. This discards the firm index $i$ and time index $t$, treating every visited state as an independent draw from the ergodic set.
+
+- **Shuffling**: The pooled observations are randomly re-ordered to eliminate serial correlation between consecutive time steps, i.e. apply a random permutation index.
+
+- Each observation in the resulting batch consists of the current state and two next-period realized shocks required for the All-in-One (AiO) estimator: 
+$$\text{Obs} = \left( \underbrace{k, b, z}_{\text{Current State}}, \underbrace{z'_1, z'_2}_{\text{Next Shocks}} \right)$$ 
+where $z'_1$ is the main shock and $z'_2$ is the forked shock. I also check that after the reshuffling, the training dataset should maintain the identical mean and variance as in the original one.
 
 ### Implementation
 
@@ -160,11 +181,11 @@ Internally:
 - Use the AR-1 transition law to rollout $z$'s after $z_0$ based on the realized $\varepsilon$'s. There should be two independent shocks.
 
 Output:
-- Train dataset 
+- Train dataset A (for LR)
+- Train dataset B (identical data points as the LR one, but shuffled for ER and BR)
 - Validation dataset
-- Test dataset (sealed)
-- Note: In addition to the component defined above. Each data set should also include the full $z$ rollout using the transition law
-
+- Test dataset
+  
 ## RNG Seeds
 It is important to use pre-registered RNG seeds to create the datasets. Key points:
 1. **Reproducibility**: exact reruns reproduce the same training/validation/test data
@@ -250,6 +271,11 @@ Outputs:
 - Validation data seeds: $\mathcal{S}^{\mathrm{val}}$
 - Test data seeds: $\mathcal{S}^{\mathrm{test}}$
 
+
+
+
+
+
 ---
 # Network Architecture
 
@@ -330,9 +356,10 @@ Outputs (activations):
 - Compute primitives using **levels** recovered from transforms
 
 ---
-# Theoretical Model Overview
+# Basic Model
 
-## Basic Model (Sec 3.1)
+
+## Theory (Sec 3.1)
 
 **Variables**
 - State: $(k,z)$
@@ -376,7 +403,251 @@ $$
 V(k,z) = \max_{k'}\{e(k,k',z)+\beta\mathbb{E}[V(k',z')\mid z]\}
 $$
 
-## Risky Debt Model (Sec 3.6)
+
+## LR Method
+Policy Network 
+$$k_{t+1}=\Gamma_{\text{policy}}(k_t,z_t;\theta_{\text{policy}})$$
+
+Objective: The objective is to find the optimal parameters $\theta$ that maximize the expected discounted lifetime reward: 
+$$\max_{\theta} \quad \mathbb{E}_{k_0, z_0, \{\varepsilon_t\}_{t=1}^{\infty}} \left[ \sum_{t=0}^{\infty}\beta^t e(k_t, k_{t+1}, z_t) \right] $$
+
+I approximate the infinite horizon objective using a finite horizon simulation $T$. To correct for the truncation at period $T$, I append a Terminal Value function (e.g., the steady-state value of capital).
+
+Given a training batch $\mathcal B$ with initial states $(k_{0,i}, z_{0,i})$ and the main AR(1) shock sequences $\{\varepsilon^{(1)}_{t,i} \}_{t=1}^T$, the empirical loss is given by the negative lifetime rewards:
+
+$$ \min_{\theta} \mathcal{L}^{\text{LR}}(\theta) = -\frac{1}{|\mathcal B|}\sum_{i\in \mathcal B} \left( \sum_{t=0}^{T-1} \beta^t e(k_{t,i}, k_{t+1,i}, z^{(1)}_{t,i}) + \beta^T V^{\text{term}}(k_{T,i}, z^{(1)}_{T,i}) \right) $$
+
+There are many ways to determine the terminal value $V^{\text{term}}$. In this project, we use the steady-state value of capital as the terminal value. The idea is
+- Assume that with long enough $T$ horizon, $k_T$ has already converged to the steady state capital level
+- This implies $k_{SS}\equiv k_T = k_{T+1} = k_{T+2} = \dots$ forever
+- The policy is determined by $I_{SS} = \delta k_{SS}$ to maintain steady state
+- Terminal value is the infinite sum of discounted cash flow at $(k_{SS},z_T)$
+
+$$
+V^{\text{term}}(k_T,z_T) = \sum_{t=T}^{\infty} \beta^t e(k_{SS},k_{SS},z_T)
+= \frac{1}{1-\beta} e(k_{SS},k_{SS},z_T)
+$$
+
+Note that the terminal value is vanshing with $\beta^T \lt 1$ when $T$ is large and/or discount factor is small.
+
+### Algorithm Summary: LR Method
+
+**Initialization** 
+- Initiate economic parameters and the policy network $\Gamma_{\text{policy}}(\theta)$.
+- Data Loading: Load a batch from Training Dataset A.
+
+**Differentiable Simulation** 
+- Using the current policy $\Gamma(\theta)$ and the loaded shocks, simulate the trajectory for $N$ firms for $T$ periods: 
+$$ k_{t+1} = \Gamma_{\text{policy}}(k_t, z^{(1)}_t; \theta) $$
+
+- Keep this operation inside the computation graph (e.g., `tf.GradientTape`) to allow backpropagation through time.
+- Since our data generation has deterministically created shock paths, the capital paths are also deterministic given policy $\theta$
+
+**Policy Update**: 
+- Compute $\mathcal{L}^{\text{LR}}$ (sum of discounted rewards) and update $\theta_{\text{policy}}$ via Stochastic Gradient Descent (SGD) to minimize the loss.
+
+**Iteration** 
+- Repeat until $\mathcal{L}^{\text{LR}}$ stabilizes.
+
+**Implementation notes**
+- Unlike ER/BR, do not shuffle the time dimension. Retrieve full trajectories of shocks $\varepsilon_{1:T}$ and initial states $(k_0, z_0)$.
+- Main Path Only: Use the main shock path ${ z^{(1)}_{t,i} }$ derived from $\varepsilon^{(1)}$. The forked path $\varepsilon^{(2)}$ is not used in LR because we maximize the sum of rewards, not a squared residual, so that we don't need the AiO estimator.
+- On-Policy Rollout: The capital sequence $k_{1} \dots k_{T}$ is not loaded from the dataset. It is generated during the training step by applying the current policy $\Gamma_{\text{policy}}$ recursively to the shocks loaded from the dataset. This ensures the loss is differentiable with respect to $\theta$.
+
+
+## ER Method
+**Notation**: Let $F_x$ denote the partial derivative of function $F$ with respect to $x$.
+
+**Optimization Problem**: The Lagrangian is set up as: 
+$$\max_{{k_{t+1}}} \mathbb{E} \left[ \sum^{\infty}_{t=0} \beta^t \cdot \big( e(I_t,z_t) - \chi_t \left( k_{t+1} - (1-\delta)k_t - I_t \right) \big) \right]$$ 
+where $\chi_t$ is the shadow price of capital (Lagrange multiplier).
+
+**First Order Conditions**:
+
+- Investment: $\chi_t = 1 + \psi_I(I_t,k_t)$
+- Next period investment: $\chi_{t+1} = 1 + \psi_I(I_{t+1},k_{t+1})$
+- Capital: $\chi_t = \beta \mathbb{E} \left[ \pi_k (z{t+1},k_{t+1}) - \psi_k (I_{t+1}, k_{t+1}) + (1 - \delta) \chi_{t+1} \right]$
+
+
+Combining these yields the **Euler Equation**: 
+$$1+\psi_I(I_t,k_t) = \beta \mathbb{E} \left[ \pi_k(z_{t+1},k_{t+1})-\psi_k(I_{t+1},k_{t+1})+(1-\delta) \big(1+\psi_I(I_{t+1},k_{t+1})\big) \right] $$
+
+**Definitions for Implementation**:
+
+- Current Investment: $I_t = k_{t+1} - (1-\delta)k_t$
+- Future Investment: $I_{t+1} = k_{t+2} - (1-\delta)k_{t+1}$
+- Marginal Benefit Function $m_\ell$: The RHS integrand is defined as: 
+$$ m(k_{t+1}, k_{t+2}, z_{t+1}) \equiv \pi_k(z_{t+1},k_{t+1}) - \psi_k(I_{t+1},k_{t+1}) + (1-\delta)(1+\psi_I(I_{t+1},k_{t+1})) $$
+- All-in-One (AiO) Loss: To estimate the squared expectation $\mathbb{E}[f]^2$ unbiasedly, I use two i.i.d. shock realizations $z'_{1}, z'_{2}$ (forks) for the next period. The empirical loss is the cross-product of residuals: 
+$$ \mathcal{L}^{\text{ER}} = \frac{1}{n} \sum_{i=1}^n \left( f_{i,1} \times f_{i,2} \right) $$ 
+where the realized Euler residual for branch $\ell \in {1, 2}$ is: 
+$$ f_{i,\ell} = \big(1 + \psi_I(I_{i}, k_{i})\big) - \beta \cdot m(k'_{i}, k''_{i,\ell}, z'_{i,\ell}), \quad \ell = 1,2$$
+
+### Algorithm Summary: ER Method
+**Initialization:**
+- Load the training dataset $\mathcal{B}$ (flattened into $N \times T$ transitions and reshuffled). 
+- Each observation is a tuple $(k, z, z'_{1}, z'_{2})$
+- Initiate current policy $\Gamma_{\text{policy}}(\cdot; \theta_{\text{policy}})$.
+- Initiate target policy $\theta^-_{\text{policy}} \leftarrow \theta_{\text{policy}}$ (to stabilize future capital approximations).
+
+**Training Loop:** Repeat until convergence ($|\mathcal{L}^{\text{ER}}| < \epsilon$).
+1. **Sample Batch**: Draw a random mini-batch of observations from $\mathcal{B}$.
+2. **Current Step (Trainable)**:
+- Compute next capital using Current Policy: 
+$$k' = \Gamma_{\text{policy}}(k, z; \theta_{\text{policy}})$$
+
+- Compute current investment: 
+$$I = k' - (1-\delta)k$$
+
+- Compute LHS marginal cost: 
+$$\chi = 1 + \psi_I(I, k)$$
+
+3. **Future Step (Fixed Target)**:
+- For both shock forks $\ell \in {1, 2}$, compute the subsequent capital $k''_{\ell}$ using the Target Policy: 
+$$ k''_{\ell} = \Gamma_{\text{policy}}(k', z'_{\ell}; \theta^-_{\text{policy}}) $$ 
+- Note: Using Target Policy here prevents gradients from flowing into the future choice, stabilizing the Euler inversion.
+- Compute future investment for both forks: $I'_{\ell} = k''_{\ell} - (1-\delta)k'$.
+
+4. **Compute Residuals**:
+- Calculate the realized marginal benefit $m_{\ell}$ for both $\ell=1$ and $\ell=2$ using $(k', k''_{\ell}, z'_{\ell})$.
+- Compute residuals: $f_{\ell} = \chi - \beta \cdot m_{\ell}$.
+
+5. **Update Policy**:
+- Compute Empirical Loss $\mathcal{L}^{\text{ER}} = \frac{1}{|\mathcal B|}\sum_{i\in \mathcal B} (f_{i,1} \times f_{i,2})$
+
+- Update $\theta_{\text{policy}}$ using gradient descent to minimize $\mathcal{L}^{\text{ER}}$.
+- Polyak Averaging to update target policy: $\theta^-_{\text{policy}} \leftarrow \nu \theta^{-}_{\text{policy}} + (1-\nu) \theta_{\text{policy}}$.
+
+
+
+## BR Method (Actor-Critic)
+Unlike LR and ER method, BR method requires two parameterized networks:
+
+**Policy network**
+$$k' = \Gamma_{\text{policy}}(k,z;\theta_{\text{policy}})$$
+
+**Value network**
+$$V(k,z) = \Gamma_{\text{value}}(k,z;\theta_{\text{value}})$$
+
+**Bellman Residual** is given as
+$$V(k,z) - \max_{k'}\{e(k,k',z)+\beta\mathbb{E}_{z'}[V(k',z')]\}$$
+
+We use actor–critic:
+
+
+1) given policy $\theta_{\text{policy}}$, update $\theta_{\text{value}}$ to fit the Bellman equation;
+2) given value $\theta_{\text{value}}$, update $\theta_{\text{policy}}$ to maximize the RHS.
+
+This is a variant of the "direct optimization" BR approach discussed in @Maliar12.
+
+### Critic Update Step
+
+The Bellman RHS target is defined as
+$$y_{\ell}=e(k ,\Gamma_{\text{policy}},z)+\beta\,\Gamma_{\text{value}}(\Gamma_{\text{policy}},z'_{\ell};\theta^{-}_{\text{value}}),\qquad \ell\in\{1,2\}$$
+
+where the expectation is dropped given two realized shocks $z'_1, z'_2$ (that were i.i.d in sampling). Our goal is to update our parameterized value network $\theta_{\text{value}}$ to minimize the "square" error from this critic target:
+$$
+\min_{\theta_{\text{value}}} \left( \Gamma_{\text{value}}(k,z;\theta_{\text{value}})-y_{1}\right)\left( \Gamma_{\text{value}}(k,z;\theta_{\text{value}})-y_{2}\right)
+$$
+where we use the AiO estimator to consistently estimate the squared expectation. 
+
+This is a classic regression problem. Once the critic target $y_{\ell}$ is computed, it is passed over as a constant (fixed label). It is critical to detach gradients from it when updating $\theta_{\text{value}}$ and also keep the policy network $(\theta_{\text{policy}})$ fixed during the critic update.
+
+**Empirical Loss**
+
+Empirically, the BR-Critic Loss is defined as
+$$\widehat{\mathcal{L}}^{\text{BR}}_{\text{critic}}(\theta_{\text{value}})=\frac{1}{N}\sum_{i=1}^N \left(\delta_{i,1} \times \delta_{i,2} \right) $$
+where the Bellman residual (error) is
+$$\delta_{i,\ell}=\Gamma_{\text{value}}(k_{i},z_{i};\theta_{\text{value}})-y_{i,\ell}, \quad \ell \in \{1,2\}$$
+for each observation $i$. For $y_{i,\ell}$, the main shock $z'_{i,1}$ and the forked shock $z'_{i,2}$ are i.i.d. draws.
+
+
+
+### Actor update step
+
+For a given fixed policy $\theta_{\text{policy}}$, the previous critic update find the best $\theta_{\text{value}}$ that minimizes the critic loss. However, it is not guaranteed that this $\theta_{\text{policy}}$ is the optimal policy that maximize the Bellman equation. In other words, we need an additional training step to ensures that
+$$
+\theta_{\text{policy}} = \argmax_{k'=\Gamma(\theta_{\text{policy}})}\{e(k,k',z)+\beta \mathbb{E}_{z'}\left[V(k',z')\right]
+$$
+
+This is exactly the "direct optimization" idea described in @Maliar12. 
+
+Empirically, I define the Actor loss as:
+$$\widehat{\mathcal{L}}^{\text{BR}}_{\text{actor}}(\theta_{\text{policy}})
+=-\frac{1}{N}\sum_{i=1}^N 
+\left[e(k'_{i},k_{i},z_{i,1})+\beta\cdot  \Gamma_{\text{value}}(k'_{i},z'_{i,1};\theta_{\text{value}})\right]$$
+where it is helpful to clarify that
+- Take $\theta_{value}$ as given, update $\theta_{policy}$ of $k'=\Gamma_{\text{policy}}(k,z;\theta_{\text{policy}})$
+- I use the main shock $z'_{i,1}$ and sample mean as unbiased estimator
+- We do not need the forked shock $z'_{i,2}$ here because this is not a AiO cross-product estimator
+
+
+### Algorithm Summary: BR Method
+**Initialization:**
+
+- Load the training data $\mathcal{D}$ (flattened into $N \times T$ transitions and reshuffled).
+- Initiate current networks: Policy $\Gamma_{\text{policy}}(\cdot; \theta_{\text{policy}})$ and Value $\Gamma_{\text{value}}(\cdot; \theta_{\text{value}})$.
+- Initiate target networks: $\theta^-_{\text{policy}} \leftarrow \theta_{\text{policy}}$ and $\theta^-_{\text{value}} \leftarrow \theta_{\text{value}}$.
+- Training Loop: Repeat A and B for `N_iter` or until stopping criteria in C are met.
+
+#### A. Value function update (Critic)
+
+Objective: Minimize the Bellman residual using the Target Policy to stabilize the learning target.
+
+1. **Sample Batch**: Draw a random mini-batch $\mathcal B$ of observations $(k_i, z_i, z'_{i}, z'_2)$ from $\mathcal{D}$.
+
+2. **Compute Critic Target** 
+- Compute next action using the Target Policy: 
+$$\widehat{k}'_i = \Gamma_{\text{policy}}(k_i, z_i; \theta^-_{\text{policy}})$$
+- Compute next value using the Target Value network for both next period shocks: 
+$$V^{\text{next}}_{i,\ell} = \Gamma_{\text{value}}(\widehat{k}'_i, z'_{i,\ell}; \theta^-_{\text{value}}), \quad \ell=1,2$$
+
+- Compute the fixed Bellman target (detach gradients): 
+$$y_{i,\ell} = \text{StopGradient} \left\{ e(k_i, \widehat{k}'_i, z_i) + \beta V^{\text{next}}_{i,\ell} \right\}, \quad \ell=1,2$$
+
+3. **Update Critic** 
+- Compute current value estimates: $V_{i} = \Gamma_{\text{value}}(k_i, z_i; \theta_{\text{value}})$
+- Calculate residuals: $\delta_{i,\ell} = V_{i} - y_{i,\ell}$ for $\ell=1,2$
+- Compute AiO Loss for each mini-batch $\mathcal B$: 
+$$ \mathcal{L}^{\text{BR}}_{\text{critic}} = \frac{1}{|\mathcal B|} \sum_{i \in \mathcal B} (\delta_{i,1} \times \delta_{i,2}) $$
+- Update $\theta_{\text{value}}$ using gradient descent to minimize $\widehat{\mathcal{L}}^\text{BR}_{\text{critic}}$
+- Update Target Value: $\theta^-_{\text{value}} \leftarrow \nu \theta^{-}_{\text{value}} + (1-\nu) \theta_{\text{value}}$
+
+Repeat Step A#1-3 by `N_critic_step` times per Actor update.
+
+#### B. Policy update (Actor)
+Objective: Maximize the expected value using the Current Policy to allow gradient flow.
+
+1. **Compute Actor Action**
+- Compute next action using the Current Policy: 
+$$ k'_i = \Gamma_{\text{policy}}(k_i, z_i; \theta_{\text{policy}}) $$
+
+2. **Compute Actor Loss**
+- Predict continuation value using the Current Value network (freeze $\theta_{\text{value}}$ and use main shock $z'_1$ only): 
+$$V^{\text{proj}}_{i} = \Gamma_{\text{value}}(k'_i, z'_{i,1}; \theta_{\text{value}})$$ 
+- Define Loss (negative expected value of Bellman RHS): 
+$$ \mathcal{L}^{\text{BR}}_{\text{actor}} = -\frac{1}{|\mathcal B|} \sum_{i \in \mathcal B} \left[ e(k_i, k'_i, z_i) + \beta V^{\text{proj}}_{i} \right] $$
+
+3. **Update Actor**
+- Update $\theta_{\text{policy}}$ using gradient descent to minimize $\mathcal{L}^{\text{BR}}_{\text{actor}}$.
+- Update Target Policy: $\theta^-_{\text{policy}} \leftarrow \nu \theta^{-}_{\text{policy}} + (1-\nu) \theta_{\text{policy}}$.
+
+#### C. Stop training
+Terminate when the optimization stabilizes:
+
+- **Bellman Residual Minimization**: The Critic loss is close to zero, indicating the Bellman equation holds: 
+$$ |\widehat{\mathcal{L}}^\text{BR}{\text{critic}}| < \epsilon_{\text{crit}} $$
+
+- **Policy Convergence**: The Actor loss stops improving, indicating we cannot find a better policy to maximize the expected value (Bellman RHS): 
+$$|\Delta \widehat{\mathcal{L}}^\text{BR}{\text{actor}}| < \epsilon_{\text{act}}$$ 
+
+Implementation Note: I use a patience counter to ensure these conditions hold for several consecutive epochs.
+
+
+---
+# Risky Debt Model
+
+## Theory (Sec 3.6)
 
 **Variables**
 - State: $(k,b,z)$
@@ -397,14 +668,14 @@ $$\eta(e)=(\eta_0+\eta_1|e|)\mathbf{1}_{e<0}$$
 
 where $\mathbf{1}_{e<0}$ is an indicator function for negative cash flow that triggers costly external financing (e.g., equity injection). 
 
-**Endogenous risky rate**
+**Endogenous risky interest rate**
 
-$$\tilde r=\tilde r(z,k',b')$$
+$$\tilde r=\tilde r(z,k',k,b',b)$$
 
-which is determined by the equilibrium in debt market (see details below).
+which is determined in equilibrium where the lenders earn zero profit after taking into account the default probablity and expected recovery. 
   
 
-**Latent and actual value**
+**Latent and actual firm value**
 
 The Bellman equation of latent value is 
 
@@ -418,19 +689,26 @@ which means that shareholders can always choose default and walk away with zeros
   
 **Bond Pricing**
 
-In equilibrium, the **risky rate** is determined by the **Lender's zero-profit condition**
+In equilibrium, the endogenous risky rate, $\tilde{r}$, is determined by the lender's zero-profit condition
 
 $$ b'(1+r)= (1+\tilde r)b'\,\mathbb{E}_{z'|z}[1-D]+\mathbb{E}_{z'|z}[D\cdot R(k',b',z')] $$
 
-where the LHS is the marginal cost of lending and the RHS is the expected marginal return to the risky bond after taking into account default probability and recovery from liquidation.
+where the LHS is the marginal (opportunity) cost of lending and the RHS is the expected marginal return to the risky bond after taking into account default probability and recovery from liquidation.
 
-Let $D$ denote an indicator for default
+- If solvent, lender earns $1+\tilde{r}$ that is higher than the risk-free rate
+- If defualt, lender recovers $R(k',b',z')$ after liquidation
 
-$$D(z',k',b')=\mathbb{1}\{\widetilde V(z',k',b')<0\}$$
+Note that the risky rate $\tilde r$ is set by lender at the current period given information
+- Current states: $k,b,z$
+- Firm choice of $k',b'$
+- Expectations about $z'$
 
-Then the **default probability** is defined as
+**Default probability**
 
-$$p^D=\mathbb{E}_{z'|z}[D(z',k',b')]$$
+Let $D$ denote an indicator for default when firm's latent/continuation value is negative
+
+$$D(z',k',b')=\mathbb{1}\{\widetilde V(z',k',b')<0\},$$
+in which case the firm will choose to walk away with actual $V=0$ and liquidate all assets.
 
 **Recovery** under default is defined as
 
@@ -438,244 +716,45 @@ $$R(k',z')=(1-\alpha)\left[(1-\tau)\pi(k',z')+(1-\delta)k'\right]$$
 
 where $\alpha\in[0,1]$ is the deadweight cost applied on the liquidation value of the firm.
 
----
-# Implementation: Basic Model
+### Optimality conditions
+To solve for this model, I need to train the neural network to enforce the following conditions:
 
-## LR Method
+1. **Bellman equation**:
+    $$\widetilde V(k,b,z)=\max_{k',b'}\left\{e(k,b,z;\tilde r)-\eta(e)+\beta\mathbb{E}_{z'}[V(k',b',z')]\right\}$$
 
-**Policy Network**
-$$k_{t+1}=\Gamma_{\text{policy}}(k_t,z_t;\theta_{\text{policy}})$$
+    where on the RHS the actual continuation value must be non-negative
 
-**Objective**
+    $$V(k',b',z')=\max\{ 0, \, \widetilde V(k',b',z') \}$$
 
-The objective is to find the optimal $\theta$ that
-$$
-\max_{\theta} J(\theta_{\text{policy}})=\mathbb{E}\sum_{t=0}^{T-1}\beta^t e(k_t,\Gamma_{\text{policy}},z_t)
-$$
+2. **Lender's zero-profit condition** that determines risky rate $\tilde{r}$:
 
-or equivalently, 
+    $$ b'(1+r)= (1+\tilde r)b'\,\mathbb{E}_{z'|z}[1-D]+\mathbb{E}_{z'|z}[D\cdot R(k',b',z')] $$
 
-$$\min_{\theta} -J(\theta_{\text{policy}})$$
-
-**Empirical loss**
-
-Given training dataset with $N$ i.i.d. rollout of firm's life over finite horizon $T$, the empirical objective is
-
-$$\min_{\theta} \widehat{\mathcal{L}}^{\text{LR}}(\theta)=-\frac{1}{N}\sum_{i=1}^N\sum_{t=0}^{T-1}\beta^t e(k_t^{(i)},\Gamma_{\text{policy}}(\theta),z_t^{(i)})$$
-
-
-**Training loop**
-
-1. Initiate the economic parameters and the neural network hyperparameters
-2. Construct parameterized policy $\Gamma(\theta)$ that maps $(k,z)\to k'$
-3. Compute $\widehat{\mathcal{L}}^{\text{LR}}$ and update $\theta_{\text{policy}}$ to minimize empirical loss
-4. Repeat step #3 until $\widehat{\mathcal{L}}^{\text{LR}}$ is stable (converged)
-
-## ER Method
-
-Notation: Let $F_x$ denote the partial derivative of function $F$ with respect to $x$.
-
-The Lagrangian is set up as
-$$
-\max_{k_1, k_2, \dots, k_T} \mathbb{E}_{z_{t+1}|z_t} \left[ \sum^{T-1}_{t=0} 
-\beta^t \cdot 
-\big( e(I_t,z_t) - \chi_t \left( k_{t+1} - (1-\delta)k_t - I_t \right) \big)
-\right]
-$$
-where $\chi_t$ is the Lagrange multiplier, or the shadow price of capital.
-
-Taking derivatives with respect to $I_t$, $I_{t+1}$, and $k_{t+1}$ yields:
-
-$$\begin{gather}
-\chi_t = \psi_I(I_t,k_t) + 1 \\
-\chi_{t+1} = \psi_I(I_{t+1},k_{t+1}) + 1 \\
-\chi_t = \mathbb{E}_{z_{t+1}|z_t} \left[ 
-    \beta \left(
-        \pi_k (z_{t+1},k_{t+1}) - \psi_k (I_{t+1}, k_{t+1}) + (1 - \delta) \chi_{t+1}
-    \right) 
-\right]
-\end{gather}$$
-
-where 
-- cash flow is $e(I_t,z_t) = \pi(z_t,k_t) - \psi(I_t,k_t) - I_t$
-- investment is $I_t = k_{t+1} - (1-\delta)k_t$
-
-Given **Policy Network** $k'=\Gamma_{\text{policy}}(k,z;\theta_{\text{policy}})$, investment is
-$$
-I_t=\Gamma_{\text{policy}}(k_t,z_t;\theta) - (1-\delta) k_t  
-$$
-
-**Euler equation** is derived by combining the FOCs:
-$$
-\mathbb{E}_{z_{t+1}|z_t}\!\left[\beta\Big(
-\pi_k(z_{t+1},k_{t+1})-\psi_k(I_{t+1},k_{t+1})+(1-\delta)
-\big(1+\psi_I(I_{t+1},k_{t+1})\big)
-\Big)\right]=1+\psi_I(I_t,k_t).
-$$
-   
-**Objective**
-
-Define the inner component of the Euler Equation LHS as
-$$
-m(I_{t+1},k_{t+1}, z_{t+1}) \equiv \pi_k(z_{t+1},k_{t+1})-\psi_k(I_{t+1},k_{t+1})+(1-\delta)\chi_{t+1}
-$$
-
-The Euler residual is defined as
-$$
-f(I_{t+1},I_t,k_{t+1},k_t,z_t;\theta) 
-\equiv 1 + \psi_I(I_t,k_t) - \beta\mathbb{E}_{z_{t+1}|z_t}[m(I_{t+1},k_{t+1}, z_{t+1})]
-$$
-
-The training objective is to minimize the square of Euler residual:
-$$\min_{\theta} J^{\text{ER}}(\theta_{\text{policy}})=\mathbb{E}[f(\theta)]^2$$
-
-
-**Empirical loss**
-
-Note that $f(\theta)$ itself includes an expectation operator, so we cannot directly square it because $\mathbb{E}[f^2] \neq (\mathbb{E}[f])^2$. Instead, we use the All-in-One (AiO) estimator by taking two i.i.d. shocks $\varepsilon^{(1)},\varepsilon^{(2)}$ and by AR(1) we obtain the realized shocks, $z^{(1)}_{t+1},z^{(2)}_{t+1}$ given $z_t$.
-
-Then the realized Euler residual (error) for each of them is computed as:
-$$
-f^{\ell}(\cdot,\theta) \equiv 1 + \psi_I(I_t,k_t) - \beta \cdot m(I_{t+1},k_{t+1}, z^{(\ell)}_{t+1}) \quad, \forall \ell=1,2
-$$
-
-The one-period empirical loss is the product of the two Euler residuals:
-
-$$\widehat{\mathcal{L}}^{\text{ER}}_t=\frac{1}{N}\sum_{i=1}^N f^{(1)}_{t,i} f^{(2)}_{t,i}$$
-
-Since our dataset is rolled out across finite horizon $T$, I further take the mean Euler residual across all $t$ and across $N$ observations (i.i.d. draws) to obtain the final empirical loss:
-
-$$\widehat{\mathcal{L}}^{\text{ER}}=\frac{1}{N}\sum_{i=1}^N \left( \frac{1}{T}\sum_{t=0}^{T-1} f^{(1)}_{t,i} f^{(2)}_{t,i} \right)$$
-
-where the inner parenthesis is the mean residual over firm $i$'s lifetime, and the outer sum take sample mean over $N$ firms in the training data. This is a consistent estimator for the theoretical loss because my data generator specifically simulate $z^{(2)}_{t+1}$ as a fork of the main $z^{(1)}_{t+1}$ conditional on the same $z_t$ for each period $t$.
-
-**Training loop**
-1. Initiate the economic parameters and the neural network hyperparameters
-2. Combine parameterized policy $\Gamma(\theta)$ that maps $(k_t,z_t)\to k_{t+1}$
-3. Compute implied investment $I_t = \Gamma(k_t,z_t;\theta) - (1-\delta) k_t$
-4. Further compute one more step that maps $(k_{t+1} ,z^{\ell}_{t+1})$ to $k_{t+2}$, and compute the implied investment  $I_{t+1}=k_{t+2}-(1-\delta)k_{t+1}$
-5. Compute $\widehat{\mathcal{L}}^{\text{ER}}$ and update $\theta_{\text{policy}}$ to minimize empirical loss
-6. Repeat previous step until $|\widehat{\mathcal{L}}^{\text{ER}}|\lt \epsilon$ for some tolerance $\epsilon$
-
-## BR Method (Actor-Critic)
-Unlike LR and ER method, BR method requires two parameterized networks:
-
-**Policy network**
-$$k' = \Gamma_{\text{policy}}(k,z;\theta_{\text{policy}})$$
-
-**Value network**
-$$V(k,z) = \Gamma_{\text{value}}(k,z;\theta_{\text{value}})$$
-
-**Bellman Residual** is given as
-$$V(k,z) - \max_{k'}\{e(k,k',z)+\beta\mathbb{E}_{z'}[V(k',z')]\}$$
-
-We use actor–critic:
-1) given policy $\theta_{\text{policy}}$, update $\theta_{\text{value}}$ to fit the Bellman equation;
-2) given value $\theta_{\text{value}}$, update $\theta_{\text{policy}}$ to maximize the RHS.
-
-This is a variant of the "direct optimization" BR approach discussed in @Maliar12.
-
-### Critic Update Step
-
-For each period $t$, the Bellman RHS target is defined as
-$$y_{t}^{(\ell)}=e(k_t ,\Gamma_{\text{policy}},z_t)+\beta\,\Gamma_{\text{value}}(\Gamma_{\text{policy}},z^{\ell}_{t+1};\theta^{-}_{\text{value}}),\qquad \ell\in\{1,2\}$$
-
-where the expectation is dropped given two realized shocks $z^{(1)}_{t+1},z^{(2)}_{t+1}$ (that were i.i.d in sampling). Our goal is to update our parameterized value network $\theta_{\text{value}}$ to minimize the "square" error from this critic target (label):
-$$
-\min_{\theta_{\text{value}}} \left( \Gamma_{\text{value}}(k_t,z_t;\theta_{\text{value}})-y_{t}^{(1)}\right)\left( \Gamma_{\text{value}}(k_t,z_t;\theta_{\text{value}})-y_{t}^{(2)}\right)
-$$
-where we use the AiO estimator to consistently estimate the squared expectation. 
-
-This is a classic regression problem. Once the critic target $y_{t}^{(\ell)}$ is computed, it is passed over as a constant (fixed label). It is critical to detach gradients from it when updating $\theta_{\text{value}}$ and also keep the policy network $(\theta_{\text{policy}})$ fixed during the critic update.
-
-**Empirical Loss**
-
-Empirically, the BR-Critic Loss is defined as
-$$\widehat{\mathcal{L}}^{\text{BR}}_{\text{critic}}(\theta_{\text{value}})=\frac{1}{N}\sum_{i=1}^N \left(
-\frac{1}{T} \sum_{t=0}^{T-1} \delta_{t,i}^{(1)} \delta_{t,i}^{(2)}
-\right) $$
-where the Bellman residual (error) is
-$$\delta_{t,i}^{(\ell)}=\Gamma_{\text{value}}(k_{t,i},z_{t,i};\theta_{\text{value}})-y_{t,i}^{(\ell)}$$
-for each observation $i$ in period $t$ over finite horizon $T$.
-
-**Critic Training Loop** 
-
-1. Before each critic update step, 
-   - Hold constant the current optimal policy $\theta_{\text{policy}}$ that determines $k' =\Gamma_{\text{policy}}$
-   - Update $\theta^{-}_{\text{value}} = \nu \theta_{\text{value}} + (1-\nu) \theta^{-}_{\text{value}}$
-
-2. Then proceed the critic update step:
-   - Compute $\widehat V^{\text{next}}_{i,\ell}=\Gamma_{\text{value}}(\Gamma_{\text{policy}},z^{\ell}_{t+1};\theta^{-}_{\text{value}})$,
-   - Detach gradient flow from RHS: $\widehat V^{\text{next}}_{i,\ell}\leftarrow \mathrm{stopgrad}(\widehat V^{\text{next}}_{i,\ell})$,
-   - Compute $y_{i,\ell}=e(\cdot)+\beta\,\widehat V^{\text{next}}_{i,\ell}$ as a constant
-   - Compute Bellman error $\delta_{t,i}^{(\ell)}$ in which  $\Gamma_{\text{value}}(k_{t,i},z_{t,i};\theta_{\text{value}})$ remains trainable.
-   - Update $\theta_{\text{value}}$ to minimize $\widehat{\mathcal{L}}^\text{BR}_{\text{critic}}$
-  
-3. Repeat #1 and #2 for `N_critic_step` iterations (normally 5-10), then move to Actor update step
-
-### Actor update step
-
-For a given fixed policy $\theta_{\text{policy}}$, the previous critic update find the best $\theta_{\text{value}}$ that minimizes the critic loss. However, it is not guaranteed that this $\theta_{\text{policy}}$ is the optimal policy that maximize the Bellman equation. In other words, we need an additional training step to ensures that
-$$
-\theta_{\text{policy}} = \argmax_{k'=\Gamma(\theta_{\text{policy}})}\{e(k,k',z)+\beta \mathbb{E}_{z'}\left[V(k',z')\right]
-$$
-
-This is exactly the "direct optimization" idea described in @Maliar12. 
-
-Empirically, I define the Actor loss as:
-$$\widehat{\mathcal{L}}^{\text{BR}}_{\text{actor}}(\theta_{\text{policy}})
-=-\frac{1}{N}\sum_{i=1}^N 
-\frac{1}{T}\sum_{t=0}^{T-1} \left[e(k_{t,i},k_{t+1,i},z_{t,i})+\beta\cdot \frac{1}{2}\sum_{\ell=1}^2 \Gamma_{\text{value}}(k_{t+1,i},z_{t+1,i}^{(\ell)};\theta_{\text{value}})\right].$$
-where it is helpful to clarify that
-- Using either one of the draws $(z_{t+1,i}^{(1)}, z_{t+1,i}^{(2)})$ is still unbiased but noisier; averaging two draws reduces variance and remains correct.
-- Note that this is NOT a AiO cross-product estimator because we are not handling squared expectations on the RHS.
-
-**Actor Training Loop** 
-1. Obtain the optimal $\theta_{value}$ fro $\Gamma_{value}$ from the previous critic update loop
-2. Compute $k_{t+1}=\Gamma_{\text{policy}}(k_t,z_t;\theta_{\text{policy}})$
-3. Compute Actor loss $\widehat{\mathcal{L}}^{\text{BR}}_{\text{actor}}$ using $k_{t+1}$ and $z^{(\ell)}_{t+1}$ with $\ell = 1,2$
-4. Update $\theta_{\text{policy}}$ by one step to minimize $\widehat{\mathcal{L}}^{\text{BR}}_{\text{actor}}$ 
-
-### Algorithm 
-The complete Actor-Critic training algorithm is summarized as below
-1. Initiate the economic parameters and the neural network hyperparameters
-2. Initiate the policy network $\Gamma_{\text{policy}}$ and the value network $\Gamma_{\text{value}}$
-3. Conduct a Critic update training loop to update $\theta_{value}$ that minimizes $\widehat{\mathcal{L}}^\text{BR}_{\text{critic}}$
-4. Conduct an Actor update training loop to update $\theta_{policy}$ that minimizes $\widehat{\mathcal{L}}^\text{BR}_{\text{actor}}$
-5. Repeat steps 3 and 4 for `N_iter` iterations, or until
-   - Bellman residual is close to zero: $|\widehat{\mathcal{L}}^\text{BR}_{\text{critic}}| \lt \epsilon_{crit}$, and 
-   - Optimal policy converged to a fixed point: $|\Delta \widehat{\mathcal{L}}^\text{BR}_{\text{actor}}| \lt \epsilon_{act}$
-
-To summarize, the critic update ensures that for a given policy, the value network satisfied the Bellman equation. Given the optimal value network, the actor update tries to deviate from the current policy to check if there exist a better policy that would maximize the RHS of Bellman equation. Repeating this process until we find the fixed point for both of them.
-
----
-# Implementation: Risky Debt Model
-
-In the risky debt model, there are two optimality conditions that need to be enforced.
-
-The first one is the **Bellman equation**:
-$$\widetilde V(k,b,z)=\max_{k',b'}\left\{e(k,b,z;\tilde r)-\eta(e)+\beta\mathbb{E}_{z'}[V(k',b',z')]\right\}$$
-
-where on the RHS the continuation value must be non-negative
-$$V(k',b',z')=\max\{ 0, \, \widetilde V(k',b',z') \}$$
-
-The second one is the **Lender's zero-profit condition** that determines $\tilde{r}$:
-
-$$ b'(1+r)= (1+\tilde r)b'\,\mathbb{E}_{z'|z}[1-D]+\mathbb{E}_{z'|z}[D\cdot R(k',b',z')] $$
+    where $D=\mathbb{1}\{\widetilde{V}<0\}$ is the default indicator, and $R(k',b',z')$ is the recovery value.
 
 ## Networks
-Implementation of this model requires at least two neural networks.
+
+Implementation of this model requires at least three neural networks.
 
 **Policy network**
-$$ (k',b') = \Gamma_{\text{policy}}(k,b,z;\theta_{\text{policy}}) $$
+
+For BR: 
+$$ (k',b') = \Gamma_{\text{policy}}(k,b,z;\theta_{\text{policy}})$$
 
 **Pricing network**
-$$\tilde{r}(k',b',z) = \Gamma_{\text{price}}(k',b',z;\theta_{\text{price}})$$
-
-On top of these, we will need an additional value network to apply the BR method.
+$$\tilde{r}(\cdot;\theta_{\text{price}}) = \Gamma_{\text{price}}(k',b',k,b,z;\theta_{\text{price}})$$
 
 **Value network**
-$$\widetilde{V}(k,b,z) = \Gamma_{\text{value}}(k,b,z;\theta_{\text{value}})$$
+$$\widetilde{V}(\cdot;\theta_{\text{value}}) = \Gamma_{\text{value}}(k,b,z;\theta_{\text{value}})$$
+
+**Loop-in-loop problem** 
+
+As described in @Strebulaev12, the key challenge to solve this model is that the latent firm value $\widetilde{V}$ depends on the endogenous risky rate $\tilde{r}$. However, solving for $\tilde{r}$ requires solving the lender's zero-profit condition and particularly on knowing the default probability $\mathbb{E}[D]$ that in turn depends on firm value $\widetilde{V}$. 
+
+The conventional approach to break this circular dependency is to solve for $\tilde{r}$ and $\mathbb{E}[D]$ iteratively via a "inner loop" and a "outer loop". For example, first solving the zero-profit condition to get an estimate of $\tilde{r}$, use it to solve for $\widetilde{V}$, then use the updated $\widetilde{V}$ to update $\tilde{r}$ and repeat until both iteration loop converge. 
+
+Using deep neural networks, this problem is solved more effectively by jointly training three networks.
+
 
 ## Pricing Loss
 
@@ -710,26 +789,114 @@ $$\widehat{\mathcal{L}}^{\text{price}}
 where I use Monte Carlo sampling mean (across $N$ i.i.d. draws) to approximate the expectation. Then I ensures the residual error is minimized across the $T$ horizon.
 
 ---
+## BR Method
+Similar to the basic model, I implement a critic-actor update algorithm to jointly minimize the Bellman equation residual and the risky bebt pricing equation residual.
+
+Recall that the training dataset has $t=1,\dots,T$ periods and $i=1,\dots,N$ observations (i.i.d. draws of firms). For each $z_{t,i}$, we have two Monte Carlo draws $(\varepsilon^{(1)}_{t+1,i},\varepsilon^{(2)}_{t+1,i})$ and use an AR(1) step to compute $(z^{(1)}_{t+1,i},z^{(2)}_{t+1,i})$. By taking average over $N$ MC draws, we get a consistent estimator for the expected continuation value in the Bellman equation.
+
+### Critic Update
+
+For each observation $i$, the critic target is the RHS of the Bellman equation:
+$$y^{(\ell)}_{t}=e(k_t,k_{t+1},b_t,b_{t+1},z_t)-\eta(e)+\beta\cdot \max\{0,\Gamma_{\text{value}}(k_{t+1},b_{t+1},z^{(\ell)}_{t+1};\bar \theta_{\text{value}})\}$$
+
+where as before $\ell = 1, 2$ denotes the two Monte Carlo draws of shocks. We also use the policy network $\Gamma_{\text{policy}}$ to compute $(k_{t+1}, b_{t+1})$. Therefore, this target can be directly computed given
+- Economic/production parameters for $e(\cdot)$ and $\eta(\cdot)$
+- Current states $(k_t,b_t,z_t)$
+- Two realized shocks $(z^{(1)}_{t+1},z^{(2)}_{t+1})$ given $z_t$
+- Policy and value networks $\Gamma_{\text{policy}}$ and $\Gamma_{\text{value}}$
+
+To stablized training, I use polyak averaging to update the target value network:
+$$
+\bar \theta_{\text{value}} \leftarrow \alpha \bar \theta_{\text{value}} + (1-\alpha)\theta_{\text{value}}
+$$
+
+The Bellman residual is computed as
+
+$$\delta^{(\ell)}_{t}=\Gamma_{\text{value}}(k_t,b_t,z_t;\theta_{\text{value}})-y^{(\ell)}_{t}$$
+where it is important to note that $\bar \theta_{\text{value}}$ is detached from the gradient. I only train $\theta_{\text{value}}$ to update the first term on the RHS and take $y^{(\ell)}_t$ as a constant.
+
+Finally, I compute the residual "square" by taking the cross-product of two residuals for each period $t$, then I take the lifetime mean over $T$ horizon to form the empirical risk:
+$$
+\widehat{\mathcal{L}}^{\text{BR}}_{\text{critic}}
+=\frac{1}{T}\sum_{t=1}^T \left( 
+\frac{1}{N}\sum_{i=1}^N \delta^{(1)}_{t,i}\delta^{(2)}_{t,i}
+\right)
+$$
+
+### Actor Update
+The critic update ensures that for given policy $\theta_{\text{policy}}$, the value function is trained to minimize the average lifetime Bellman residuals. However, it is not guaranteed that the policy itself if optimal. Thus in the Actor update step, I train the policy network to maximize the RHS of the Bellman equation, holding the value network constant. The actor empirical risk is given as
+
+$$
+\widehat{\mathcal{L}}^{\text{BR}}_{\text{actor}}(\theta_{\text{policy}})
+=-\frac{1}{N}\sum_{i=1}^N \frac{1}{T}\sum_{t=0}^{T-1}
+\left[
+    e(\cdot)-\eta(e)+\beta\cdot \frac{1}{2}\sum_{\ell=1}^2 \max\{0,\Gamma_{\text{value}}(k_{t+1,i},b_{t+1,i},z^{(\ell)}_{t+1,i};\theta_{\text{value}})\}
+\right]$$
+where we prevent $\theta_{\text{value}}$ from update and only train the policy $\theta_{\text{policy}}$ to maximize the RHS over $N$ draws. Then it is averaged over $T$ period to ensure that the policy is $\argmax_{\theta}$ on average over all periods.
+
+---
+> **Warning**: I recommend using BR method to solve the risky debt model. The following sections (LR and ER) are experimental and not implemented.
+
 
 ## LR Method
-
-**Policy networks**
-$$(k_{t+1},b_{t+1})=\Gamma_{\text{policy}}(k_t,b_t,z_t;\theta_{\text{policy}}).$$
 
 **Reward (cash flow)**
 $$u_t=e(k_t,k_{t+1},b_t,b_{t+1},z_t)-\eta(e(\cdot)).$$
 
+**Networks**
+
+A key feature of this model is that shareholder can choose default and walk away with zero payout when the continuation value is negative. In practice, I define a new neuron output $d_{t+1}\in(0,1)$ to approximate the default probability and train the policy network to "learn" it.
+
+To implement the LR method, we only need two networks: 
+
+1. Policy Networks:
+$$
+(k_{t+1},b_{t+1}, d_{t+1})=\Gamma_{\text{policy}}(k_t,b_t,z_t;\theta_{\text{policy}})
+$$
+where the interpretation is: conditional on information at $t$, the firm chooses optimal next-period capital and debt levels, and defaults at the start of next period with probability $d_{t+1}$
+
+2. Pricing Networks:
+$$\tilde{r}(k_{t+1},b_{t+1},z_t) = \Gamma_{\text{price}}(k_{t+1},b_{t+1},z_t;\theta_{\text{price}})$$
+Note that $\tilde r$ is issued at current period and does NOT depends on the realization of next period $z_{t+1}$.
+
+**Survival Mask**
+Define a soft survival indicator $M_t\in[0,1]$ as “probability-weight” that the firm is alive during period $t$.
+- Initialization: $M_0=1$.
+- Recursion (default happens at start of $t+1$ with probability $d_{t+1}$):
+$$M_{t+1}=M_t\,(1-d_{t+1}),\qquad t=0,\dots,T-1.$$
+Equivalently,
+$$M_t=\prod_{s=0}^{t}(1-d_s),\qquad t\ge 1,\quad d_0=0.$$
+
+
+
+**Zero-profit condition**
+
+Given $(z^{(1)}_{t+1,i},z^{(2)}_{t+1,i})$ and the policy network for $(k_{t+1,i},b_{t+1,i},d_{t+1,i})$, the residual of the zero-profit condition is computed as
+$$f^{(\ell)}_{t,i}
+=
+b_{t+1,i} (1+r)-
+\Big[
+    d_{t+1,i} \cdot R(k_{t+1,i},z^{(\ell)}_{t+1,i}) 
+    +(1-d_{t+1,i}) \cdot b_{t+1,i} (1+\tilde{r}_{t,i})
+\Big]$$
+where default indicator $d_{t+1,i}$ and borrowing $b_{t+1,i}$ are all outputs of the policy network. Recovery value can be computed directly given $k_{t+1,i},z^{(\ell)}_{t+1,i}$.
 
 **Objective**
 
 Let $\mathbf{\theta} \equiv (\theta_{price}, \theta_{policy})$. The objective of training is to find the optimal $\theta$ that jointly minimizes the negative lifetime reward $\mathcal{L}^{\text{LR}}$ and the pricing residual $\mathcal{L}^{\text{price}}$:
+$$
+\mathcal{L}^{\text{LR}}(\theta) = -\frac{1}{N}\sum_{i=1}^N\sum_{t=0}^{T-1}
+\beta^t \cdot M_{t,i} \cdot u_{t,i}^{(1)}
+$$
+where rewards are computed using the $\ell=1$ main shock path.
 
 $$
-\begin{align}
-\mathcal{L}^{\text{LR}}(\theta) &= -\frac{1}{N}\sum_{i=1}^N\sum_{t=0}^{T-1}\beta^t u_t^{(i)} \\
-\mathcal{L}^{\text{price}}(\theta) &= \frac{1}{N}\sum_{i=1}^N 
-\left( \frac{1}{T}\sum_{t=1}^{T-1} f^{(1)}_{t,i}f^{(2)}_{t,i}\right)
-\end{align}
+\mathcal{L}^{\text{price}}(\theta) = \frac{1}{N}\sum_{i=1}^N 
+\left( \frac{1}{T}\sum_{t=0}^{T-1} f^{(1)}_{t,i}f^{(2)}_{t,i}\right)
+$$
+where the survival mask is computed recursively using neuron output $\{d_{t+1}\}_{t=0}^{T-1}$ from policy network: 
+$$
+M_{t,i} = \prod_{s=0}^{t} (1-d_{s,i})
 $$
 
 These two objectives can be combined into a single empirical risk:
@@ -741,7 +908,7 @@ where the Lagrange multiplier $\lambda_j$ is used to enforce the pricing residua
 - Compute Polyak averaging $\mathcal{\bar L}_j^{\text{price}}= (1-w) \mathcal{\bar L}_{j-1}^{\text{price}} + w \mathcal{L}_j^{\text{price}}$ with weight $w\in(0,1)$
 - Update $\lambda_j \leftarrow \max(0, \lambda_j + \eta_\lambda(\bar L_j^{\text{price}}-\epsilon))$ where $\eta_\lambda$ is a learning rate for the multiplier
 
-The multiplier $\lambda_j \to 0$ when the constraint binds, i.e. the pricing equation residual is small enough $\mathcal{L}_j^{\text{price}} \lt \epsilon$, which ensures that the zero-profit condition holds.
+The multiplier $\lambda_j \to 0$ when the constraint is slack / satisfied, i.e. the pricing equation residual is small enough $\mathcal{L}_j^{\text{price}} \lt \epsilon$, which ensures that the zero-profit condition holds.
 
 **Training loop summary**
 1.	Initialize economic parameters, training hyperparameters, model parameters $\theta$ (policy network $\Gamma_{\text{policy}}$ and pricing network $\Gamma_{\text{price}}$), and Lagrange multiplier(s) $\lambda \ge 0$.
@@ -752,12 +919,8 @@ The multiplier $\lambda_j \to 0$ when the constraint binds, i.e. the pricing equ
   - Update $\theta$: take one optimizer step to minimize $\mathcal{L}_j$ via backpropagation
   - Update $\lambda$ (no backprop): using the detached batch estimate $\mathcal{\bar L}_j^{\text{price}}$ and update 
   $$\lambda \leftarrow \max\!\left(0,\ \lambda+\eta_\lambda(\mathcal{\bar L}_{j}^{\text{price}}-\epsilon)\right)$$
-3.	Stop at $N_{\text{iter}}$ or early-stop when evaluation reward plateaus while $L_2$ stays below $\epsilon$; return the best feasible checkpoint
+3.	Stop at $N_{\text{iter}}$ or early-stop when evaluation reward plateaus while $\bar{\mathcal L}^{\text{price}}$ stays below $\epsilon$; return the best feasible checkpoint
 
 ## ER Method
 
 Underdevelopment. Coming soon.
-
-## BR Method
-
-  
