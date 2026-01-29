@@ -11,7 +11,7 @@ import logging
 from typing import Dict, Optional, Any, Iterator, List, Tuple
 
 from src.economy.parameters import EconomicParams, ShockParams
-from src.economy.logic import compute_cash_flow_basic, euler_chi, euler_m
+from src.economy.logic import compute_cash_flow_basic, euler_chi, euler_m, compute_terminal_value
 
 from src.networks.network_basic import BasicPolicyNetwork, BasicValueNetwork, build_basic_networks
 from src.trainers.losses import (
@@ -21,7 +21,7 @@ from src.trainers.losses import (
     compute_br_critic_diagnostics,
     compute_br_actor_loss
 )
-from src.trainers.config import NetworkConfig, OptimizationConfig, AnnealingConfig, MethodConfig
+from src.trainers.config import NetworkConfig, OptimizationConfig, AnnealingConfig, MethodConfig, EarlyStoppingConfig
 from src.trainers.core import execute_training_loop
 
 logger = logging.getLogger(__name__)
@@ -62,6 +62,11 @@ class BasicTrainerLR:
         """
         Executes one training step via Lifetime Reward Maximization.
 
+        Includes terminal value correction for finite horizon truncation.
+
+        Reference:
+            report_brief.md lines 499-514: LR loss with terminal value
+
         Args:
             k (tf.Tensor): Initial capital batch. Shape: (Batch, 1).
             z_path (tf.Tensor): Productivity trajectory. Shape: (Batch, T+1).
@@ -75,28 +80,84 @@ class BasicTrainerLR:
             k = tf.reshape(k, [-1, 1])
             # Use pre-computed path. z_path is (Batch, T+1)
             # This ensures determinism and uses the exact shock realizations from data generation.
-            
+
             for t in range(self.T):
                 z_curr = tf.reshape(z_path[:, t], [-1, 1])
-                
+
                 k_next = self.policy_net(k, z_curr)
                 reward = compute_cash_flow_basic(k, k_next, z_curr, self.params, temperature=temperature, logit_clip=self.logit_clip)
                 rewards_list.append(reward)
-                
+
                 k = k_next
-            
+
             rewards = tf.concat(rewards_list, axis=1)
-            loss = compute_lr_loss(rewards, self.beta)
-        
+
+            # Compute terminal value correction (report lines 503-514)
+            # V^term(k_T, z_T) = e(k_SS, k_SS, z_T) / (1 - β)
+            z_terminal = tf.reshape(z_path[:, self.T], [-1, 1])
+            v_terminal = compute_terminal_value(
+                k, z_terminal, self.params, self.beta,
+                temperature=temperature,
+                logit_clip=self.logit_clip
+            )
+
+            # Loss includes terminal value weighted by β^T
+            loss = compute_lr_loss(rewards, self.beta, terminal_value=v_terminal)
+
         grads = tape.gradient(loss, self.policy_net.trainable_variables)
         self.optimizer.apply_gradients(zip(grads, self.policy_net.trainable_variables))
-        
-        z_terminal = tf.reshape(z_path[:, self.T], [-1, 1])
+
         terminal_states = tf.concat([k, z_terminal], axis=1).numpy()
         return {
-            "loss_LR": float(loss), 
+            "loss_LR": float(loss),
             "mean_reward": float(tf.reduce_mean(rewards)),
             "terminal_states": terminal_states
+        }
+
+    def evaluate(
+        self,
+        k: tf.Tensor,
+        z_path: tf.Tensor,
+        temperature: float,
+    ) -> Dict[str, float]:
+        """
+        Evaluate on data without updating weights.
+
+        Used for validation set evaluation during early stopping.
+
+        Args:
+            k (tf.Tensor): Initial capital batch. Shape: (Batch, 1).
+            z_path (tf.Tensor): Productivity trajectory. Shape: (Batch, T+1).
+            temperature (float): Gate temperature.
+
+        Returns:
+            Dict[str, float]: Loss and metrics.
+        """
+        rewards_list = []
+        k = tf.reshape(k, [-1, 1])
+
+        for t in range(self.T):
+            z_curr = tf.reshape(z_path[:, t], [-1, 1])
+            k_next = self.policy_net(k, z_curr)
+            reward = compute_cash_flow_basic(k, k_next, z_curr, self.params, temperature=temperature, logit_clip=self.logit_clip)
+            rewards_list.append(reward)
+            k = k_next
+
+        rewards = tf.concat(rewards_list, axis=1)
+
+        # Compute terminal value
+        z_terminal = tf.reshape(z_path[:, self.T], [-1, 1])
+        v_terminal = compute_terminal_value(
+            k, z_terminal, self.params, self.beta,
+            temperature=temperature,
+            logit_clip=self.logit_clip
+        )
+
+        loss = compute_lr_loss(rewards, self.beta, terminal_value=v_terminal)
+
+        return {
+            "loss_LR": float(loss),
+            "mean_reward": float(tf.reduce_mean(rewards)),
         }
 
 
@@ -225,8 +286,7 @@ class BasicTrainerER:
             chi = euler_chi(k, k_next, self.params)
 
             # === FUTURE STEP - MAIN FORK (Target Policy) ===
-            # Compute k'' using TARGET policy for stability
-            # User clarification: "Use Target Policy for the second step k''"
+            # Compute k'' using TARGET policy for stability (DDPG-style)
             k_next_next_main = self.target_policy_net(k_next, z_next_main)
             m_main = euler_m(k_next, k_next_next_main, z_next_main, self.params)
             f_main = chi - self.beta * m_main
@@ -255,6 +315,50 @@ class BasicTrainerER:
             "target_policy_update": target_update_mag
         }
 
+    def evaluate(
+        self,
+        k: tf.Tensor,
+        z: tf.Tensor,
+        z_next_main: tf.Tensor,
+        z_next_fork: tf.Tensor
+    ) -> Dict[str, float]:
+        """
+        Evaluate on data without updating weights.
+
+        Used for validation set evaluation during early stopping.
+
+        Args:
+            k: Current capital (batch_size,)
+            z: Current productivity (batch_size,)
+            z_next_main: Next productivity, main fork (batch_size,)
+            z_next_fork: Next productivity, second fork (batch_size,)
+
+        Returns:
+            Dict with loss_ER metric.
+        """
+        # Reshape inputs
+        k = tf.reshape(k, [-1, 1])
+        z = tf.reshape(z, [-1, 1])
+        z_next_main = tf.reshape(z_next_main, [-1, 1])
+        z_next_fork = tf.reshape(z_next_fork, [-1, 1])
+
+        # Current step
+        k_next = self.policy_net(k, z)
+        chi = euler_chi(k, k_next, self.params)
+
+        # Future step (target policy)
+        k_next_next_main = self.target_policy_net(k_next, z_next_main)
+        m_main = euler_m(k_next, k_next_next_main, z_next_main, self.params)
+        f_main = chi - self.beta * m_main
+
+        k_next_next_fork = self.target_policy_net(k_next, z_next_fork)
+        m_fork = euler_m(k_next, k_next_next_fork, z_next_fork, self.params)
+        f_fork = chi - self.beta * m_fork
+
+        loss = compute_er_loss_aio(f_main, f_fork)
+
+        return {"loss_ER": float(loss)}
+
 
 class BasicTrainerBR:
     """
@@ -277,7 +381,6 @@ class BasicTrainerBR:
 
     Reference:
         report_brief.md lines 585-644: "Algorithm Summary: BR Method"
-        User clarification: Use target policy (DDPG framework)
     """
     def __init__(
         self,
@@ -535,6 +638,93 @@ class BasicTrainerBR:
             "target_policy_update": target_policy_update
         }
 
+    def evaluate(
+        self,
+        k: tf.Tensor,
+        z: tf.Tensor,
+        z_next_main: tf.Tensor,
+        z_next_fork: tf.Tensor,
+        temperature: float
+    ) -> Dict[str, float]:
+        """
+        Evaluate on data without updating weights.
+
+        Used for validation set evaluation during early stopping.
+
+        Args:
+            k: Current capital (batch_size,)
+            z: Current productivity (batch_size,)
+            z_next_main: Next productivity, main fork (batch_size,)
+            z_next_fork: Next productivity, second fork (batch_size,)
+            temperature: Annealing temperature
+
+        Returns:
+            Dict with loss_critic and loss_actor metrics.
+        """
+        # Reshape inputs
+        k = tf.reshape(k, [-1, 1])
+        z = tf.reshape(z, [-1, 1])
+        z_next_main = tf.reshape(z_next_main, [-1, 1])
+        z_next_fork = tf.reshape(z_next_fork, [-1, 1])
+
+        # Critic evaluation (using target networks)
+        k_next = self.target_policy_net(k, z)
+        V_next_main = self.target_value_net(k_next, z_next_main)
+        V_next_fork = self.target_value_net(k_next, z_next_fork)
+
+        e = compute_cash_flow_basic(k, k_next, z, self.params, temperature=temperature, logit_clip=self.logit_clip)
+
+        y1 = e + self.beta * V_next_main
+        y2 = e + self.beta * V_next_fork
+
+        V_curr = self.value_net(k, z)
+        loss_critic = compute_br_critic_loss_aio(V_curr, y1, y2)
+
+        # Actor evaluation (using current policy)
+        k_next_actor = self.policy_net(k, z)
+        V_next_actor = self.value_net(k_next_actor, z_next_main)
+        e_actor = compute_cash_flow_basic(k, k_next_actor, z, self.params, temperature=temperature, logit_clip=self.logit_clip)
+        loss_actor = -tf.reduce_mean(e_actor + self.beta * V_next_actor)
+
+        return {
+            "loss_critic": float(loss_critic),
+            "loss_actor": float(loss_actor)
+        }
+
+
+# =============================================================================
+# VALIDATION HELPERS
+# =============================================================================
+
+def _make_validation_fn_lr(trainer: BasicTrainerLR):
+    """Create validation function for LR method."""
+    def validation_fn(trainer, batch, temperature):
+        k = batch.get('k0', batch.get('k'))
+        z_path = batch['z_path']
+        return trainer.evaluate(k, z_path, temperature)
+    return validation_fn
+
+
+def _make_validation_fn_er(trainer: BasicTrainerER):
+    """Create validation function for ER method."""
+    def validation_fn(trainer, batch, temperature):
+        return trainer.evaluate(
+            batch['k'], batch['z'],
+            batch['z_next_main'], batch['z_next_fork']
+        )
+    return validation_fn
+
+
+def _make_validation_fn_br(trainer: BasicTrainerBR):
+    """Create validation function for BR method."""
+    def validation_fn(trainer, batch, temperature):
+        return trainer.evaluate(
+            batch['k'], batch['z'],
+            batch['z_next_main'], batch['z_next_fork'],
+            temperature
+        )
+    return validation_fn
+
 
 # =============================================================================
 # HIGH-LEVEL ENTRY POINTS
@@ -548,19 +738,34 @@ def train_basic_lr(
     anneal_config: AnnealingConfig,
     params: EconomicParams,
     shock_params: ShockParams,
-    bounds: Dict[str, Tuple[float, float]]
+    bounds: Dict[str, Tuple[float, float]],
+    validation_data: Optional[Dict[str, tf.Tensor]] = None
 ) -> Dict[str, Any]:
     """
     Train Basic Model using Lifetime Reward (LR).
+
+    Args:
+        dataset: Training dataset with keys 'k0', 'z_path'
+        net_config: Network architecture configuration
+        opt_config: Optimization configuration (includes early_stopping)
+        method_config: Method-specific configuration
+        anneal_config: Annealing configuration
+        params: Economic parameters
+        shock_params: Shock parameters
+        bounds: State bounds dictionary
+        validation_data: Optional validation dataset for early stopping
+
+    Returns:
+        Dict with history, trained networks, and configs
     """
     k_bounds = bounds['k']
-    
+
     # 0. Data Setup
     if 'z_path' in dataset:
         T = dataset['z_path'].shape[1] - 1
     else:
         raise ValueError("Cannot infer Horizon T from dataset (missing 'z_path').")
-        
+
     # Create batched iterator
     tf_dataset = tf.data.Dataset.from_tensor_slices(dataset)
     tf_dataset = tf_dataset.shuffle(buffer_size=dataset['k0'].shape[0]).batch(opt_config.batch_size).repeat()
@@ -574,7 +779,7 @@ def train_basic_lr(
         n_neurons=net_config.n_neurons,
         activation=net_config.activation
     )
-    
+
     # 2. Setup Trainer
     optimizer = tf.keras.optimizers.Adam(learning_rate=opt_config.learning_rate)
     trainer = BasicTrainerLR(
@@ -585,16 +790,21 @@ def train_basic_lr(
         T=T,
         logit_clip=anneal_config.logit_clip
     )
-    
-    # 3. Execute Loop
+
+    # 3. Setup validation function (for early stopping)
+    validation_fn = _make_validation_fn_lr(trainer) if validation_data is not None else None
+
+    # 4. Execute Loop
     history = execute_training_loop(
-        trainer, 
-        data_iter, 
+        trainer,
+        data_iter,
         opt_config,
-        anneal_config, 
-        method_name="basic_lr"
+        anneal_config,
+        method_name="basic_lr",
+        validation_data=validation_data,
+        validation_fn=validation_fn
     )
-    
+
     return {
         "history": history,
         "_policy_net": policy_net,
@@ -616,7 +826,8 @@ def train_basic_er(
     anneal_config: AnnealingConfig,
     params: EconomicParams,
     shock_params: ShockParams,
-    bounds: Dict[str, Tuple[float, float]]
+    bounds: Dict[str, Tuple[float, float]],
+    validation_data: Optional[Dict[str, tf.Tensor]] = None
 ) -> Dict[str, Any]:
     """
     Train Basic Model using Euler Residuals (ER).
@@ -643,6 +854,7 @@ def train_basic_er(
         params: Economic parameters
         shock_params: Shock parameters
         bounds: State bounds dictionary
+        validation_data: Optional FLATTENED validation dataset for early stopping
 
     Returns:
         Dict containing:
@@ -683,12 +895,17 @@ def train_basic_er(
         polyak_tau=method_config.polyak_tau if hasattr(method_config, 'polyak_tau') else 0.995
     )
 
+    # Setup validation function (for early stopping)
+    validation_fn = _make_validation_fn_er(trainer) if validation_data is not None else None
+
     history = execute_training_loop(
         trainer,
         data_iter,
         opt_config,
         anneal_config,
-        method_name="basic_er"
+        method_name="basic_er",
+        validation_data=validation_data,
+        validation_fn=validation_fn
     )
 
     return {
@@ -713,7 +930,8 @@ def train_basic_br(
     anneal_config: AnnealingConfig,
     params: EconomicParams,
     shock_params: ShockParams,
-    bounds: Dict[str, Tuple[float, float]]
+    bounds: Dict[str, Tuple[float, float]],
+    validation_data: Optional[Dict[str, tf.Tensor]] = None
 ) -> Dict[str, Any]:
     """
     Train Basic Model using Bellman Residuals (Actor-Critic).
@@ -742,6 +960,7 @@ def train_basic_br(
         params: Economic parameters
         shock_params: Shock parameters
         bounds: State bounds dictionary
+        validation_data: Optional FLATTENED validation dataset for early stopping
 
     Returns:
         Dict containing:
@@ -789,12 +1008,17 @@ def train_basic_br(
         polyak_tau=method_config.polyak_tau if hasattr(method_config, 'polyak_tau') else 0.995
     )
 
+    # Setup validation function (for early stopping)
+    validation_fn = _make_validation_fn_br(trainer) if validation_data is not None else None
+
     history = execute_training_loop(
         trainer,
         data_iter,
         opt_config,
         anneal_config,
-        method_name="basic_br"
+        method_name="basic_br",
+        validation_data=validation_data,
+        validation_fn=validation_fn
     )
 
     return {

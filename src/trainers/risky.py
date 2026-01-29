@@ -32,7 +32,7 @@ from src.trainers.losses import (
     compute_critic_objective,
     compute_actor_objective
 )
-from src.utils.annealing import AnnealingSchedule, smooth_default_prob
+from src.utils.annealing import AnnealingSchedule, indicator_default
 from src.trainers.config import NetworkConfig, OptimizationConfig, AnnealingConfig, MethodConfig
 from src.trainers.core import execute_training_loop
 
@@ -80,7 +80,7 @@ class RiskyDebtTrainerLR:
         self.optimizer_value = optimizer_value or tf.keras.optimizers.Adam(1e-3)
         self.T = T
         self.batch_size = batch_size
-        self.smoothing = smoothing or AnnealingSchedule(init_temp=0.1, min=1e-4, decay=0.99)
+        self.smoothing = smoothing or AnnealingSchedule(init_temp=0.1, min_temp=1e-4, decay_rate=0.99)
         self.logit_clip = logit_clip
         self.beta = 1.0 / (1.0 + params.r_rate)
 
@@ -238,8 +238,8 @@ class RiskyDebtTrainerLR:
                 # Compute pricing residual using value network for default probability
                 V_tilde_1 = self.value_net(k_next, b_next, z_next_main)
                 V_tilde_2 = self.value_net(k_next, b_next, z_next_fork)
-                p_D_1 = smooth_default_prob(V_tilde_1, self.smoothing, logit_clip=self.logit_clip)
-                p_D_2 = smooth_default_prob(V_tilde_2, self.smoothing, logit_clip=self.logit_clip)
+                p_D_1 = indicator_default(V_tilde_1, self.smoothing, logit_clip=self.logit_clip)
+                p_D_2 = indicator_default(V_tilde_2, self.smoothing, logit_clip=self.logit_clip)
 
                 R_1 = recovery_value(k_next, z_next_main, self.params)
                 R_2 = recovery_value(k_next, z_next_fork, self.params)
@@ -320,7 +320,7 @@ class RiskyDebtTrainerBR:
         self.lambda_1 = lambda_1
         self.lambda_2 = lambda_2
         self.n_critic_steps = n_critic_steps
-        self.smoothing = smoothing or AnnealingSchedule(init_temp=0.1, min=1e-4, decay=0.99)
+        self.smoothing = smoothing or AnnealingSchedule(init_temp=0.1, min_temp=1e-4, decay_rate=0.99)
         self.logit_clip = logit_clip
         self.beta = 1.0 / (1.0 + params.r_rate)
         self.leaky_actor = leaky_actor
@@ -383,8 +383,8 @@ class RiskyDebtTrainerBR:
                 loss_critic_accum += l_br
                 
                 # Price Loss
-                p_D_1 = smooth_default_prob(V_tilde_next_1, self.smoothing, logit_clip=self.logit_clip)
-                p_D_2 = smooth_default_prob(V_tilde_next_2, self.smoothing, logit_clip=self.logit_clip)
+                p_D_1 = indicator_default(V_tilde_next_1, self.smoothing, logit_clip=self.logit_clip)
+                p_D_2 = indicator_default(V_tilde_next_2, self.smoothing, logit_clip=self.logit_clip)
                 R_1 = recovery_value(k_next, z_next_main, self.params)
                 R_2 = recovery_value(k_next, z_next_fork, self.params)
                 
@@ -456,8 +456,8 @@ class RiskyDebtTrainerBR:
                 loss_actor_accum += l_actor
                 
                 # Price Constraint
-                p_D_1 = smooth_default_prob(V_tilde_next_1, self.smoothing, logit_clip=self.logit_clip)
-                p_D_2 = smooth_default_prob(V_tilde_next_2, self.smoothing, logit_clip=self.logit_clip)
+                p_D_1 = indicator_default(V_tilde_next_1, self.smoothing, logit_clip=self.logit_clip)
+                p_D_2 = indicator_default(V_tilde_next_2, self.smoothing, logit_clip=self.logit_clip)
                 R_1 = recovery_value(k_next, z_next_main, self.params)
                 R_2 = recovery_value(k_next, z_next_fork, self.params)
                 

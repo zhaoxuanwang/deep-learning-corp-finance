@@ -23,7 +23,6 @@ from src.economy.logic import (
     production_function,
     compute_investment,
     adjustment_costs,
-    investment_gate_ste,
     # Cash flows
     compute_cash_flow_basic,
     cash_flow_risky_debt,
@@ -65,7 +64,6 @@ __all__ = [
     "production_function",
     "compute_investment",
     "adjustment_costs",
-    "investment_gate_ste",
     # Cash flows
     "compute_cash_flow_basic",
     "cash_flow_risky_debt",

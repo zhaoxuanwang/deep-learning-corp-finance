@@ -194,6 +194,7 @@ class DataGenerator:
         self._test_dataset: Optional[Dict[str, tf.Tensor]] = None
         self._training_dataset: Optional[Dict[str, tf.Tensor]] = None
         self._flattened_training_dataset: Optional[Dict[str, tf.Tensor]] = None
+        self._flattened_validation_dataset: Optional[Dict[str, tf.Tensor]] = None
 
     def _get_config_hash(self) -> str:
         """
@@ -833,6 +834,106 @@ class DataGenerator:
             )
 
         return self._flattened_training_dataset
+
+    def get_flattened_validation_dataset(self) -> Dict[str, tf.Tensor]:
+        """
+        Get flattened validation dataset for ER/BR methods (N_val*T i.i.d. transitions).
+
+        This method transforms trajectory-based validation data into individual i.i.d.
+        transitions suitable for Euler Residual (ER) and Bellman Residual (BR) methods.
+
+        The transformation follows the same logic as get_flattened_training_dataset():
+        1. Load validation dataset with trajectories (N_val firms, T timesteps)
+        2. Flatten from (N_val, T) to (N_val*T,) individual state transitions
+        3. For each transition: sample k independently from ergodic distribution
+        4. NO shuffling for validation (deterministic evaluation)
+
+        Returns:
+            Dictionary with flattened validation data:
+                - 'k': Current capital (N_val*T,) - sampled independently
+                - 'z': Current productivity (N_val*T,) - from z_path[:, t]
+                - 'z_next_main': Next productivity, main path (N_val*T,) - from z_path[:, t+1]
+                - 'z_next_fork': Next productivity, fork path (N_val*T,) - from z_fork[:, t, 0]
+
+        Example:
+            >>> # For ER/BR validation
+            >>> flat_val = gen.get_flattened_validation_dataset()
+            >>> k = flat_val['k']  # (N_val*T,)
+            >>> z = flat_val['z']  # (N_val*T,)
+        """
+        # Check memory cache first
+        if self._flattened_validation_dataset is not None:
+            return self._flattened_validation_dataset
+
+        # Try loading from disk cache if enabled
+        if self.cache_dir is not None:
+            cache_path = self._get_cache_path("validation_flattened")
+            if os.path.exists(cache_path):
+                self._flattened_validation_dataset = self._load_from_disk(cache_path)
+                return self._flattened_validation_dataset
+
+        # Generate flattened dataset from trajectory validation data
+        traj_data = self.get_validation_dataset()
+
+        # Extract relevant arrays
+        z_path = traj_data['z_path']  # (N_val, T+1)
+        z_fork = traj_data['z_fork']  # (N_val, T, 1)
+
+        # Get dimensions
+        N = tf.shape(z_path)[0]  # Number of validation trajectories
+        T = tf.shape(z_path)[1] - 1  # Horizon (z_path is T+1)
+        N_total = N * T  # Total flattened samples
+
+        # === FLATTENING ===
+        # Extract z (current): take z_path[:, 0:T]
+        z_curr = z_path[:, :-1]  # (N, T)
+
+        # Extract z_next_main: take z_path[:, 1:T+1]
+        z_next_main = z_path[:, 1:]  # (N, T)
+
+        # Extract z_next_fork: z_fork is already (N, T, 1), squeeze last dim
+        z_next_fork = tf.squeeze(z_fork, axis=-1)  # (N, T)
+
+        # Flatten from (N, T) to (N*T,)
+        z_flat = tf.reshape(z_curr, [-1])  # (N*T,)
+        z_next_main_flat = tf.reshape(z_next_main, [-1])  # (N*T,)
+        z_next_fork_flat = tf.reshape(z_next_fork, [-1])  # (N*T,)
+
+        # === INDEPENDENT K SAMPLING ===
+        # Sample k independently for validation (different seed offset from training)
+        k_seed = tf.constant([
+            self.master_seed[0] + 600,  # Offset for validation flattened k sampling
+            self.master_seed[1] + 0
+        ], dtype=tf.int32)
+
+        k_min, k_max = self.k_bounds
+        k_flat = tf.random.stateless_uniform(
+            shape=[N_total],
+            seed=k_seed,
+            minval=k_min,
+            maxval=k_max,
+            dtype=tf.float32
+        )
+
+        # NOTE: No shuffling for validation - we want deterministic evaluation
+        # Store in memory cache
+        self._flattened_validation_dataset = {
+            'k': k_flat,
+            'z': z_flat,
+            'z_next_main': z_next_main_flat,
+            'z_next_fork': z_next_fork_flat
+        }
+
+        # Save to disk cache if enabled
+        if self.cache_dir is not None:
+            cache_path = self._get_cache_path("validation_flattened")
+            self._save_to_disk(
+                self._flattened_validation_dataset,
+                cache_path,
+                metadata=self._get_metadata()
+            )
+
+        return self._flattened_validation_dataset
 
 
 # =============================================================================

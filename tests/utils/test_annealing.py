@@ -5,9 +5,10 @@ Unit tests for AnnealingSchedule class.
 """
 
 import pytest
+import math
 import numpy as np
 
-from src.utils.annealing import AnnealingSchedule, smooth_default_prob
+from src.utils.annealing import AnnealingSchedule, indicator_default, indicator_abs_gt, indicator_lt
 
 
 class TestAnnealingSchedule:
@@ -17,16 +18,22 @@ class TestAnnealingSchedule:
         """Default initialization creates valid schedule."""
         schedule = AnnealingSchedule()
         assert schedule.init_temp == 1.0
-        assert schedule.min == 0.0001
-        assert schedule.decay == 0.9
-        assert schedule.schedule == "exponential"
+        assert schedule.min_temp == 0.0001
+        assert schedule.decay_rate == 0.9
+        assert schedule.buffer == 0.25
         assert schedule.value == 1.0
         assert schedule.step == 0
     
+    def test_n_anneal_calculation(self):
+        """Test calculation of N_anneal against manual check."""
+        schedule = AnnealingSchedule(init_temp=1.0, min_temp=0.01, decay_rate=0.9, buffer=0.25)
+        # Expected: ceil( ((ln(0.01)-ln(1))/ln(0.9)) * 1.25 ) = ceil(43.7 * 1.25) = 55
+        assert schedule.n_anneal == 55
+
     def test_exponential_decay_deterministic(self):
         """Exponential decay is deterministic."""
-        s1 = AnnealingSchedule(init_temp=1.0, decay=0.9, min=0.01)
-        s2 = AnnealingSchedule(init_temp=1.0, decay=0.9, min=0.01)
+        s1 = AnnealingSchedule(init_temp=1.0, decay_rate=0.9, min_temp=0.01)
+        s2 = AnnealingSchedule(init_temp=1.0, decay_rate=0.9, min_temp=0.01)
         
         for _ in range(10):
             s1.update()
@@ -36,7 +43,7 @@ class TestAnnealingSchedule:
     
     def test_monotone_decreasing(self):
         """Value monotonically decreases."""
-        schedule = AnnealingSchedule(init_temp=1.0, decay=0.9, min=0.001)
+        schedule = AnnealingSchedule(init_temp=1.0, decay_rate=0.9, min_temp=0.001)
         
         prev = schedule.value
         for _ in range(100):
@@ -47,41 +54,22 @@ class TestAnnealingSchedule:
     
     def test_clamps_at_min(self):
         """Value never goes below min."""
-        schedule = AnnealingSchedule(init_temp=1.0, decay=0.5, min=0.1)
+        schedule = AnnealingSchedule(init_temp=1.0, decay_rate=0.5, min_temp=0.1)
         
         for _ in range(100):
             schedule.update()
         
-        assert schedule.value >= schedule.min
+        assert schedule.value >= schedule.min_temp
         assert schedule.value == 0.1
     
     def test_reaches_near_zero(self):
         """Value reaches near-zero relative to initial."""
-        schedule = AnnealingSchedule(init_temp=1.0, min=0.01, decay=0.99)
+        schedule = AnnealingSchedule(init_temp=1.0, min_temp=0.01, decay_rate=0.99)
         
         for _ in range(1000):
             schedule.update()
         
         assert schedule.value <= 0.01 * 1.01
-    
-    def test_linear_schedule(self):
-        """Linear schedule decays linearly to min."""
-        schedule = AnnealingSchedule(
-            init_temp=1.0,
-            min=0.0,
-            schedule="linear",
-            total_steps=100
-        )
-        
-        for _ in range(50):
-            schedule.update()
-        
-        assert abs(schedule.value - 0.5) < 0.02
-        
-        for _ in range(50):
-            schedule.update()
-        
-        assert schedule.value == 0.0
     
     def test_reset(self):
         """Reset restores initial state."""
@@ -116,22 +104,16 @@ class TestAnnealingSchedule:
         
         assert schedule.step == 5
     
-    def test_invalid_schedule_raises(self):
-        """Invalid schedule type raises ValueError."""
-        schedule = AnnealingSchedule(schedule="invalid")
-        
-        with pytest.raises(ValueError, match="Unknown schedule"):
-            schedule.update()
-    
     def test_repr(self):
-        """__repr__ produces informative string."""
-        schedule = AnnealingSchedule(init_temp=1.0, min=0.01, schedule="exponential")
+        """__repr__ produces informative string including N_anneal."""
+        schedule = AnnealingSchedule(init_temp=1.0, min_temp=0.01, decay_rate=0.9, buffer=0.0)
         
         repr_str = repr(schedule)
         
         assert "AnnealingSchedule" in repr_str
         assert "init=1.0" in repr_str
         assert "min=0.01" in repr_str
+        assert "N_anneal=" in repr_str
 
     def test_value_is_python_float(self):
         """Value property returns Python float, not tf.Tensor."""
@@ -143,32 +125,76 @@ class TestAnnealingSchedule:
 
 
 class TestComputeSmoothDefaultProb:
-    """Tests for functional smooth_default_prob."""
+    """Tests for refactored smooth_default_prob (Gumbel-Sigmoid)."""
     
-    def test_pD_at_zero_V_tilde(self):
-        """p^D = 0.5 when V_tilde = 0."""
+    def test_deterministic_behavior(self):
+        """When noise=False, acts as deterministic sigmoid."""
         import tensorflow as tf
-        V_tilde = tf.constant([0.0])
-        p_D = smooth_default_prob(V_tilde, temperature=0.1)
+        # Formula: sigma(-x/tau)
+        V_norm = tf.constant([0.0]) # x=0 -> logit=0 -> p=0.5
+        p_D = indicator_default(V_norm, temperature=1.0, noise=False)
         assert abs(p_D.numpy()[0] - 0.5) < 1e-5
-    
-    def test_pD_increases_as_V_decreases(self):
-        """p^D increases as V_tilde decreases."""
+        
+        # V/k = 2.0 -> logit = -2.0 -> p = sigmoid(-2) approx 0.119
+        V_pos = tf.constant([2.0])
+        p_D_pos = indicator_default(V_pos, temperature=1.0, noise=False)
+        expected = 1 / (1 + math.exp(2.0))
+        assert abs(p_D_pos.numpy()[0] - expected) < 1e-5
+
+    def test_stochastic_behavior(self):
+        """When noise=True, output differs across runs."""
         import tensorflow as tf
-        V_large = tf.constant([2.0])
-        V_small = tf.constant([-2.0])
-        
-        p_D_large = smooth_default_prob(V_large, temperature=0.1)
-        p_D_small = smooth_default_prob(V_small, temperature=0.1)
-        
-        assert p_D_small.numpy()[0] > p_D_large.numpy()[0]
-    
-    def test_pD_bounded_0_1(self):
-        """p^D is bounded in [0, 1]."""
+        V_norm = tf.constant([0.0])
+        # Two calls with same input should differ due to Gumbel noise
+        p1 = indicator_default(V_norm, temperature=1.0, noise=True)
+        p2 = indicator_default(V_norm, temperature=1.0, noise=True)
+        assert p1.numpy()[0] != p2.numpy()[0]
+
+    def test_clipping(self):
+        """Value is clipped before processing."""
         import tensorflow as tf
-        V = tf.constant([-100.0, -10.0, 0.0, 10.0, 100.0])
+        # V=100 would be clipped to 20
+        # If noise=False, logit = -20/1 = -20.
+        # sigmoid(-20) is very close to 0.
+        V_huge = tf.constant([100.0])
+        p_D = indicator_default(V_huge, temperature=1.0, logit_clip=20.0, noise=False)
+        expected = 1 / (1 + math.exp(20.0))
+        assert abs(p_D.numpy()[0] - expected) < 1e-7
+
+
+class TestIndicators:
+    """Tests for indicator_abs_gt and indicator_lt."""
+    
+    def test_indicator_abs_gt_epsilon_shift(self):
+        """Test sigma((|x| - eps)/tau)."""
+        import tensorflow as tf
+        # x = eps -> logit = 0 -> p = 0.5
+        eps = 0.5
+        x = tf.constant([0.5]) 
+        # indicator_abs_gt(x, threshold=eps, mode='soft')
+        val = indicator_abs_gt(x, threshold=eps, temperature=1.0, mode='soft')
+        assert abs(val.numpy()[0] - 0.5) < 1e-5
         
-        p_D = smooth_default_prob(V, temperature=0.1)
+        # x > eps -> logit > 0 -> p > 0.5
+        x_large = tf.constant([2.5]) # |2.5| - 0.5 = 2.0
+        val_large = indicator_abs_gt(x_large, threshold=eps, temperature=1.0, mode='soft')
+        expected = 1 / (1 + math.exp(-2.0))
+        assert abs(val_large.numpy()[0] - expected) < 1e-5
+
+    def test_indicator_lt_epsilon_shift(self):
+        """Test sigma(-(x + eps)/tau)."""
+        import tensorflow as tf
+        # x = -eps -> logit = 0 -> p = 0.5
+        eps = 0.5
+        # indicator_lt checks x < -eps
+        # formula: -(x + eps)/tau
+        # if x = -0.5, then -( -0.5 + 0.5 ) = 0
+        x = tf.constant([-0.5]) 
+        val = indicator_lt(x, threshold=eps, temperature=1.0, mode='soft')
+        assert abs(val.numpy()[0] - 0.5) < 1e-5
         
-        assert all(p_D.numpy() >= 0)
-        assert all(p_D.numpy() <= 1)
+        # x < -eps (e.g. -2.5) -> -2.5 + 0.5 = -2.0 -> -(-2.0) = 2.0 -> p > 0.5
+        x_small = tf.constant([-2.5])
+        val_small = indicator_lt(x_small, threshold=eps, temperature=1.0, mode='soft')
+        expected = 1 / (1 + math.exp(-2.0))
+        assert abs(val_small.numpy()[0] - expected) < 1e-5

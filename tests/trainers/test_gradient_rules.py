@@ -18,8 +18,8 @@ from src.networks import (
     apply_limited_liability
 )
 from src.trainers.basic import BasicTrainerBR
-from src.utils.annealing import AnnealingSchedule, smooth_default_prob
-from src.economy.logic import investment_gate_ste, adjustment_costs
+from src.utils.annealing import AnnealingSchedule, indicator_default
+from src.economy.logic import adjustment_costs
 
 
 class TestStopGradientRules:
@@ -31,6 +31,13 @@ class TestStopGradientRules:
         """Critic step should not produce gradients for policy params."""
         policy_net = BasicPolicyNetwork(k_min=0.01, k_max=10.0, n_layers=2, n_neurons=8, activation="swish")
         value_net = BasicValueNetwork(n_layers=2, n_neurons=8, activation="swish")
+        
+        # Build networks
+        k_dummy = tf.constant([[1.0]])
+        z_dummy = tf.constant([[1.0]])
+        policy_net(k_dummy, z_dummy)
+        value_net(k_dummy, z_dummy)
+
         params = EconomicParams()
         shock_params = ShockParams()
         
@@ -45,6 +52,13 @@ class TestStopGradientRules:
         """Actor step should not update value network parameters."""
         policy_net = BasicPolicyNetwork(k_min=0.01, k_max=10.0, n_layers=2, n_neurons=8, activation="swish")
         value_net = BasicValueNetwork(n_layers=2, n_neurons=8, activation="swish")
+
+        # Build networks
+        k_dummy = tf.constant([[1.0]])
+        z_dummy = tf.constant([[1.0]])
+        policy_net(k_dummy, z_dummy)
+        value_net(k_dummy, z_dummy)
+
         params = EconomicParams()
         shock_params = ShockParams()
         

@@ -22,6 +22,30 @@ class NetworkConfig:
 
 
 @dataclass
+class EarlyStoppingConfig:
+    """
+    Configuration for early stopping / convergence criteria.
+
+    References:
+        report_brief.md lines 723-784: Convergence and Stopping Criteria
+    """
+    enabled: bool = False  # If False, run exactly n_iter steps (Debug mode)
+    patience: int = 5  # Consecutive validation checks before stopping
+    eval_freq: int = 100  # Evaluate validation metrics every N steps
+
+    # LR Method: Relative Improvement Plateau
+    lr_epsilon: float = 1e-4  # Relative improvement threshold
+    lr_window: int = 100  # Window size for improvement evaluation
+
+    # ER Method: Zero-Tolerance Plateau
+    er_epsilon: float = 1e-5  # Absolute loss threshold
+
+    # BR Method: Dual-Condition Convergence
+    br_critic_epsilon: float = 1e-5  # Critic loss threshold
+    br_actor_epsilon: float = 1e-4  # Actor relative improvement threshold
+
+
+@dataclass
 class OptimizationConfig:
     """Configuration for training loop and optimizer."""
     learning_rate: float = 1e-3
@@ -29,6 +53,7 @@ class OptimizationConfig:
     batch_size: int = 128  # Trainer-controlled batch size
     n_iter: int = 1000
     log_every: int = 10
+    early_stopping: Optional[EarlyStoppingConfig] = None  # None = disabled
 
 
 @dataclass

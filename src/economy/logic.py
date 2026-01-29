@@ -27,26 +27,13 @@ def compute_investment(k: Numeric, k_next: Numeric, params: EconomicParams) -> N
     """ Law of motion: I = k' - (1 - delta) * k """
     return k_next - (1 - params.delta) * k
 
-def investment_gate_ste(
-    investment: Numeric,
-    eps: float = 1e-6,
-    temperature: float = 0.1,
-    logit_clip: float = 20.0,
-    mode: str = "soft"
-) -> Numeric:
-    """
-    Investment indicator gate with smooth function and annealing.
-    """
-    from src.utils.annealing import indicator_abs_gt
-    return indicator_abs_gt(investment, threshold=eps, temperature=temperature, logit_clip=logit_clip, mode=mode)
-
 
 def adjustment_costs(
     k: Numeric,
     k_next: Numeric,
     params: EconomicParams,
-    temperature: float = 0.1,
-    logit_clip: float = 20.0
+    temperature: float,
+    logit_clip: float
 ) -> Numeric:
     """
     Total Adjustment Costs (Convex + Fixed).
@@ -57,15 +44,27 @@ def adjustment_costs(
         params: Model parameters (cost_convex, cost_fixed)
         temperature: Temperature for fixed cost gate (if soft/ste)
     """
+    from src.utils.annealing import indicator_abs_gt
+
     investment = compute_investment(k, k_next, params)
     safe_k = tf.maximum(k, 1e-8)
 
     # 1. Convex Costs: (φ/2) * (I^2 / k)
     adj_convex = (params.cost_convex / 2.0) * (investment ** 2) / safe_k
 
-    # 2. Fixed Costs: cost_fixed * k * 1{|I| > eps}
-    # Uses STE gate for gradient flow during training
-    is_investing = investment_gate_ste(investment, temperature=temperature, logit_clip=logit_clip)
+    # 2. Fixed Costs: cost_fixed * k * 1{|I/k| > eps}
+    # Uses smooth gate for gradient flow during training
+    # Note: Report specifies 1{|I/k| > eps}. We normalize I by k.
+    i_normalized = investment / safe_k
+    
+    # Use epsilon=1e-6 as hardcoded threshold for now, matching previous default
+    is_investing = indicator_abs_gt(
+        i_normalized, 
+        threshold=1e-8, 
+        temperature=temperature, 
+        logit_clip=logit_clip
+    )
+    
     adj_fixed = params.cost_fixed * safe_k * is_investing
 
     return adj_convex + adj_fixed
@@ -75,8 +74,8 @@ def compute_cash_flow_basic(
     k_next: Numeric, 
     z: Numeric, 
     params: EconomicParams,
-    temperature: float = 0.1,
-    logit_clip: float = 20.0
+    temperature: float,
+    logit_clip: float
 ) -> Numeric:
     """
     Dividend d_t = Profit - Investment - Costs
@@ -91,8 +90,8 @@ def compute_cash_flow_basic(
 def external_financing_cost(
     e: Numeric,
     params: EconomicParams,
-    temperature: float = 0.1,
-    logit_clip: float = 20.0
+    temperature: float,
+    logit_clip: float
 ) -> Numeric:
     """
     External equity injection cost per outline_v2.md.
@@ -106,7 +105,7 @@ def external_financing_cost(
     """
     from src.utils.annealing import indicator_lt
     
-    is_negative = indicator_lt(e, threshold=0.0, temperature=temperature, logit_clip=logit_clip)
+    is_negative = indicator_lt(e, threshold=1e-8, temperature=temperature, logit_clip=logit_clip)
     return is_negative * (params.cost_inject_fixed + params.cost_inject_linear * tf.abs(e))
 
 
@@ -118,8 +117,8 @@ def cash_flow_risky_debt(
     z: Numeric,
     r_tilde: Numeric,
     params: EconomicParams,
-    temperature: float = 0.1,
-    logit_clip: float = 20.0
+    temperature: float,
+    logit_clip: float
 ) -> Numeric:
     """
     Cash flow for risky debt model, using interest rate directly.
@@ -318,6 +317,60 @@ def euler_m(
 
 
 # === SECTION 5: Pricing Primitives ===
+
+# === SECTION 6: Terminal Value for LR Method ===
+
+def compute_terminal_value(
+    k_terminal: Numeric,
+    z_terminal: Numeric,
+    params: EconomicParams,
+    beta: float,
+    temperature: float,
+    logit_clip: float
+) -> Numeric:
+    """
+    Compute terminal value for LR method truncation correction.
+
+    References:
+        report_brief.md lines 503-514: Terminal Value for LR
+
+    Assumes:
+        - With long enough T horizon, k_T has converged to steady state
+        - At steady state: k_SS = k_T = k_{T+1} = ... forever
+        - Investment at steady state: I_SS = δ · k_SS
+        - Terminal value is infinite sum of discounted cash flow at (k_SS, z_T)
+
+    Formula:
+        V^term(k_T, z_T) = e(k_SS, k_SS, z_T) / (1 - β)
+
+    Args:
+        k_terminal: Terminal capital k_T (batch_size, 1)
+        z_terminal: Terminal productivity z_T (batch_size, 1)
+        params: Economic parameters
+        beta: Discount factor 1/(1+r)
+        temperature: Gate temperature for adjustment costs
+        logit_clip: Logit clipping for indicator functions
+
+    Returns:
+        Terminal value V^term (batch_size, 1)
+    """
+    # At steady state, k_SS = k_T
+    k_ss = k_terminal
+
+    # Compute steady-state cash flow: e(k_SS, k_SS, z_T)
+    # Investment I_SS = k_SS - (1-δ)k_SS = δ · k_SS (replace depreciation only)
+    e_ss = compute_cash_flow_basic(
+        k_ss, k_ss, z_terminal, params,
+        temperature=temperature,
+        logit_clip=logit_clip
+    )
+
+    # V^term = e_ss / (1 - β)
+    # This is the infinite geometric sum of discounted steady-state cash flows
+    v_term = e_ss / (1.0 - beta)
+
+    return v_term
+
 
 def pricing_residual_zero_profit(
     b_next: Numeric,

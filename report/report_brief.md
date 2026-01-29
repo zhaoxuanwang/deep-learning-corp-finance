@@ -355,6 +355,89 @@ Outputs (activations):
 **Others**
 - Compute primitives using **levels** recovered from transforms
 
+## Implementation Issues
+
+Several practical issues are common across all methods and need to be handled carefully and accurately.
+
+### Discrete Indicators
+
+In our model, there are two types of indicator functions that need to be handled carefully:
+
+- Inaction region $\mathbb{1}\{ x \neq 0\}$, e.g., fixed capital adjustment cost $\phi_1 \cdot k \cdot \mathbb{1}\{I\neq0\}$
+
+- Regime switch $\mathbb{1}\{x<0\}$ , e.g., equity injection, default on debt
+
+These hard discrete indicators have derivative 0 a.e. and undefined at $I=0$ due to discontinuity. Gradient-based training thus has no useful signal. If we hard-coded the indicator in our reward calculation, this component will has zero gradient through backpropogation, meaning that the network would essentially 'ignore' the inaction region or regime switch that are of interest. This issue does not only affect the ER method that requires existence of derivatives of the cost functions, it can also affect the LR and BR method, or any gradient-based training.
+
+Although it is straightforward to approximate these indicators with smooth functions, we should avoid over-smoothing the discontinuities/kinks because the hard indicators are economically meaningful and supposed to be captured by training. For example, we do not want to erase the inaction region in optimal investment policies due to fixed capital adjustment cost at $I\neq0$.
+
+With these nuances in mind, I adopt Sigmoid smoothing with annealing to replace the discrete indicator with a differentiable function that
+- is smooth and provides useful gradient signals during early iterations
+- converges to the true discrete indicator as a temperature/anneal parameter $\tau \to 0$ 
+
+Concretely, define sigmoid function $\sigma(x)=1/(1+e^{-x})$ and a tiny tolerance $\epsilon>0$ that is close to zero. By definition, $\sigma(x)\to 1$ when $x\to \infty$ and $\sigma(x)\to 0$ when $x\to -\infty$, and we can use it to approximate binary indicator during training while still ensure differentiability. Let $\tau>0$ denote a temperature parameter that is decreasing during training under an annealing schedule. 
+
+
+
+#### Capital adjustment cost
+
+In both the basic and risky debt model, firm pays a fixed capital adjustment cost for any non-zero investment. The fixed investment cost indicator $\mathbb{1}\{ I\neq 0\}$ can be replaced with
+
+$$
+\sigma\left(\frac{|I/k|-\epsilon}{\tau}\right) \rightarrow \mathbb{1}\{|I/k|\gt \epsilon\} \quad \text{as} \quad \tau \rightarrow 0, \, |I|\neq \epsilon
+$$
+
+where the point $I \neq 0$ is approximated with a small inaction region $[-\epsilon, \epsilon]$ in computation. Normalizing investment by capital is important to avoid saturation.
+
+#### Costly external finance
+
+In ths risky debt model, firm pays a fixed cost for equity injection (external financing) when cash flow $e$ is negative. The equity injection indicator $\mathbb{1}\{e<0\}$ can be replaced with
+$$
+\sigma\left(-\frac{e/k+\epsilon}{\tau}\right) \rightarrow \mathbb{1}\left\{\frac{e}{k}<-\epsilon \right\} \quad \text{as} \quad \tau \rightarrow 0
+$$ 
+where the payout is also normzlied by current capital to avoid saturation.
+
+#### Endogenous Default indicator 
+
+In risky debt model, firm choose to default when the continuation value becomes negative, $D=\mathbb{1}\{\widetilde V(z',k',b')<0\}$. In principle, we could use a similar sigmoid $\sigma(-V/\tau)$, but it risks getting stuck in local optima (e.g., the model learns "never default" early on and never explores the alternative). 
+
+Instead, I use Gumbel-Sigmoid that introduces random noise to force the pricing network to explore both default and solvent states around the default boundary. The steps are 
+
+1. Compute the normalized value $\widetilde V/k$ 
+2. Clip the norm value between $[-20, 20]$ as additional safety net
+3. Draw random noise  $u \sim \text{Uniform}(0,1)$
+4. Initialize temperature/anneal $\tau = 1.0$
+5. Compute Gumbel-Sigmoid: 
+$$ \sigma \left( 
+    \frac{- \widetilde V/k + \log(u) - \log(1-u)}{\tau}
+\right) \rightarrow \mathbb{1}\left\{\frac{\widetilde V}{k}<0 \right\} \quad \text{as} \quad \tau \rightarrow 0 $$
+
+where the random uniform noise $u \sim \text{Uniform}(0,1)$
+- encourages exploration around the default boundary when $\tau$ is large 
+- converges to the true indicator as $\tau \rightarrow 0$
+
+Note that the clipping limits and the initial temperature are hyperparameters that can be tuned.
+
+### Annealing Schedule
+I build a simple schedule that anneals temperature $\tau$ over iterations:
+$$
+\tau_j = \tau_0 \cdot d^j
+$$
+where $\tau_0$ is the initial temperature, $d \in (0,1)$ is the decay rate, and $j$ is the iteration number. 
+
+Given a set $\tau_{\min}>0$, we stop annealing when $\tau_{\min} \leftarrow \tau_j$. Then I hold $\tau_j$ constant at $\tau_{\min}$ to allow the gradients (which become very sharp/spiky at low $\tau$) to fine-tune the decision boundaries (e.g., the exact k where default happens) without the moving target. 
+
+Given the hyperparameter intput $\tau_{\min}$, initial temperature $\tau_0$, and decay $d$, we can compute the number of iterations for decay as 
+$$
+N_{\text{decay}} = \frac{\log(\tau_{\min}) - \log(\tau_0)}{\log(d)}
+$$
+The allow for a stablization buffer `anneal_buffer` (default 25%) to compute the final number of iterations for annealing as 
+$$
+N_{\text{anneal}} = \lceil N_{\text{decay}} \cdot (1+ \text{anneal\_buffer}) \rceil
+$$
+where $\lceil \cdot \rceil$ denotes the ceiling function. Later, the annealing iteration $N_{\text{anneal}}$ will be used in determining early stopping/convergence.
+
+
 ---
 # Basic Model
 
@@ -446,8 +529,8 @@ $$ k_{t+1} = \Gamma_{\text{policy}}(k_t, z^{(1)}_t; \theta) $$
 **Policy Update**: 
 - Compute $\mathcal{L}^{\text{LR}}$ (sum of discounted rewards) and update $\theta_{\text{policy}}$ via Stochastic Gradient Descent (SGD) to minimize the loss.
 
-**Iteration** 
-- Repeat until $\mathcal{L}^{\text{LR}}$ stabilizes.
+**Stopping** 
+- Repeat the loop above until hitting hard max $N_{\text{iter}}$ (for quick debugging) or when reached the converegnce/stopping criteria for LR (See section below).
 
 **Implementation notes**
 - Unlike ER/BR, do not shuffle the time dimension. Retrieve full trajectories of shocks $\varepsilon_{1:T}$ and initial states $(k_0, z_0)$.
@@ -518,7 +601,8 @@ $$ k''_{\ell} = \Gamma_{\text{policy}}(k', z'_{\ell}; \theta^-_{\text{policy}}) 
 - Update $\theta_{\text{policy}}$ using gradient descent to minimize $\mathcal{L}^{\text{ER}}$.
 - Polyak Averaging to update target policy: $\theta^-_{\text{policy}} \leftarrow \nu \theta^{-}_{\text{policy}} + (1-\nu) \theta_{\text{policy}}$.
 
-
+**Stopping** 
+- Repeat the loop above until hitting hard max $N_{\text{iter}}$ (for quick debugging) or when reached the converegnce/stopping criteria for ER (See section below).
 
 ## BR Method (Actor-Critic)
 Unlike LR and ER method, BR method requires two parameterized networks:
@@ -632,16 +716,71 @@ $$ \mathcal{L}^{\text{BR}}_{\text{actor}} = -\frac{1}{|\mathcal B|} \sum_{i \in 
 - Update $\theta_{\text{policy}}$ using gradient descent to minimize $\mathcal{L}^{\text{BR}}_{\text{actor}}$.
 - Update Target Policy: $\theta^-_{\text{policy}} \leftarrow \nu \theta^{-}_{\text{policy}} + (1-\nu) \theta_{\text{policy}}$.
 
-#### C. Stop training
-Terminate when the optimization stabilizes:
+**Stopping** 
+- Repeat the A-B loop above until hitting hard max $N_{\text{iter}}$ (for quick debugging) or when reached the converegnce/stopping criteria for BR (See section below).
 
-- **Bellman Residual Minimization**: The Critic loss is close to zero, indicating the Bellman equation holds: 
-$$ |\widehat{\mathcal{L}}^\text{BR}{\text{critic}}| < \epsilon_{\text{crit}} $$
+---
+## Convergence and Stopping Criteria
+The stopping logic is hierarchical. It first enforces a "Gatekeeper" (Annealing) to ensure the problem is economically valid (sharp boundaries) before checking statistical convergence on the **Validation Set** $\mathcal{D}_{val}$.
+- The validation set was generated along with the training set using deterministic RNG seeds
 
-- **Policy Convergence**: The Actor loss stops improving, indicating we cannot find a better policy to maximize the expected value (Bellman RHS): 
-$$|\Delta \widehat{\mathcal{L}}^\text{BR}{\text{actor}}| < \epsilon_{\text{act}}$$ 
+### Step A. Gatekeeper for Annealing Schedule Training
 
-Implementation Note: I use a patience counter to ensure these conditions hold for several consecutive epochs.
+Details of the annealing schedule is described in previous section. 
+
+- Inputs: $\tau_0$, $\tau_{\min}$ (e.g., $10^{-5}$), decay_rate, and stablization buffer (25%).
+- Calculate $N_{\text{decay}}$ steps required to reach $\tau_{\min}$
+- Calculate $N_{\text{stable}}$ (buffer steps at $\tau_{\min}$)
+- Output: $N_{\text{anneal}} = N_{\text{decay}} + N_{\text{stable}}$
+- Constraint: If current_step < $N_{\text{anneal}}$, ignore all early stopping triggers.
+
+### Step B. Method-Specific Stopping Rules (Post-Annealing) 
+
+These metrics are computed strictly on the Validation Set $\mathcal{D}_{val}$ to avoid overfitting. First, define a `patience_counter` as an integer variable that tracks the number of consecutive validation checks where the method-specific convergence criteria are satisfied.
+- Initialize `patience_counter=0`
+- Trigger: Only active when current step > `N_anneal`
+- Update `patience_counter += 1` if convergence criteria is `True`
+- Reset to 0 if convergence criteria is `False`
+- Stops when `patience_counter >= PATIENCE_LIMIT` (e.g., 5 consecutive checks)
+
+
+#### LR Method (Relative Improvement Plateau)
+- Goal: Minimize negative lifetime reward (unknown lower bound)
+- Metric: Moving Average of the LR on validation set ($\bar L^{LR}$)
+- Criteria: Stop if `patience_counter` is exhausted AND relative improvement is negligible: 
+$$ \frac{\bar L^{LR}(j) - \bar L^{LR}(j-s)}{|\bar L^{LR}(j-s)|} < \epsilon_{LR} $$
+where $s$ is a selected window for improvement evaluation (e.g., 100 steps).
+
+
+#### ER Method (Zero-Tolerance Plateau)
+- Goal: Solve for root where residual is zero.
+- Metric: ER loss (mean square error)
+$$
+L^{ER} < \epsilon_{ER} = 10^{-5}
+$$
+- Criteria: Stop if `patience_counter` is exhausted AND ER loss is less than tolerance $\epsilon_{ER}$ 
+- Note: use log-10 transformation to numericaly stability and easier visualization
+
+#### BR Method (Dual-Condition Convergence)
+- Goal: Equilibrium where Value function is accurate AND Policy is optimal.
+- Metric 1: Critic Loss (Bellman Residual MSE)
+- Metric 2: Actor Objective (Bellman RHS Value)
+- Criteria: Stop if `patience_counter` is exhausted AND both conditions are met:
+  - Critic Accuracy: Bellman Residual $< \epsilon_{crit}$
+  - Policy Stability: Actor Value relative improvement $< \epsilon_{act}$
+where relative improvement is computed similar to the LR approach
+
+### API Usage 
+For the APIs (e.g., `train_basic_lr`), the training loop is controlled by configurations `max_iter`, `early_stopping`. Example usages:
+- Debug/Demo: Set `early_stopping = False`. The loop runs exactly `max_iter` steps. Used to visualize annealing schedules, check gradient flow, and plot preliminary policy surfaces.
+- Full Mode: Set `early_stopping = True` and `max_iter = Large_Int` (safety ceiling). The loop terminates dynamically when the Validation Set metrics satisfy method-specific economic criteria.
+
+In practice, I use a "Callback" logic to handle the switch between Debug Mode (run until max_iter) and Full Mode (run until Convergence).
+
+Example callback hook:
+- If `step % eval_freq == 0` AND `config.early_stopping`:
+    - If `step < N_anneal`: Continue (ignore validation).
+    - Else: Compute loss and check if criteria is met.
 
 
 ---
@@ -919,7 +1058,7 @@ The multiplier $\lambda_j \to 0$ when the constraint is slack / satisfied, i.e. 
   - Update $\theta$: take one optimizer step to minimize $\mathcal{L}_j$ via backpropagation
   - Update $\lambda$ (no backprop): using the detached batch estimate $\mathcal{\bar L}_j^{\text{price}}$ and update 
   $$\lambda \leftarrow \max\!\left(0,\ \lambda+\eta_\lambda(\mathcal{\bar L}_{j}^{\text{price}}-\epsilon)\right)$$
-3.	Stop at $N_{\text{iter}}$ or early-stop when evaluation reward plateaus while $\bar{\mathcal L}^{\text{price}}$ stays below $\epsilon$; return the best feasible checkpoint
+3.	Stop at $N_{\text{iter}}$ (for quick debugging) or when reached the converegnce/stopping criteria for LR (See section below).
 
 ## ER Method
 

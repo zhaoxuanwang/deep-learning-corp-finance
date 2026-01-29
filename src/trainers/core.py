@@ -3,6 +3,10 @@ src/trainers/core.py
 
 Core training loop utility for all models.
 Replaces the monolithic ExperimentRunner.
+
+References:
+    report_brief.md lines 723-784: Convergence and Stopping Criteria
+    report_brief.md lines 773-784: API Usage
 """
 
 import time
@@ -10,27 +14,42 @@ import logging
 import inspect
 import numpy as np
 import tensorflow as tf
-from typing import Dict, Any, Iterator, Optional, Union
+from typing import Dict, Any, Iterator, Optional, Union, Callable
 
 from src.utils.annealing import AnnealingSchedule
 from src.trainers.config import OptimizationConfig, AnnealingConfig
+from src.trainers.stopping import ConvergenceChecker, create_convergence_checker
 
 logger = logging.getLogger(__name__)
+
 
 def execute_training_loop(
     trainer: Any,
     dataset: Iterator[Dict[str, tf.Tensor]],
     opt_config: OptimizationConfig,
     anneal_config: AnnealingConfig,
-    method_name: str = "unknown"
+    method_name: str = "unknown",
+    validation_data: Optional[Dict[str, tf.Tensor]] = None,
+    validation_fn: Optional[Callable] = None
 ) -> Dict[str, Any]:
     """
-    Execute the common training loop:
+    Execute the common training loop with optional early stopping.
+
+    Training modes (report_brief.md lines 773-777):
+    - Debug/Demo: early_stopping=None/disabled. Runs exactly n_iter steps.
+    - Full Mode: early_stopping=enabled. Terminates when validation metrics
+      satisfy method-specific convergence criteria.
+
+    Loop steps:
     1. Validate dataset format matches method requirements
-    2. Iterate for n_iter
-    3. Updates annealing schedule
-    4. Calls trainer.train_step()
-    5. Logs metrics
+    2. Create annealing schedule and convergence checker
+    3. For each iteration:
+       a. Update temperature
+       b. Get batch and run train_step()
+       c. Log metrics
+       d. If eval_freq: evaluate on validation set
+       e. Check convergence criteria (post-annealing gatekeeper)
+    4. Return history
 
     Args:
         trainer: Object with .train_step(**kwargs) method
@@ -38,14 +57,21 @@ def execute_training_loop(
         opt_config: Optimization configuration
         anneal_config: Annealing configuration
         method_name: Name of the method for logging
+        validation_data: Optional validation dataset for convergence checking
+        validation_fn: Optional function to compute validation metrics.
+                       Signature: validation_fn(trainer, batch, temperature) -> Dict[str, float]
 
     Returns:
-        History dictionary containing lists of metrics.
+        History dictionary containing lists of metrics, plus 'stopped_early' flag.
 
     Raises:
         ValueError: If dataset format doesn't match method requirements
     """
-    logger.info(f"Starting Training Loop: Method={method_name}, Iterations={opt_config.n_iter}")
+    early_stopping = opt_config.early_stopping
+    logger.info(
+        f"Starting Training Loop: Method={method_name}, Iterations={opt_config.n_iter}, "
+        f"EarlyStopping={'enabled' if early_stopping and early_stopping.enabled else 'disabled'}"
+    )
 
     # ===================================================================
     # Dataset Format Validation
@@ -102,13 +128,25 @@ def execute_training_loop(
     # Annealing Schedule
     anneal = AnnealingSchedule(
         init_temp=anneal_config.temperature_init,
-        min=anneal_config.temperature_min,
-        decay=anneal_config.decay,
-        schedule=anneal_config.schedule
+        min_temp=anneal_config.temperature_min,
+        decay_rate=anneal_config.decay,
+        # buffer defaults to 0.25, which is what we want
     )
-    
+
+    # Convergence Checker (early stopping)
+    # Reference: report_brief.md lines 727-735
+    convergence_checker = create_convergence_checker(
+        method_name=method_name,
+        n_anneal=anneal.n_anneal,
+        early_stopping_config=early_stopping
+    )
+
+    if convergence_checker:
+        logger.info(f"Convergence checker created. N_anneal={anneal.n_anneal}, Patience={early_stopping.patience}")
+
     history: Dict[str, list] = {}
-    
+    stopped_early = False
+
     for i in range(1, opt_config.n_iter + 1):
         # 1. Update Temperature
         current_temp = anneal.value
@@ -181,7 +219,34 @@ def execute_training_loop(
         # Update annealing state
         anneal.update()
 
+        # ===================================================================
+        # Convergence Checking (Early Stopping)
+        # Reference: report_brief.md lines 779-784
+        # ===================================================================
+        if convergence_checker is not None and early_stopping is not None:
+            # Only check at eval_freq intervals
+            if i % early_stopping.eval_freq == 0:
+                # Get validation metrics
+                if validation_data is not None and validation_fn is not None:
+                    # Evaluate on validation set
+                    val_metrics = validation_fn(trainer, validation_data, current_temp)
+                    validation_metrics = val_metrics
+                else:
+                    # Use training metrics as proxy (not ideal but functional)
+                    validation_metrics = metrics
+
+                # Check convergence
+                if convergence_checker.check(i, validation_metrics):
+                    stopped_early = True
+                    logger.info(f"Early stopping at iteration {i}")
+                    break
+
     elapsed = time.time() - start_time
-    logger.info(f"Training finished in {elapsed:.2f}s")
-    
+    logger.info(f"Training finished in {elapsed:.2f}s (stopped_early={stopped_early})")
+
+    # Add metadata to history
+    history['stopped_early'] = stopped_early
+    history['final_iteration'] = i
+    history['n_anneal'] = anneal.n_anneal
+
     return history
