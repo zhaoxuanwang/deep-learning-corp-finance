@@ -22,6 +22,31 @@ class NetworkConfig:
 
 
 @dataclass
+class EarlyStoppingConfig:
+    """
+    Configuration for early stopping / convergence criteria.
+
+    References:
+        report_brief.md lines 723-784: Convergence and Stopping Criteria
+    """
+    enabled: bool = False  # If False, run exactly n_iter steps (Debug mode)
+    patience: int = 5  # Consecutive validation checks before stopping
+    eval_freq: int = 100  # Evaluate validation metrics every N steps
+
+    # LR Method: Relative Improvement Plateau
+    lr_epsilon: float = 1e-4  # Relative improvement threshold
+    lr_window: int = 100  # Window size for improvement evaluation
+    ma_window: int = 20  # Moving average window size for smoothing
+
+    # ER Method: Zero-Tolerance Plateau
+    er_epsilon: float = 1e-5  # Absolute loss threshold
+
+    # BR Method: Dual-Condition Convergence
+    br_critic_epsilon: float = 1e-5  # Critic loss threshold
+    br_actor_epsilon: float = 1e-4  # Actor relative improvement threshold
+
+
+@dataclass
 class OptimizationConfig:
     """Configuration for training loop and optimizer."""
     learning_rate: float = 1e-3
@@ -29,6 +54,7 @@ class OptimizationConfig:
     batch_size: int = 128  # Trainer-controlled batch size
     n_iter: int = 1000
     log_every: int = 10
+    early_stopping: Optional[EarlyStoppingConfig] = None  # None = disabled
 
 
 @dataclass
@@ -44,9 +70,10 @@ class AnnealingConfig:
 @dataclass
 class RiskyDebtConfig:
     """Configuration specific to Risky Debt models."""
-    # BR method: price constraint weights
-    lambda_1: float = 1.0
-    lambda_2: float = 1.0
+    # BR method: Bellman residual weight (price weight is implicitly 1.0)
+    # L_critic = weight_br * L_BR + L_price
+    # Default 0.1 because BR loss is typically 100x larger than price loss
+    weight_br: float = 0.1
 
     # LR method: adaptive Lagrange multiplier parameters
     lambda_price_init: float = 1.0
@@ -56,19 +83,14 @@ class RiskyDebtConfig:
     n_value_update_freq: int = 1
     learning_rate_value: Optional[float] = None
 
-    # Default probability smoothing (shared by LR and BR)
-    epsilon_D_0: float = 0.1
-    epsilon_D_min: float = 1e-4
-    decay_d: float = 0.99
+    # NOTE: Default probability smoothing (epsilon_D) is now handled by AnnealingConfig
+    # Use AnnealingConfig in train_risky_br() for temperature annealing
 
 
 @dataclass
 class MethodConfig:
     """
     Configuration for the solution method (Algorithm).
-
-    References:
-        - report_brief.md lines 407-644: Algorithm specifications for LR, ER, BR
     """
     name: str  # e.g., "basic_lr", "basic_er", "risky_br", etc.
     n_critic: int = 5   # Critic updates per actor update (BR methods)

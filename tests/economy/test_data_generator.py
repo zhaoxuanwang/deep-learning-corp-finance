@@ -1074,8 +1074,8 @@ class TestFlattenedDataset:
 
         # They should NOT match (unless incredibly unlucky with random shuffle)
         # Check that at least some values are in different positions
-        matches = tf.reduce_sum(tf.cast(z_unshuffled == z_shuffled, tf.int32))
-        total = tf.size(z_unshuffled)
+        matches = int(tf.reduce_sum(tf.cast(z_unshuffled == z_shuffled, tf.int32)))
+        total = int(tf.size(z_unshuffled))
 
         # Expect most values to be in different positions after shuffle
         # (Some might match by chance, but not all)

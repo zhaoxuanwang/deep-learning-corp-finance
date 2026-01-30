@@ -21,33 +21,43 @@ from typing import Dict, Tuple
 
 def compute_lr_loss(
     rewards: tf.Tensor,
-    beta: float
+    beta: float,
+    terminal_value: tf.Tensor = None
 ) -> tf.Tensor:
     """
-    Compute Lifetime Reward loss.
-    
-    L_LR = -mean(sum_t beta^t * e_t)
-    
+    Compute Lifetime Reward loss with optional terminal value correction.
+
+    L_LR = -mean(sum_t beta^t * e_t + beta^T * V^term)
+
     We MINIMIZE this, so we take the negative of the total discounted reward.
-    
+
+    Reference:
+        report_brief.md lines 499-514: LR loss with terminal value
+
     Args:
         rewards: Tensor of shape (batch, T) with per-period rewards
         beta: Discount factor
-    
+        terminal_value: Optional terminal value V^term(k_T, z_T) of shape (batch, 1)
+
     Returns:
         Scalar loss
-    
-    Reference: outline_v2.md lines 189-194
     """
     T = tf.shape(rewards)[1]
     # Discount factors: [1, beta, beta^2, ..., beta^(T-1)]
     t_indices = tf.cast(tf.range(T), tf.float32)
     discount_factors = tf.pow(beta, t_indices)
-    
+
     # Discounted sum per trajectory
     discounted_rewards = rewards * discount_factors[None, :]
-    total_rewards = tf.reduce_sum(discounted_rewards, axis=1)
-    
+    total_rewards = tf.reduce_sum(discounted_rewards, axis=1, keepdims=True)
+
+    # Add terminal value if provided (report lines 503-514)
+    if terminal_value is not None:
+        # V^term is discounted by beta^T
+        T_float = tf.cast(T, tf.float32)
+        terminal_discount = tf.pow(beta, T_float)
+        total_rewards = total_rewards + terminal_discount * terminal_value
+
     # Loss = -mean(J)
     return -tf.reduce_mean(total_rewards)
 
@@ -263,10 +273,8 @@ def compute_br_actor_loss_risky(
     
     Returns:
         Scalar loss
-    
-    Reference: outline_v2.md lines 373-374
     """
-    V_next_avg = 0.5 * (V_next_1 + V_next_2)
+    V_next_avg = V_next_1
     payout = e - eta
     rhs = payout + beta * V_next_avg
     return -tf.reduce_mean(rhs)
@@ -339,44 +347,25 @@ def compute_price_residual(
 def compute_critic_objective(
     br_critic_loss: tf.Tensor,
     price_loss: tf.Tensor,
-    lambda_1: float
+    weight_br: float = 0.1
 ) -> tf.Tensor:
     """
     Combined critic objective for Risky Debt BR training.
-    
-    L_critic = L_BR_critic + lambda_1 * L_price
-    
+
+    L_critic = weight_br * L_BR + L_price
+
+    The price weight is implicitly 1.0 for better numerical stability.
+    BR loss is typically 100x larger than price loss (sums lifetime rewards),
+    so we normalize to price and weight down BR instead.
+
     Args:
         br_critic_loss: Bellman residual critic loss
         price_loss: Price loss
-        lambda_1: Weight on price loss for critic
-    
+        weight_br: Weight on BR loss for critic (default 0.1)
+
     Returns:
         Combined loss
-    
-    Reference: outline_v2.md line 381
-    """
-    return br_critic_loss + lambda_1 * price_loss
 
-
-def compute_actor_objective(
-    br_actor_loss: tf.Tensor,
-    price_loss: tf.Tensor,
-    lambda_2: float
-) -> tf.Tensor:
+    Reference: report_brief.md lines 1062-1063
     """
-    Combined actor objective for Risky Debt BR training.
-    
-    L_actor = L_BR_actor + lambda_2 * L_price
-    
-    Args:
-        br_actor_loss: Bellman residual actor loss
-        price_loss: Price loss
-        lambda_2: Weight on price loss for actor
-    
-    Returns:
-        Combined loss
-    
-    Reference: outline_v2.md line 382
-    """
-    return br_actor_loss + lambda_2 * price_loss
+    return weight_br * br_critic_loss + price_loss

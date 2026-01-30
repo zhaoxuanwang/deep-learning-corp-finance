@@ -5,15 +5,11 @@ Handles the exogenous stochastic processes for the model.
 Focuses on continuous sampling for Deep Learning (Direct Optimization).
 """
 
+import numpy as np
 import tensorflow as tf
-import numpy as np
-import numpy as np
-from typing import Optional, Tuple
-from src.economy.parameters import EconomicParams
-from typing import Union
+from typing import Optional, Tuple, Union
 
 from src.economy.parameters import EconomicParams, ShockParams
-from typing import Union
 
 
 def step_ar1_tf(

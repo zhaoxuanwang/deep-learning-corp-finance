@@ -16,6 +16,11 @@ from src.economy import logic
 
 # --- Fixtures ---
 
+# Default temperature and logit_clip for soft gates
+DEFAULT_TEMPERATURE = 0.01  # Small value for near-hard gates
+DEFAULT_LOGIT_CLIP = 20.0
+
+
 @pytest.fixture
 def params():
     """Default test parameters."""
@@ -37,61 +42,77 @@ def params_with_injection_costs():
 
 class TestExternalFinancingCost:
     """Tests for external_financing_cost (η) per outline_v2.md."""
-    
+
     def test_zero_for_positive_cashflow(self, params):
         """η(e) = 0 when e >= 0."""
         e = tf.constant([0.0, 1.0, 10.0, 100.0])
-        eta = logic.external_financing_cost(e, params)
-        
-        assert np.allclose(eta.numpy(), 0.0), \
+        eta = logic.external_financing_cost(
+            e, params,
+            temperature=DEFAULT_TEMPERATURE,
+            logit_clip=DEFAULT_LOGIT_CLIP
+        )
+
+        assert np.allclose(eta.numpy(), 0.0, atol=1e-3), \
             "External financing cost should be zero for non-negative cash flow"
-    
+
     def test_formula_for_negative_cashflow(self, params_with_injection_costs):
         """η(e) = η₀ + η₁|e| when e < 0."""
         e = tf.constant([-5.0])
-        eta = logic.external_financing_cost(e, params_with_injection_costs)
-        
+        eta = logic.external_financing_cost(
+            e, params_with_injection_costs,
+            temperature=DEFAULT_TEMPERATURE,
+            logit_clip=DEFAULT_LOGIT_CLIP
+        )
+
         # Expected: η₀ + η₁ * 5.0
         expected = params_with_injection_costs.cost_inject_fixed + params_with_injection_costs.cost_inject_linear * 5.0
-        
-        assert np.isclose(eta.numpy(), expected), \
+
+        assert np.isclose(eta.numpy(), expected, rtol=0.01), \
             f"Expected η = {expected}, got {eta.numpy()}"
-    
+
     def test_no_k_dependence(self, params):
         """η(e) does NOT depend on k — function signature doesn't include k."""
         import inspect
         sig = inspect.signature(logic.external_financing_cost)
         param_names = list(sig.parameters.keys())
-        
+
         assert 'k' not in param_names, \
             "external_financing_cost should not take 'k' as parameter"
         assert 'e' in param_names and 'params' in param_names, \
             f"Expected e and params in signature, got {param_names}"
-    
+
     def test_vectorized(self, params_with_injection_costs):
         """Works on batched inputs."""
         e = tf.constant([-1.0, 5.0, 1.0, -10.0])
-        eta = logic.external_financing_cost(e, params_with_injection_costs)
-        
+        eta = logic.external_financing_cost(
+            e, params_with_injection_costs,
+            temperature=DEFAULT_TEMPERATURE,
+            logit_clip=DEFAULT_LOGIT_CLIP
+        )
+
         assert eta.shape == (4,)
         assert eta.numpy()[0] > 0  # negative e
-        assert eta.numpy()[1] < 1e-5  # positive e (5.0), cost should be ~0
-        assert eta.numpy()[2] < 1e-5  # positive e
+        assert eta.numpy()[1] < 1e-3  # positive e (5.0), cost should be ~0
+        assert eta.numpy()[2] < 1e-3  # positive e
         assert eta.numpy()[3] > 0  # negative e
-    
+
     def test_ste_gradient_nonzero_for_negative_e(self, params_with_injection_costs):
-        """STE should provide non-zero gradient when e < 0."""
+        """Soft gate should provide non-zero gradient when e < 0."""
         e = tf.Variable([-0.5], dtype=tf.float32)  # Negative
-        
+
         with tf.GradientTape() as tape:
-            eta = logic.external_financing_cost(e, params_with_injection_costs)
+            eta = logic.external_financing_cost(
+                e, params_with_injection_costs,
+                temperature=DEFAULT_TEMPERATURE,
+                logit_clip=DEFAULT_LOGIT_CLIP
+            )
             loss = tf.reduce_sum(eta)
-        
+
         grad = tape.gradient(loss, e)
-        
-        assert grad is not None, "STE should provide gradient"
+
+        assert grad is not None, "Soft gate should provide gradient"
         # Gradient should be non-zero for negative e (derivative of |e| * const)
-        assert grad.numpy()[0] != 0, "STE gradient should be non-zero for e < 0"
+        assert grad.numpy()[0] != 0, "Gradient should be non-zero for e < 0"
 
 
 # === SECTION 2: Primitives Tests ===
@@ -123,12 +144,16 @@ class TestPrimitives:
         """ψ = (φ₀/2) · I²/k when φ₁ = 0."""
         k = tf.constant([4.0])
         k_next = tf.constant([5.0])  # I = 5 - (1-δ)*4
-        
-        psi = logic.adjustment_costs(k, k_next, params_no_fixed_cost)
-        
+
+        psi = logic.adjustment_costs(
+            k, k_next, params_no_fixed_cost,
+            temperature=DEFAULT_TEMPERATURE,
+            logit_clip=DEFAULT_LOGIT_CLIP
+        )
+
         I = 5.0 - (1 - params_no_fixed_cost.delta) * 4.0
         expected = (params_no_fixed_cost.cost_convex / 2.0) * (I ** 2) / 4.0
-        
+
         assert np.isclose(psi.numpy(), expected, rtol=1e-5)
 
 
@@ -136,19 +161,23 @@ class TestPrimitives:
 
 class TestCashFlow:
     """Tests for cash flow functions."""
-    
+
     def test_basic_cash_flow_components(self, params):
         """e = π - I - ψ"""
         k = tf.constant([2.0])
         k_next = tf.constant([2.2])
         z = tf.constant([1.0])
-        
-        e = logic.compute_cash_flow_basic(k, k_next, z, params)
-        
+
+        e = logic.compute_cash_flow_basic(
+            k, k_next, z, params,
+            temperature=DEFAULT_TEMPERATURE,
+            logit_clip=DEFAULT_LOGIT_CLIP
+        )
+
         # Verify it's finite and has right shape
         assert np.isfinite(e.numpy())
         assert e.shape == (1,) or e.shape == ()
-    
+
     def test_risky_debt_cash_flow_shape(self, params):
         """Output shape matches input for risky debt cash flow."""
         k = tf.constant([1.0, 2.0])
@@ -157,26 +186,35 @@ class TestCashFlow:
         b_next = tf.constant([0.6, 0.6])
         z = tf.constant([1.0, 1.0])
         r_tilde = tf.constant([0.05, 0.06])
-        
-        e = logic.cash_flow_risky_debt(k, k_next, b, b_next, z, r_tilde, params)
-        
+        q = 1.0 / (1.0 + r_tilde)  # Convert interest rate to bond price
+
+        e = logic.cash_flow_risky_debt_q(
+            k, k_next, b, b_next, z, q, params,
+            temperature=DEFAULT_TEMPERATURE,
+            logit_clip=DEFAULT_LOGIT_CLIP
+        )
+
         assert e.shape == (2,)
         assert np.all(np.isfinite(e.numpy()))
-    
+
     def test_risky_debt_differentiable_wrt_actions(self, params):
-        """Gradients exist w.r.t. k_next, b_next, r_tilde."""
+        """Gradients exist w.r.t. k_next, b_next, q."""
         k = tf.constant([1.0])
         k_next = tf.Variable([1.1])
         b = tf.constant([0.5])
         b_next = tf.Variable([0.6])
         z = tf.constant([1.0])
-        r_tilde = tf.Variable([0.05])
-        
+        q = tf.Variable([0.95])  # Bond price instead of interest rate
+
         with tf.GradientTape() as tape:
-            e = logic.cash_flow_risky_debt(k, k_next, b, b_next, z, r_tilde, params)
-        
-        grads = tape.gradient(e, [k_next, b_next, r_tilde])
-        
+            e = logic.cash_flow_risky_debt_q(
+                k, k_next, b, b_next, z, q, params,
+                temperature=DEFAULT_TEMPERATURE,
+                logit_clip=DEFAULT_LOGIT_CLIP
+            )
+
+        grads = tape.gradient(e, [k_next, b_next, q])
+
         assert all(g is not None for g in grads), \
             "Gradients should exist for all action variables"
 
@@ -302,131 +340,66 @@ class TestRecoveryAndPricing:
 
 class TestDifferentiability:
     """Tests that key functions are differentiable for gradient-based training."""
-    
+
     def test_basic_cash_flow_grad_exists(self, params):
         """Gradient of cash flow w.r.t. k_next exists."""
         k = tf.constant([2.0])
         k_next = tf.Variable([2.2])
         z = tf.constant([1.0])
-        
+
         with tf.GradientTape() as tape:
-            e = logic.compute_cash_flow_basic(k, k_next, z, params)
-        
+            e = logic.compute_cash_flow_basic(
+                k, k_next, z, params,
+                temperature=DEFAULT_TEMPERATURE,
+                logit_clip=DEFAULT_LOGIT_CLIP
+            )
+
         grad = tape.gradient(e, k_next)
-        
+
         assert grad is not None
         assert np.isfinite(grad.numpy())
-    
+
     def test_adjustment_costs_grad_convex(self, params_no_fixed_cost):
         """Gradient of ψ w.r.t. k_next exists (convex part only)."""
         k = tf.constant([2.0])
         k_next = tf.Variable([2.5])
-        
+
         with tf.GradientTape() as tape:
-            psi = logic.adjustment_costs(k, k_next, params_no_fixed_cost)
-        
+            psi = logic.adjustment_costs(
+                k, k_next, params_no_fixed_cost,
+                temperature=DEFAULT_TEMPERATURE,
+                logit_clip=DEFAULT_LOGIT_CLIP
+            )
+
         grad = tape.gradient(psi, k_next)
-        
+
         assert grad is not None
         assert np.isfinite(grad.numpy())
 
-
-# === SECTION 7: Investment Gate STE Tests ===
-
-class TestInvestmentGateSTE:
-    """Tests for investment_gate_ste function (Straight-Through Estimator)."""
-    
-    def test_forward_hard_gate_above_threshold(self):
-        """Gate = 1 when |I| > eps."""
-        I = tf.constant([1.0, -1.0, 0.1, -0.1])
-        
-        gate_hard = logic.investment_gate_ste(I, eps=1e-6, mode="hard")
-        gate_ste = logic.investment_gate_ste(I, eps=1e-6, mode="ste")
-        
-        # Both should return 1 for all (|I| > eps)
-        assert np.allclose(gate_hard.numpy(), 1.0)
-        assert np.allclose(gate_ste.numpy(), 1.0)
-    
-    def test_forward_hard_gate_at_threshold(self):
-        """Gate = 0 when |I| <= eps."""
-        eps = 1e-6
-        I = tf.constant([0.0, 1e-7, -1e-7, eps * 0.5])
-        
-        gate_hard = logic.investment_gate_ste(I, eps=eps, mode="hard")
-        gate_ste = logic.investment_gate_ste(I, eps=eps, mode="ste")
-        
-        # Both should return 0 for all (|I| <= eps)
-        assert np.allclose(gate_hard.numpy(), 0.0)
-        assert np.allclose(gate_ste.numpy(), 0.0)
-    
-    def test_ste_forward_matches_hard(self):
-        """STE forward pass matches hard gate exactly."""
-        I = tf.constant([0.0, 1e-7, 1e-5, 0.01, 1.0, -0.5])
-        eps = 1e-6
-        
-        gate_hard = logic.investment_gate_ste(I, eps=eps, mode="hard")
-        gate_ste = logic.investment_gate_ste(I, eps=eps, mode="ste")
-        
-        np.testing.assert_allclose(gate_ste.numpy(), gate_hard.numpy())
-    
-    def test_ste_gradient_nonzero_near_threshold(self):
-        """STE gradient is non-zero near |I| ≈ eps."""
-        eps = 1e-6
-        temp = 0.1  # Default value
-        
-        # Investment near threshold: use Variable to track gradients
-        I = tf.Variable([eps * 0.5, eps, eps * 2, eps * 10])
-        
-        with tf.GradientTape() as tape:
-            gate = logic.investment_gate_ste(I, eps=eps, temperature=temp, mode="ste")
-            loss = tf.reduce_sum(gate)
-        
-        grad = tape.gradient(loss, I)
-        
-        assert grad is not None, "Gradient should exist for STE mode"
-        assert np.all(np.isfinite(grad.numpy())), "Gradients should be finite"
-        # At least some gradients should be non-zero
-        assert np.any(grad.numpy() > 0), "Some gradients should be positive"
-    
-    def test_hard_gradient_is_zero(self):
-        """Hard gate has zero gradient."""
-        eps = 1e-6
-        I = tf.Variable([eps * 0.5, eps, eps * 2, eps * 10])
-        
-        with tf.GradientTape() as tape:
-            gate = logic.investment_gate_ste(I, eps=eps, mode="hard")
-            loss = tf.reduce_sum(gate)
-        
-        grad = tape.gradient(loss, I)
-        
-        # Hard gate: gradient is None or zero
-        assert grad is None or np.allclose(grad.numpy(), 0.0)
-    
-    def test_symmetry_positive_and_negative_investment(self):
-        """Gate responds identically for I > 0 and I < 0."""
-        I_pos = tf.constant([0.01, 0.1, 1.0])
-        I_neg = tf.constant([-0.01, -0.1, -1.0])
-        
-        gate_pos = logic.investment_gate_ste(I_pos, mode="ste")
-        gate_neg = logic.investment_gate_ste(I_neg, mode="ste")
-        
-        np.testing.assert_allclose(gate_pos.numpy(), gate_neg.numpy())
-    
-    def test_adjustment_costs_with_ste_has_gradient(self, params):
-        """adjustment_costs with STE mode has gradient through fixed cost."""
+    def test_adjustment_costs_grad_fixed_cost(self, params):
+        """adjustment_costs should have gradient through fixed cost (via smooth gate)."""
         # Use params with non-zero fixed cost
         params_fixed = replace(params, cost_fixed=0.5, cost_convex=0.01)
-        
+
         k = tf.constant([2.0])
-        k_next = tf.Variable([2.5])  # I = 2.5 - (1-δ)*2 > 0
-        
+        # I = 2.5 - (1-0.15)*2 = 2.5 - 1.7 = 0.8 > 0 (investing)
+        k_next = tf.Variable([2.5])
+
         with tf.GradientTape() as tape:
-            # Note: adjustment_costs no longer accepts mode, uses internal or STE
-            psi = logic.adjustment_costs(k, k_next, params_fixed)
-        
+            psi = logic.adjustment_costs(
+                k, k_next, params_fixed,
+                temperature=DEFAULT_TEMPERATURE,
+                logit_clip=DEFAULT_LOGIT_CLIP
+            )
+
         grad = tape.gradient(psi, k_next)
-        
-        assert grad is not None, "Gradient should exist with STE mode"
+
+        assert grad is not None, "Gradient should exist with smooth gate"
         assert np.isfinite(grad.numpy()), "Gradient should be finite"
         # Gradient should be non-zero (from both convex and fixed cost)
-        assert grad.numpy() != 0, "Gradient should be non-zero with fixed cost"
+        assert grad.numpy() != 0, "Gradient should be non-zero"
+
+
+
+
+

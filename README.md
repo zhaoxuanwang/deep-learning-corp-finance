@@ -34,15 +34,16 @@ This repository develops a Python and Tensorflow codebase for solving and estima
 ## Repository structure
 
 ```
-├── experiments/                 # runnable experiments
-├── paper/                       # reports and references
-├── src/                         # core library code
-│   ├── dnn/                     # deep neural network solvers
-│   ├── ddp/                     # discrete dynamic programming solvers
-│   └── economy/                 # economic model logic
-├── tests/                       # unit and integration tests
-├── requirements.txt             # dependencies
-└── pytest.ini                   # pytest configuration
+├── report/                      # Technical documentation and methodology
+├── src/                         # Core library code
+│   ├── economy/                 # Economic model primitives & data generation
+│   ├── networks/                # Neural network architectures
+│   ├── trainers/                # Training algorithms (LR, ER, BR methods)
+│   ├── utils/                   # Utilities (annealing, plotting, analysis)
+│   └── ddp/                     # Discrete DP reference solvers
+├── tests/                       # Comprehensive test suite (290 tests)
+├── requirements.txt             # Python dependencies
+└── pytest.ini                   # Pytest configuration
 ```
 
 ## References

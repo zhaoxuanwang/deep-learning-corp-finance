@@ -194,6 +194,10 @@ class DataGenerator:
         self._test_dataset: Optional[Dict[str, tf.Tensor]] = None
         self._training_dataset: Optional[Dict[str, tf.Tensor]] = None
         self._flattened_training_dataset: Optional[Dict[str, tf.Tensor]] = None
+        self._flattened_validation_dataset: Optional[Dict[str, tf.Tensor]] = None
+        # Separate caches for debt variants (include_debt=True)
+        self._flattened_training_dataset_debt: Optional[Dict[str, tf.Tensor]] = None
+        self._flattened_validation_dataset_debt: Optional[Dict[str, tf.Tensor]] = None
 
     def _get_config_hash(self) -> str:
         """
@@ -692,7 +696,7 @@ class DataGenerator:
 
         return self._test_dataset
 
-    def get_flattened_training_dataset(self) -> Dict[str, tf.Tensor]:
+    def get_flattened_training_dataset(self, include_debt: bool = False) -> Dict[str, tf.Tensor]:
         """
         Get flattened training dataset for ER/BR methods (N*T i.i.d. transitions).
 
@@ -702,18 +706,23 @@ class DataGenerator:
         Transformation Process:
         1. Load full training dataset with trajectories (N firms, T timesteps)
         2. Flatten from (N, T) to (N*T,) individual state transitions
-        3. For each transition: sample k independently from ergodic distribution
+        3. For each transition: sample k (and optionally b) independently
         4. Shuffle all observations to ensure i.i.d. property for SGD
 
-        Why Independent k Sampling:
+        Why Independent k/b Sampling:
         - At data generation time, we don't have a policy to generate k_1, k_2, ..., k_T
         - We only have initial k_0 for each trajectory
         - To create N*T i.i.d. samples, we sample k ~ Uniform(k_min, k_max) for each transition
         - This treats each (k, z) pair as an independent draw from the ergodic state distribution
+        - Same logic applies to b when include_debt=True
 
         Data Format Difference:
         - LR method: Uses trajectory data with shape (N, T+1) to compute lifetime rewards
         - ER/BR methods: Use flattened data with shape (N*T,) for one-step transitions
+
+        Args:
+            include_debt: If True, also sample b independently from b_bounds.
+                          Use for risky debt models. Default False for backward compatibility.
 
         Returns:
             Dictionary with flattened training data:
@@ -721,31 +730,41 @@ class DataGenerator:
                 - 'z': Current productivity (N*T,) - from z_path[:, t]
                 - 'z_next_main': Next productivity, main path (N*T,) - from z_path[:, t+1]
                 - 'z_next_fork': Next productivity, fork path (N*T,) - from z_fork[:, t, 0]
+                - 'b': Current debt (N*T,) - sampled independently (only if include_debt=True)
 
         Reference:
             report_brief.md lines 157-167: "Flatten Data for ER and BR"
             Each observation represents a single transition (k, z) -> (k', z')
 
         Example:
-            >>> # For ER/BR training
+            >>> # For basic ER/BR training (no debt)
             >>> flat_data = gen.get_flattened_training_dataset()
             >>> k = flat_data['k']  # (N*T,) independent capital samples
-            >>> z = flat_data['z']  # (N*T,) productivity states
             >>>
-            >>> # Create TF dataset for batching
-            >>> tf_dataset = tf.data.Dataset.from_tensor_slices(flat_data)
-            >>> tf_dataset = tf_dataset.shuffle(10000).batch(256).repeat()
+            >>> # For risky debt BR training (with debt)
+            >>> flat_data = gen.get_flattened_training_dataset(include_debt=True)
+            >>> k, b = flat_data['k'], flat_data['b']  # Both sampled i.i.d.
         """
+        # Select appropriate cache based on include_debt flag
+        if include_debt:
+            cache_attr = '_flattened_training_dataset_debt'
+            cache_name = "training_flattened_debt"
+        else:
+            cache_attr = '_flattened_training_dataset'
+            cache_name = "training_flattened"
+
         # Check memory cache first
-        if self._flattened_training_dataset is not None:
-            return self._flattened_training_dataset
+        cached = getattr(self, cache_attr)
+        if cached is not None:
+            return cached
 
         # Try loading from disk cache if enabled
         if self.cache_dir is not None:
-            cache_path = self._get_cache_path("training_flattened")
+            cache_path = self._get_cache_path(cache_name)
             if os.path.exists(cache_path):
-                self._flattened_training_dataset = self._load_from_disk(cache_path)
-                return self._flattened_training_dataset
+                dataset = self._load_from_disk(cache_path)
+                setattr(self, cache_attr, dataset)
+                return dataset
 
         # Generate flattened dataset
         # Get full trajectory dataset
@@ -797,6 +816,23 @@ class DataGenerator:
             dtype=tf.float32
         )
 
+        # === INDEPENDENT B SAMPLING (if include_debt) ===
+        b_flat = None
+        if include_debt:
+            b_seed = tf.constant([
+                self.master_seed[0] + 450,  # Different offset from k
+                self.master_seed[1] + 0
+            ], dtype=tf.int32)
+
+            b_min, b_max = self.b_bounds
+            b_flat = tf.random.stateless_uniform(
+                shape=[N_total],
+                seed=b_seed,
+                minval=b_min,
+                maxval=b_max,
+                dtype=tf.float32
+            )
+
         # === SHUFFLING ===
         # Shuffle all arrays together using the same permutation
         # This ensures i.i.d. property for SGD
@@ -815,24 +851,172 @@ class DataGenerator:
         z_next_main_shuffled = tf.gather(z_next_main_flat, shuffled_indices)
         z_next_fork_shuffled = tf.gather(z_next_fork_flat, shuffled_indices)
 
-        # Store in memory cache
-        self._flattened_training_dataset = {
+        # Build result dictionary
+        result = {
             'k': k_shuffled,
             'z': z_shuffled,
             'z_next_main': z_next_main_shuffled,
             'z_next_fork': z_next_fork_shuffled
         }
 
+        if include_debt:
+            b_shuffled = tf.gather(b_flat, shuffled_indices)
+            result['b'] = b_shuffled
+
+        # Store in memory cache
+        setattr(self, cache_attr, result)
+
         # Save to disk cache if enabled
         if self.cache_dir is not None:
-            cache_path = self._get_cache_path("training_flattened")
+            cache_path = self._get_cache_path(cache_name)
             self._save_to_disk(
-                self._flattened_training_dataset,
+                result,
                 cache_path,
                 metadata=self._get_metadata()
             )
 
-        return self._flattened_training_dataset
+        return result
+
+    def get_flattened_validation_dataset(self, include_debt: bool = False) -> Dict[str, tf.Tensor]:
+        """
+        Get flattened validation dataset for ER/BR methods (N_val*T i.i.d. transitions).
+
+        This method transforms trajectory-based validation data into individual i.i.d.
+        transitions suitable for Euler Residual (ER) and Bellman Residual (BR) methods.
+
+        The transformation follows the same logic as get_flattened_training_dataset():
+        1. Load validation dataset with trajectories (N_val firms, T timesteps)
+        2. Flatten from (N_val, T) to (N_val*T,) individual state transitions
+        3. For each transition: sample k (and optionally b) independently
+        4. NO shuffling for validation (deterministic evaluation)
+
+        Args:
+            include_debt: If True, also sample b independently from b_bounds.
+                          Use for risky debt models. Default False for backward compatibility.
+
+        Returns:
+            Dictionary with flattened validation data:
+                - 'k': Current capital (N_val*T,) - sampled independently
+                - 'z': Current productivity (N_val*T,) - from z_path[:, t]
+                - 'z_next_main': Next productivity, main path (N_val*T,) - from z_path[:, t+1]
+                - 'z_next_fork': Next productivity, fork path (N_val*T,) - from z_fork[:, t, 0]
+                - 'b': Current debt (N_val*T,) - sampled independently (only if include_debt=True)
+
+        Example:
+            >>> # For ER/BR validation
+            >>> flat_val = gen.get_flattened_validation_dataset()
+            >>> k = flat_val['k']  # (N_val*T,)
+            >>>
+            >>> # For risky debt validation
+            >>> flat_val = gen.get_flattened_validation_dataset(include_debt=True)
+            >>> k, b = flat_val['k'], flat_val['b']
+        """
+        # Select appropriate cache based on include_debt flag
+        if include_debt:
+            cache_attr = '_flattened_validation_dataset_debt'
+            cache_name = "validation_flattened_debt"
+        else:
+            cache_attr = '_flattened_validation_dataset'
+            cache_name = "validation_flattened"
+
+        # Check memory cache first
+        cached = getattr(self, cache_attr)
+        if cached is not None:
+            return cached
+
+        # Try loading from disk cache if enabled
+        if self.cache_dir is not None:
+            cache_path = self._get_cache_path(cache_name)
+            if os.path.exists(cache_path):
+                dataset = self._load_from_disk(cache_path)
+                setattr(self, cache_attr, dataset)
+                return dataset
+
+        # Generate flattened dataset from trajectory validation data
+        traj_data = self.get_validation_dataset()
+
+        # Extract relevant arrays
+        z_path = traj_data['z_path']  # (N_val, T+1)
+        z_fork = traj_data['z_fork']  # (N_val, T, 1)
+
+        # Get dimensions
+        N = tf.shape(z_path)[0]  # Number of validation trajectories
+        T = tf.shape(z_path)[1] - 1  # Horizon (z_path is T+1)
+        N_total = N * T  # Total flattened samples
+
+        # === FLATTENING ===
+        # Extract z (current): take z_path[:, 0:T]
+        z_curr = z_path[:, :-1]  # (N, T)
+
+        # Extract z_next_main: take z_path[:, 1:T+1]
+        z_next_main = z_path[:, 1:]  # (N, T)
+
+        # Extract z_next_fork: z_fork is already (N, T, 1), squeeze last dim
+        z_next_fork = tf.squeeze(z_fork, axis=-1)  # (N, T)
+
+        # Flatten from (N, T) to (N*T,)
+        z_flat = tf.reshape(z_curr, [-1])  # (N*T,)
+        z_next_main_flat = tf.reshape(z_next_main, [-1])  # (N*T,)
+        z_next_fork_flat = tf.reshape(z_next_fork, [-1])  # (N*T,)
+
+        # === INDEPENDENT K SAMPLING ===
+        # Sample k independently for validation (different seed offset from training)
+        k_seed = tf.constant([
+            self.master_seed[0] + 600,  # Offset for validation flattened k sampling
+            self.master_seed[1] + 0
+        ], dtype=tf.int32)
+
+        k_min, k_max = self.k_bounds
+        k_flat = tf.random.stateless_uniform(
+            shape=[N_total],
+            seed=k_seed,
+            minval=k_min,
+            maxval=k_max,
+            dtype=tf.float32
+        )
+
+        # === INDEPENDENT B SAMPLING (if include_debt) ===
+        b_flat = None
+        if include_debt:
+            b_seed = tf.constant([
+                self.master_seed[0] + 650,  # Different offset from k and training b
+                self.master_seed[1] + 0
+            ], dtype=tf.int32)
+
+            b_min, b_max = self.b_bounds
+            b_flat = tf.random.stateless_uniform(
+                shape=[N_total],
+                seed=b_seed,
+                minval=b_min,
+                maxval=b_max,
+                dtype=tf.float32
+            )
+
+        # NOTE: No shuffling for validation - we want deterministic evaluation
+        # Build result dictionary
+        result = {
+            'k': k_flat,
+            'z': z_flat,
+            'z_next_main': z_next_main_flat,
+            'z_next_fork': z_next_fork_flat
+        }
+
+        if include_debt:
+            result['b'] = b_flat
+
+        # Store in memory cache
+        setattr(self, cache_attr, result)
+
+        # Save to disk cache if enabled
+        if self.cache_dir is not None:
+            cache_path = self._get_cache_path(cache_name)
+            self._save_to_disk(
+                result,
+                cache_path,
+                metadata=self._get_metadata()
+            )
+
+        return result
 
 
 # =============================================================================

@@ -19,7 +19,6 @@ from src.trainers.losses import (
     compute_br_actor_loss_risky,
     compute_price_loss_aio,
     compute_critic_objective,
-    compute_actor_objective
 )
 from src.economy.logic import (
     euler_chi,
@@ -192,26 +191,25 @@ class TestPriceLoss:
 # =============================================================================
 
 class TestCombinedObjectives:
-    """Tests for combined critic and actor objectives."""
-    
+    """Tests for combined critic objective."""
+
     def test_critic_objective(self):
-        """L_critic = L_BR + lambda1 * L_price."""
-        br_loss = tf.constant(1.0)
+        """L_critic = weight_br * L_BR + L_price."""
+        br_loss = tf.constant(100.0)  # BR loss is typically much larger
         price_loss = tf.constant(2.0)
-        lambda1 = 0.5
-        
-        total = compute_critic_objective(br_loss, price_loss, lambda1)
-        
-        expected = 1.0 + 0.5 * 2.0
+        weight_br = 0.5
+
+        total = compute_critic_objective(br_loss, price_loss, weight_br)
+
+        expected = 0.5 * 100.0 + 2.0  # = 52.0
         assert np.isclose(total.numpy(), expected)
-    
-    def test_actor_objective(self):
-        """L_actor = L_BR_actor + lambda2 * L_price."""
-        br_loss = tf.constant(-1.0)  # Actor loss is negative
+
+    def test_critic_objective_default_weight(self):
+        """L_critic with default weight_br=0.1."""
+        br_loss = tf.constant(100.0)
         price_loss = tf.constant(2.0)
-        lambda2 = 0.1
-        
-        total = compute_actor_objective(br_loss, price_loss, lambda2)
-        
-        expected = -1.0 + 0.1 * 2.0
+
+        total = compute_critic_objective(br_loss, price_loss)
+
+        expected = 0.1 * 100.0 + 2.0  # = 12.0
         assert np.isclose(total.numpy(), expected)
