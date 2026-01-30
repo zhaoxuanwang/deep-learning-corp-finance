@@ -1,4 +1,4 @@
-# Common Definitions
+# Summary of Notation
 
 **Trainable Parameters**
 - Policy net params: $\theta_{\text{policy}}$
@@ -42,8 +42,6 @@ For the reminder of the report, abbreviations of the three main methods are comm
 	- BR-Critic Loss: $\widehat{\mathcal{L}}^{\text{BR}}_{\text{critic}}(\theta_{\text{value}})$
 	- BR-Actor Loss: $\widehat{\mathcal{L}}^{\text{BR}}_{\text{actor}}(\theta_{\text{policy}})$
 
----
-
 # Data Generation
 
 ## State Space
@@ -76,14 +74,17 @@ $$
 which is the maximum amount that firm can repay debt in the best world $z_{\max}$ and with no liquidation cost (so that firm can sell all capital stock).
 
 ##### Implementation
+
 Inputs: 
 - Shock parameters: $\mu, \sigma, \rho$ 
 - Economic parameters: $\gamma, r, \delta$
 - Multipliers: $m, \bar{c}, \underline{c}$
+
 Output (Tuples): 
 - Shock (log) state range $[\log z_{\min}, \log z_{\max}] = \left[ \mu - m \cdot \sigma_{\log z}, \, \mu + m \cdot \sigma_{\log z} \right]$
 - Capital state range: $[K_{\min}, K_{\max}]$
 - Debt state range $[0, B_{\max}]$
+- Frictionless steady state $k^*(e^\mu)=\left(\frac{e^\mu\cdot\gamma}{r+\delta}\right)^{\frac{1}{1-\gamma}}$ where $\mu$ is stationary AR-1 mean for $\log z$
 
 ## Datasets
 Core ideas:
@@ -302,7 +303,6 @@ Outputs (activations):
 Primitives use levels:
 - $k=\exp(\log k)$, $z=\exp(\log z)$
 - Use levels in $\pi(k,z)$, $\psi(I,k)$, $e(\cdot)$, etc.
-- In this project version: do NOT standardize network inputs/outputs using running mean/std.
 
 ## Risky Debt Model Networks
 
@@ -312,7 +312,7 @@ $$ (k',b') = \Gamma_{\text{policy}}(k,b,z;\theta_{\text{policy}}) $$
 
 2. Bond pricing network:
 
-$$\tilde{r}(k',b',z) = \Gamma_{\text{price}}(k',b',z;\theta_{\text{price}})$$
+$$q(k',b',z) \equiv \frac{1}{1+\tilde{r}} =  \Gamma_{\text{price}}(k',b',z;\theta_{\text{price}})$$
 
 3. Continuation (latent) value network:
 
@@ -332,8 +332,8 @@ Outputs (activations):
 - $b' = B_{\max} \cdot \text{Sigmoid}(\cdot)$
 	- Ensures $b' \in [0,B_{\max}]$
 
-- Risky interest rate: $\tilde{r}(k',b',z) = r_{\text{risk-free}} + \mathrm{softplus}(\cdot)$
-	- Ensures $\tilde{r} \in [r, \infty]$
+- Bond price $q(k',b',z) = (1/(1+r)) \cdot \text{Sigmoid}(\cdot)$
+	- Ensures $q \in [0, \frac{1}{1+r}]$ where $r$ is risk-free rate
 
 - $\widetilde{V}(k,b,z) = \mathrm{linear}(\cdot)$
 	- Ensures $\tilde{V}$ can be either positive or negative
@@ -790,7 +790,7 @@ Example callback hook:
 
 **Variables**
 - State: $(k,b,z)$
-- Control: $(k',b')$
+- Action/Control: $(k',b')$
 
 where $b' \ge 0$ denotes borrowing at endogenous risky interest rate $\tilde{r}$.
 
@@ -809,10 +809,15 @@ where $\mathbf{1}_{e<0}$ is an indicator function for negative cash flow that tr
 
 **Endogenous risky interest rate**
 
-$$\tilde r=\tilde r(z,k',k,b',b)$$
+$$\tilde r=\tilde r(k,b,z,k',b')$$
 
 which is determined in equilibrium where the lenders earn zero profit after taking into account the default probablity and expected recovery. 
-  
+
+In practice, I use $q$ to denote the unit price of a zero-coupon risky bond 
+
+$$q(k,b,z,k',b') = \frac{1}{1+\tilde{r}}$$
+
+The bond proceed is thus $q\cdot b'$ (unit price $\times$ face value) and in next period the borrower repay $b'$ and lender earns the risky interest rate $1+\tilde{r}$.
 
 **Latent and actual firm value**
 
@@ -838,11 +843,10 @@ where the LHS is the marginal (opportunity) cost of lending and the RHS is the e
 - If defualt, lender recovers $R(k',b',z')$ after liquidation
 
 Note that the risky rate $\tilde r$ is set by lender at the current period given information
-- Current states: $k,b,z$
 - Firm choice of $k',b'$
-- Expectations about $z'$
+- Current $z$ and conditional expectations about $z'$
 
-**Default probability**
+**Endogenous Default**
 
 Let $D$ denote an indicator for default when firm's latent/continuation value is negative
 
@@ -871,195 +875,213 @@ To solve for this model, I need to train the neural network to enforce the follo
 
     where $D=\mathbb{1}\{\widetilde{V}<0\}$ is the default indicator, and $R(k',b',z')$ is the recovery value.
 
-## Networks
-
-Implementation of this model requires at least three neural networks.
-
-**Policy network**
-
-For BR: 
-$$ (k',b') = \Gamma_{\text{policy}}(k,b,z;\theta_{\text{policy}})$$
-
-**Pricing network**
-$$\tilde{r}(\cdot;\theta_{\text{price}}) = \Gamma_{\text{price}}(k',b',k,b,z;\theta_{\text{price}})$$
-
-**Value network**
-$$\widetilde{V}(\cdot;\theta_{\text{value}}) = \Gamma_{\text{value}}(k,b,z;\theta_{\text{value}})$$
-
-**Loop-in-loop problem** 
-
-As described in @Strebulaev12, the key challenge to solve this model is that the latent firm value $\widetilde{V}$ depends on the endogenous risky rate $\tilde{r}$. However, solving for $\tilde{r}$ requires solving the lender's zero-profit condition and particularly on knowing the default probability $\mathbb{E}[D]$ that in turn depends on firm value $\widetilde{V}$. 
+**Loop-in-loop problem** As described in @Strebulaev12, the key challenge to solve this model is that the latent firm value $\widetilde{V}$ depends on the endogenous risky rate $\tilde{r}$. However, solving for $\tilde{r}$ requires solving the lender's zero-profit condition and particularly on knowing the default probability $\mathbb{E}[D]$ that in turn depends on firm value $\widetilde{V}$. 
 
 The conventional approach to break this circular dependency is to solve for $\tilde{r}$ and $\mathbb{E}[D]$ iteratively via a "inner loop" and a "outer loop". For example, first solving the zero-profit condition to get an estimate of $\tilde{r}$, use it to solve for $\widetilde{V}$, then use the updated $\widetilde{V}$ to update $\tilde{r}$ and repeat until both iteration loop converge. 
 
-Using deep neural networks, this problem is solved more effectively by jointly training three networks.
+Using deep neural networks, this problem is solved more effectively by jointly training three networks in a Critic-Actor algorithm.
 
 
 ## Pricing Loss
 
 First let us define an empirical loss for the zero-profit condition. This is essential for training the pricing network and solve fo the endogenous risky rate $\tilde{r}$.
 
-**Smooth default probability**
+**Default indicator**
 
-Since the default indicator $D=\mathbb{1}\{\widetilde{V}<0\}$ is non-differentiable, I approximate the default indicator using a softened, smooth function:
-
-$$p(k',b',z')=\sigma\!\left(-\frac{\widetilde V(k',b',z')}{\tau^D_j}\right) \to D \quad \text{as} \quad \tau^D_j \to 0^+$$
-
-where I built an annealing schedule for $\tau^D_j$ to gradually reduce to zero over $j$ iterations.
+Since the default indicator $D=\mathbb{1}\{\widetilde{V}<0\}$ is non-differentiable, I approximate the default indicator using Gumbel-Sigmoid: 
+$$ p(k',b',z') \equiv \sigma \left( 
+    \frac{- \widetilde V/k + \log(u) - \log(1-u)}{\tau}
+\right) \to \mathbb{1}\left\{\frac{\widetilde V}{k}<0 \right\} \quad \text{as} \quad \tau \rightarrow 0 $$
+where the random uniform noise $u \sim \text{Uniform}(0,1)$ to force exploration around default boundary. As in the basic model, I use an annealing schedule for $\tau$ to converge to near-zero over iterations.
 
 **Pricing equation residual**
 
-Given $(z^{(1)}_{t+1,i},(z^{(2)}_{t+1,i})$ and the policy network for $(k',b')$, the residual of the zero-profit condition is computed as
-$$f^{(\ell)}_{t,i}
+Given $(z'_{i,1},z'_{i,2})$ and the policy network for $(k',b')$, the residual of the zero-profit condition is computed as
+$$f_{i,\ell}
 =
-b_{t+1,i} (1+r)-
+ \underbrace{q(\cdot, \theta_{\text{price}})}_{1/1+\tilde{r}} \cdot b'_{i,\ell} (1+r)-
 \Big[
-    p^{\ell}_{t,i} \cdot R(k_{t+1,i},z^{(\ell)}_{t+1,i}) 
-    +(1-p^{\ell}_{t,i}) \cdot b_{t+1,i} (1+\tilde{r}_{t,i})
-\Big]$$
-where default indicator $p^{\ell}_{t,i}$ and recovery value $R(k_{t+1,i},z^{(\ell)}_{t+1,i})$ can be directly calculated given the realized shocks for each observation $i$ in period $t$.
+    p_{i,\ell} \cdot R(k'_{i,\ell},z'_{i,\ell}) 
+    +(1-p^{\ell}_{i}) \cdot b'_{i,\ell} )
+\Big], \quad \ell = 1,2
+$$
+where $p^{\ell}_{i}$ is the Gumbel-Sigmoid function for default indicator, and $R(k'_{i,\ell},z'_{i,\ell})$ is the recovery value that be directly calculated given the realized shocks for each observation $i$ in period $t$.
 
-The endogenous risky rate $\tilde r$ is replaced with a pricing network $\Gamma_{\text{price}}(k',b',z';\theta_{\text{price}})$, so that the residual $f$ becomes a function of trainable parameters $\theta_{\text{price}}$.
+The endogenous risky bond price is replaced with a pricing network $q=\Gamma_{\text{price}}(k',b',z';\theta_{\text{price}})$, so that the residual $f$ becomes a function of trainable parameters $\theta_{\text{price}}$.
 
 The empirical loss function for the zero-profit condition is
-$$\widehat{\mathcal{L}}^{\text{price}}
-=\frac{1}{N}\sum_{i=1}^N 
-\left( \frac{1}{T}\sum_{t=1}^{T-1} f^{(1)}_{t,i}f^{(2)}_{t,i}\right)$$
-where I use Monte Carlo sampling mean (across $N$ i.i.d. draws) to approximate the expectation. Then I ensures the residual error is minimized across the $T$ horizon.
+$$\mathcal{L}^{\text{price}}
+=\frac{1}{\mathcal {|B|}}\sum_{i\in \mathcal B} 
+\left( f_{i,1}f_{i,2}\right)$$
+where $\mathcal{B}$ denotes the mini-batch of observations, and $f_{i,\ell}$ is the pricing residual for observation $i$ and Monte Carlo draw $\ell=1,2$.
 
 ---
 ## BR Method
-Similar to the basic model, I implement a critic-actor update algorithm to jointly minimize the Bellman equation residual and the risky bebt pricing equation residual.
+For the more sophisticated risky debt model, I first focus on the Bellman Residual (BR) method (Actor-Critic style), as it is a robust way to handle the simultaneous determination of the risky interest rate and the value function (the "loop-within-a-loop" problem described in @Strebulaev2012).
 
-Recall that the training dataset has $t=1,\dots,T$ periods and $i=1,\dots,N$ observations (i.i.d. draws of firms). For each $z_{t,i}$, we have two Monte Carlo draws $(\varepsilon^{(1)}_{t+1,i},\varepsilon^{(2)}_{t+1,i})$ and use an AR(1) step to compute $(z^{(1)}_{t+1,i},z^{(2)}_{t+1,i})$. By taking average over $N$ MC draws, we get a consistent estimator for the expected continuation value in the Bellman equation.
+Unlike the basic model, we need to enforce both the Bellman equation (firm's optimization) and the lender's zero-profit condition (equilibrium bond pricing). The core idea of the training loop is
+1. **Critic**: Train the value and pricing networks $(\theta_{\text{value}}, \theta_{\text{price}})$ to minimize the Bellman residual and pricing residual simultaneously 
+2. **Actor**: Given the trained value and pricing networks, update the policy $\theta_{\text{policy}}$ to maximize the expected firm value (RHS of Bellman)
+
+The algorithm should repeat this loop until (i) Bellman and zero-profit condition holds (approximately), and (ii) cannot find a better policy that improves the expected firm value. 
 
 ### Critic Update
 
 For each observation $i$, the critic target is the RHS of the Bellman equation:
-$$y^{(\ell)}_{t}=e(k_t,k_{t+1},b_t,b_{t+1},z_t)-\eta(e)+\beta\cdot \max\{0,\Gamma_{\text{value}}(k_{t+1},b_{t+1},z^{(\ell)}_{t+1};\bar \theta_{\text{value}})\}$$
+$$
+\begin{align*}
+y_{\ell} &= e(k,k',b,b',z)-\eta(e)+\beta\cdot \max\{0,\Gamma_{\text{value}}(k',b',z'_{\ell}; \theta^-_{\text{value}})\} \\
+&\approx e - \eta(e) + \beta (1-p_{\ell}) \cdot \Gamma_{\text{value}}(k',b',z'_{\ell})
+\end{align*}
+$$
+where as before $\ell=1,2$ denotes the two Monte Carlo draws of next period shocks. Crucially, the $\max$ operator that enforces limited liability on RHS is replaced with a smooth function. If we use a hard max for the Critic, it creates a "kink" in the target surface that the Value network tries to fit with smooth activations.
 
-where as before $\ell = 1, 2$ denotes the two Monte Carlo draws of shocks. We also use the policy network $\Gamma_{\text{policy}}$ to compute $(k_{t+1}, b_{t+1})$. Therefore, this target can be directly computed given
+Recall that $p_{i,\ell}$ is the Gumbel-Sigmoid approximation of the default indicator defined in previous section and computed using the MC shock $z'_{i,\ell}$. This substitution is valid because the effective continuation value is $(1-\mathbb{1}_{\text{default}}) \tilde{V} + \mathbb{1}_{\text{default}} \cdot 0$. The annealing schedule ensures that over training steps: 
+$$
+p_{i,\ell} \to \mathbb{1}_{\text{default}}
+\quad \text{and} \quad   
+\Gamma_{\text{value}}(\cdot) \to \tilde{V} 
+$$
+
+
+
+
+We also use the policy network $\Gamma_{\text{policy}}$ to compute $(k', b')$. Therefore, this target can be directly computed given
 - Economic/production parameters for $e(\cdot)$ and $\eta(\cdot)$
-- Current states $(k_t,b_t,z_t)$
-- Two realized shocks $(z^{(1)}_{t+1},z^{(2)}_{t+1})$ given $z_t$
+- Current states $(k,b,z)$
+- Two realized shocks $(z'_{1},z'_2)$
 - Policy and value networks $\Gamma_{\text{policy}}$ and $\Gamma_{\text{value}}$
 
 To stablized training, I use polyak averaging to update the target value network:
 $$
-\bar \theta_{\text{value}} \leftarrow \alpha \bar \theta_{\text{value}} + (1-\alpha)\theta_{\text{value}}
+\theta^-_{\text{value}} \leftarrow \nu  \theta^-_{\text{value}} + (1-\nu)\theta_{\text{value}}
 $$
 
-The Bellman residual is computed as
+The Bellman residual for each observation $i$ is computed as
 
-$$\delta^{(\ell)}_{t}=\Gamma_{\text{value}}(k_t,b_t,z_t;\theta_{\text{value}})-y^{(\ell)}_{t}$$
-where it is important to note that $\bar \theta_{\text{value}}$ is detached from the gradient. I only train $\theta_{\text{value}}$ to update the first term on the RHS and take $y^{(\ell)}_t$ as a constant.
+$$\delta_{i,\ell}=\Gamma_{\text{value}}(k_i,b_i,z_i;\theta_{\text{value}})-y_{i,\ell}$$
+where it is important to note that $\theta^-_{\text{value}}$ is detached from the gradient. I only train $\theta_{\text{value}}$ to update the first term on the RHS and take $y^{(\ell)}_t$ as a constant.
 
-Finally, I compute the residual "square" by taking the cross-product of two residuals for each period $t$, then I take the lifetime mean over $T$ horizon to form the empirical risk:
+For given mini-batch $\mathcal B$, the Monte Carlo expected Bellman residual is the AiO cross-product as in the basic model:
 $$
-\widehat{\mathcal{L}}^{\text{BR}}_{\text{critic}}
-=\frac{1}{T}\sum_{t=1}^T \left( 
-\frac{1}{N}\sum_{i=1}^N \delta^{(1)}_{t,i}\delta^{(2)}_{t,i}
-\right)
+\mathcal{L}^{\text{BR}} = \frac{1}{|\mathcal B|}\sum_{i\in \mathcal B} \delta_{i,1}\delta_{i,2}
 $$
+
+Finally, the empirical risk combines the Bellman residual and the zero-profit pricing residual:
+$$
+\mathcal{L} (\theta_{\text{value}}, \theta_{\text{price}})
+= \omega_1 \mathcal{L}^{\text{BR}} + \omega_2 \mathcal{L}^{\text{price}}
+$$
+where $(\omega_1, \omega_2)$ are exogenous weights (hyperparameter) on each loss. @Maliar21 recommend tuning them to match the scale of each loss. For example, if the BR loss is on average 10-100 times larger than the pricing residual (because BR sums over lifetime discounted rewards), we might set $\omega_1=0.1$ and $\omega_2=1$ to balance the two losses.
+
 
 ### Actor Update
-The critic update ensures that for given policy $\theta_{\text{policy}}$, the value function is trained to minimize the average lifetime Bellman residuals. However, it is not guaranteed that the policy itself if optimal. Thus in the Actor update step, I train the policy network to maximize the RHS of the Bellman equation, holding the value network constant. The actor empirical risk is given as
+Next in the Actor update step, I train the policy network to maximize the expected firm value (RHS of the Bellman equation) for a given value and pricing network. The actor empirical risk is defined as
 
+$$ 
+\begin{align*}
+\mathcal{L}^{\text{BR}}_{\text{actor}}(\theta_{\text{policy}})
+&= -\frac{1}{N}\sum_{i=1}^N 
+\Big[e(\cdot, z_{i,1})+\beta \cdot  
+\max \{0, \, \Gamma_{\text{value}}(k'_{i},z'_{i,1};\theta_{\text{value}}, \theta_{\text{price}}) \}\Big]    \\
+&\approx 
+-\frac{1}{N}\sum_{i=1}^N 
+\Big[e(\cdot, z_{i,1})+\beta \cdot V_{\text{eff}} \Big]
+\end{align*}
 $$
-\widehat{\mathcal{L}}^{\text{BR}}_{\text{actor}}(\theta_{\text{policy}})
-=-\frac{1}{N}\sum_{i=1}^N \frac{1}{T}\sum_{t=0}^{T-1}
-\left[
-    e(\cdot)-\eta(e)+\beta\cdot \frac{1}{2}\sum_{\ell=1}^2 \max\{0,\Gamma_{\text{value}}(k_{t+1,i},b_{t+1,i},z^{(\ell)}_{t+1,i};\theta_{\text{value}})\}
-\right]$$
-where we prevent $\theta_{\text{value}}$ from update and only train the policy $\theta_{\text{policy}}$ to maximize the RHS over $N$ draws. Then it is averaged over $T$ period to ensure that the policy is $\argmax_{\theta}$ on average over all periods.
+where it is helpful to clarify that
+- Take $(\theta_{\text{value}},\theta_{\text{price}})$ as given, update $\theta_{\text{policy}}$ via policy network
+$$(k',b')=\Gamma_{\text{policy}}(k,b,z;\theta^-_{\text{policy}})$$
+- Use the main shock $z'_{i,1}$ and sample mean as unbiased estimator
 
----
-> **Warning**: I recommend using BR method to solve the risky debt model. The following sections (LR and ER) are experimental and not implemented.
-
-
-## LR Method
-
-**Reward (cash flow)**
-$$u_t=e(k_t,k_{t+1},b_t,b_{t+1},z_t)-\eta(e(\cdot)).$$
-
-**Networks**
-
-A key feature of this model is that shareholder can choose default and walk away with zero payout when the continuation value is negative. In practice, I define a new neuron output $d_{t+1}\in(0,1)$ to approximate the default probability and train the policy network to "learn" it.
-
-To implement the LR method, we only need two networks: 
-
-1. Policy Networks:
+Similar to the Critic step, the $\max$ operator that enforces limited liability on RHS is replaced with a smooth function to avoid the dying Relu problem:
 $$
-(k_{t+1},b_{t+1}, d_{t+1})=\Gamma_{\text{policy}}(k_t,b_t,z_t;\theta_{\text{policy}})
+V_{\text{eff}} = (1 - p_{i,1}) \cdot \Gamma_{\text{value}}(k'_{i},z'_{i,1};\theta_{\text{value}}, \theta_{\text{price}})
 $$
-where the interpretation is: conditional on information at $t$, the firm chooses optimal next-period capital and debt levels, and defaults at the start of next period with probability $d_{t+1}$
+where $p_{i,1}$ is the Gumbel-Sigmoid approximation of the default indicator defined in previous section and computed using the main realized shock $z'_1$. 
 
-2. Pricing Networks:
-$$\tilde{r}(k_{t+1},b_{t+1},z_t) = \Gamma_{\text{price}}(k_{t+1},b_{t+1},z_t;\theta_{\text{price}})$$
-Note that $\tilde r$ is issued at current period and does NOT depends on the realization of next period $z_{t+1}$.
+It should be clarified that the dying Relu problem of the $\max$ operator is not the concern for the previous critic update step because the $\theta^-_{\text{value}}$ is detached from graph once the target $y_{i,\ell}$ is computed, so that we do not need its gradient. For critic, the smooth function is mainly used to reduce kinks and improve training stability.
 
-**Survival Mask**
-Define a soft survival indicator $M_t\in[0,1]$ as “probability-weight” that the firm is alive during period $t$.
-- Initialization: $M_0=1$.
-- Recursion (default happens at start of $t+1$ with probability $d_{t+1}$):
-$$M_{t+1}=M_t\,(1-d_{t+1}),\qquad t=0,\dots,T-1.$$
-Equivalently,
-$$M_t=\prod_{s=0}^{t}(1-d_s),\qquad t\ge 1,\quad d_0=0.$$
+However, in the actor update step it is essential to avoid a hard $\max$ because in that case the Actor (Policy) receives a zero gradient as $\max$ is not differentiable. It receives no signal on how to adjust capital $k'$ or debt $b'$ to exit the default zone where all future values are flat zeros.
+
+### Requirements
+All inputs should be normalized: $\log k$, $b/k$, $\log z$.
+
+**Policy Net** (Actor): $\Gamma_{policy}(k, b, z; \theta_\pi) \to (k', b')$
+- Activations: Sigmoids scaled to $[k_{\min}, k_{\max}]$ and $[0, b_{\max}]$.
+
+**Price Net** (Critic): $\Gamma_{price}(k', b', z; \theta_q) \to q$
+- Output: Sigmoid scaled to $(0, \frac{1}{1+r}]$. Represents bond price.
+
+**Value Net** (Critic): $\Gamma_{value}(k, b, z; \theta_V) \to \widetilde{V}$
+- Output: Linear (represents latent continuation value).
+
+**Auxiliary Functions** (Differentiable)
+
+- Default Probability: $p(V) = \text{Sigmoid}(-V / \tau)$ where $\tau$ is the annealing temperature
+- Effective Value: $V_{\text{eff}}(V) = (1 - p(V)) \cdot V$
+- Economic primitives are defined as above (cash flow, recoveries, etc)
+
+**Hyperparameters**
+- Optimizers `Adam`
+- Different learning rate for critic and actor
+- Critic steps: Update Critic `N_critic_step` times for every 1 Actor update.
+
+**Logging**
+
+The trainer should log the following metrics:
+- Mean Bellman residual (Critic loss 1)
+- Mean pricing residual (Critic loss 2)
+- Share of defaults $p(V)$ per iteration
+- Annealing and other metrics for convergence/early stopping
 
 
+### Algorithm Summary
+Training Set: Sample batch $\mathcal B$ of transition samples: $(k, b, z)$ and $(z'_1, z'_2)$.
 
-**Zero-profit condition**
+Validation Set: Data $\mathcal D_{val}$ generated using same RNG seed as training set. 
 
-Given $(z^{(1)}_{t+1,i},z^{(2)}_{t+1,i})$ and the policy network for $(k_{t+1,i},b_{t+1,i},d_{t+1,i})$, the residual of the zero-profit condition is computed as
-$$f^{(\ell)}_{t,i}
-=
-b_{t+1,i} (1+r)-
-\Big[
-    d_{t+1,i} \cdot R(k_{t+1,i},z^{(\ell)}_{t+1,i}) 
-    +(1-d_{t+1,i}) \cdot b_{t+1,i} (1+\tilde{r}_{t,i})
-\Big]$$
-where default indicator $d_{t+1,i}$ and borrowing $b_{t+1,i}$ are all outputs of the policy network. Recovery value can be computed directly given $k_{t+1,i},z^{(\ell)}_{t+1,i}$.
+#### A. Critic Update
 
-**Objective**
+Forward Pass (Targets): 
+- Get next actions: $(k', b') = \Gamma_{policy}(k, b, z)$.
+- Get target values (using $\theta^-_V$) and recovery values at both shocks $\ell \in {1,2}$.
+- Compute Bellman Target $y_\ell$: 
+$$ y_\ell = e(k, b, z, k', b'; q) + \beta \cdot V_{\text{eff}}(\Gamma_{value}(k', b', z'_\ell; \theta^-_{value})) $$
+- Compute Lender Payoff $P_\ell$: 
+$$ P_\ell = \beta [ (1-p_{\ell}) \cdot b' + p_{\ell} \cdot R(k', z'_\ell) ] $$
 
-Let $\mathbf{\theta} \equiv (\theta_{price}, \theta_{policy})$. The objective of training is to find the optimal $\theta$ that jointly minimizes the negative lifetime reward $\mathcal{L}^{\text{LR}}$ and the pricing residual $\mathcal{L}^{\text{price}}$:
+Forward Pass (Predictions):
+- Predict Value: $V_{pred} = \Gamma_{value}(k, b, z; \theta_{value})$.
+- Predict Price: $q_{pred} = \Gamma_q(k', b', z; \theta_{price})$.
+- Compute residuals for both losses for $\ell=1,2$
 $$
-\mathcal{L}^{\text{LR}}(\theta) = -\frac{1}{N}\sum_{i=1}^N\sum_{t=0}^{T-1}
-\beta^t \cdot M_{t,i} \cdot u_{t,i}^{(1)}
+\begin{gather*}
+\delta_{i,\ell} = (V_{pred, i} - y_{i,\ell}) \\
+f_{i,\ell} = (q_{pred, i} \cdot b'_i \cdot (1+r)- P_{i,\ell})
+\end{gather*}
 $$
-where rewards are computed using the $\ell=1$ main shock path.
-
-$$
-\mathcal{L}^{\text{price}}(\theta) = \frac{1}{N}\sum_{i=1}^N 
-\left( \frac{1}{T}\sum_{t=0}^{T-1} f^{(1)}_{t,i}f^{(2)}_{t,i}\right)
-$$
-where the survival mask is computed recursively using neuron output $\{d_{t+1}\}_{t=0}^{T-1}$ from policy network: 
-$$
-M_{t,i} = \prod_{s=0}^{t} (1-d_{s,i})
+- Loss Calculation (AiO):
+$$\mathcal{L} = \frac{1}{|\mathcal B|} \left( w_1 \sum_{i\in \mathcal B} \delta_{i,1}\delta_{i,2} + w_2 \sum_{i\in \mathcal B} f_{i,1}f_{i,2} \right)
 $$
 
-These two objectives can be combined into a single empirical risk:
-$$
-\mathcal{L}(\theta) \equiv \mathcal{L}^{\text{LR}} + \lambda_j (\mathcal{L}^{\text{price}} - \epsilon)
-$$
-where the Lagrange multiplier $\lambda_j$ is used to enforce the pricing residual to be close to zero by a tolerance $\epsilon$. After each step update of $\theta$ in iteration $j$, the multiplier is updated by
-- Detach $\theta$ from $\mathcal{L}_j^{\text{price}}$ to prevent it from being updated
-- Compute Polyak averaging $\mathcal{\bar L}_j^{\text{price}}= (1-w) \mathcal{\bar L}_{j-1}^{\text{price}} + w \mathcal{L}_j^{\text{price}}$ with weight $w\in(0,1)$
-- Update $\lambda_j \leftarrow \max(0, \lambda_j + \eta_\lambda(\bar L_j^{\text{price}}-\epsilon))$ where $\eta_\lambda$ is a learning rate for the multiplier
+Update: Gradient descent on $\theta_{value}, \theta_{price}$. Polyak update $\theta^-_{value}, \theta^-_{price}$.
 
-The multiplier $\lambda_j \to 0$ when the constraint is slack / satisfied, i.e. the pricing equation residual is small enough $\mathcal{L}_j^{\text{price}} \lt \epsilon$, which ensures that the zero-profit condition holds.
+#### B. Actor Update
 
-**Training loop summary**
-1.	Initialize economic parameters, training hyperparameters, model parameters $\theta$ (policy network $\Gamma_{\text{policy}}$ and pricing network $\Gamma_{\text{price}}$), and Lagrange multiplier(s) $\lambda \ge 0$.
-2.	For $j = 1,\dots,N_{\text{iter}}$ during training:
-  - Sample a minibatch $B_j$ from the training set
-  - Compute $L^{LR}(\theta;B_j)$ (negative lifetime reward) and $L^{\text{price}}(\theta;B_j)$
-  - Form the Lagrangian loss: $\mathcal{L}_j(\theta,\lambda)=L^{LR}(\theta;B_j)+\lambda\big(L^{\text{price}}(\theta;B_j)-\epsilon\big)$
-  - Update $\theta$: take one optimizer step to minimize $\mathcal{L}_j$ via backpropagation
-  - Update $\lambda$ (no backprop): using the detached batch estimate $\mathcal{\bar L}_j^{\text{price}}$ and update 
-  $$\lambda \leftarrow \max\!\left(0,\ \lambda+\eta_\lambda(\mathcal{\bar L}_{j}^{\text{price}}-\epsilon)\right)$$
-3.	Stop at $N_{\text{iter}}$ (for quick debugging) or when reached the converegnce/stopping criteria for LR (See section below).
+Forward Pass:Generate actions: $(k'_i, b'_i) = \Gamma_{policy}(k_i, b_i, z_i; \theta_{policy})$.
 
-## ER Method
+- Evaluate Price: $q = \Gamma_q(k'_i, b'_i, z'_{i,1}; \theta_{price})$
+- Evaluate Value: $V'_{next} = \Gamma_V(k'_i, b'_i, z'_{i,1}; \theta_V)$ (Freeze $\theta_V$).
+- Loss Calculation:Maximize 
+$$\mathcal{L}_{actor} = - \frac{1}{|\mathcal B|} \sum_{i\in \mathcal B}\left[ e(q_i) - \eta(e(q_i)) + \beta \cdot V_{\text{eff}}(V'_{next}) \right]$$
 
-Underdevelopment. Coming soon.
+Update: Gradient descent on $\theta_{policy}$. Polyak update $\theta^-_{policy}$.
+
+#### C. Stopping Rule
+- Decay $\tau$ (for default sigmoid) and $\epsilon$ (for inaction regions) according to annealing schedule per iteration step.
+- Repeat Step A-B until convergence/early stopping rule is met.
+
+
+## Extensions
+Under-development.

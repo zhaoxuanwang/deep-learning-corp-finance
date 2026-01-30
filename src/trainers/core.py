@@ -134,7 +134,6 @@ def execute_training_loop(
     )
 
     # Convergence Checker (early stopping)
-    # Reference: report_brief.md lines 727-735
     convergence_checker = create_convergence_checker(
         method_name=method_name,
         n_anneal=anneal.n_anneal,
@@ -214,7 +213,7 @@ def execute_training_loop(
                  # Find a loss key to print
                  loss_keys = [k for k in metrics.keys() if "loss" in k]
                  loss_str = f"{loss_keys[0]}={metrics[loss_keys[0]]:.4f}" if loss_keys else ""
-                 print(f"Iter {i}: {loss_str} T={current_temp:.3f}")
+                 logger.info(f"Iter {i}: {loss_str} Anneal_log={np.log10(current_temp):.2f}")
         
         # Update annealing state
         anneal.update()

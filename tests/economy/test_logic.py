@@ -186,9 +186,10 @@ class TestCashFlow:
         b_next = tf.constant([0.6, 0.6])
         z = tf.constant([1.0, 1.0])
         r_tilde = tf.constant([0.05, 0.06])
+        q = 1.0 / (1.0 + r_tilde)  # Convert interest rate to bond price
 
-        e = logic.cash_flow_risky_debt(
-            k, k_next, b, b_next, z, r_tilde, params,
+        e = logic.cash_flow_risky_debt_q(
+            k, k_next, b, b_next, z, q, params,
             temperature=DEFAULT_TEMPERATURE,
             logit_clip=DEFAULT_LOGIT_CLIP
         )
@@ -197,22 +198,22 @@ class TestCashFlow:
         assert np.all(np.isfinite(e.numpy()))
 
     def test_risky_debt_differentiable_wrt_actions(self, params):
-        """Gradients exist w.r.t. k_next, b_next, r_tilde."""
+        """Gradients exist w.r.t. k_next, b_next, q."""
         k = tf.constant([1.0])
         k_next = tf.Variable([1.1])
         b = tf.constant([0.5])
         b_next = tf.Variable([0.6])
         z = tf.constant([1.0])
-        r_tilde = tf.Variable([0.05])
+        q = tf.Variable([0.95])  # Bond price instead of interest rate
 
         with tf.GradientTape() as tape:
-            e = logic.cash_flow_risky_debt(
-                k, k_next, b, b_next, z, r_tilde, params,
+            e = logic.cash_flow_risky_debt_q(
+                k, k_next, b, b_next, z, q, params,
                 temperature=DEFAULT_TEMPERATURE,
                 logit_clip=DEFAULT_LOGIT_CLIP
             )
 
-        grads = tape.gradient(e, [k_next, b_next, r_tilde])
+        grads = tape.gradient(e, [k_next, b_next, q])
 
         assert all(g is not None for g in grads), \
             "Gradients should exist for all action variables"

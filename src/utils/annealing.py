@@ -32,9 +32,9 @@ class AnnealingSchedule:
         step: Current iteration
         n_anneal: Projected iterations to reach convergence (including buffer)
     """
-    init_temp: float = 1.0
+    init_temp: float = 2.0
     min_temp: float = 1e-4
-    decay_rate: float = 0.9
+    decay_rate: float = 0.995
     buffer: float = 0.25
     
     def __post_init__(self):

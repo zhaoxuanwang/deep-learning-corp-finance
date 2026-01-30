@@ -268,8 +268,6 @@ class BasicTrainerER:
                 - loss_ER: Euler residual loss (AiO form)
                 - target_policy_update: Average magnitude of target network updates
 
-        Reference:
-            report_brief.md lines 494-519: ER training loop with target policy
         """
         with tf.GradientTape() as tape:
             # Reshape inputs
@@ -379,8 +377,6 @@ class BasicTrainerBR:
     - Critic uses TARGET networks for computing targets (stability)
     - Actor uses CURRENT networks but freezes value weights during update
 
-    Reference:
-        report_brief.md lines 585-644: "Algorithm Summary: BR Method"
     """
     def __init__(
         self,
@@ -388,8 +384,10 @@ class BasicTrainerBR:
         value_net: BasicValueNetwork,
         params: EconomicParams,
         shock_params: ShockParams,
-        actor_lr: float = 1e-3,
-        critic_lr: float = 1e-3,
+        actor_learning_rate: float = 1e-3,
+        critic_learning_rate: float = 1e-3,
+        optimizer_actor: Optional[tf.keras.optimizers.Optimizer] = None,
+        optimizer_value: Optional[tf.keras.optimizers.Optimizer] = None,
         n_critic_steps: int = 20,
         logit_clip: float = 20.0,
         polyak_tau: float = 0.995  # Polyak averaging coefficient
@@ -398,8 +396,8 @@ class BasicTrainerBR:
         self.value_net = value_net
         self.params = params
         self.shock_params = shock_params
-        self.optimizer_policy = tf.keras.optimizers.Adam(actor_lr)
-        self.optimizer_value = tf.keras.optimizers.Adam(critic_lr)
+        self.optimizer_policy = optimizer_actor or tf.keras.optimizers.Adam(actor_learning_rate)
+        self.optimizer_value = optimizer_value or tf.keras.optimizers.Adam(critic_learning_rate)
         self.n_critic_steps = n_critic_steps
         self.logit_clip = logit_clip
         self.beta = 1.0 / (1.0 + params.r_rate)
@@ -727,7 +725,7 @@ def _make_validation_fn_br(trainer: BasicTrainerBR):
 
 
 # =============================================================================
-# HIGH-LEVEL ENTRY POINTS
+# HIGH-LEVEL APIs
 # =============================================================================
 
 def train_basic_lr(
@@ -948,8 +946,8 @@ def train_basic_br(
     Implements DDPG-style actor-critic with target networks and Polyak averaging.
 
     Reference:
-        report_brief.md lines 157-167: "Flatten Data for ER and BR"
-        report_brief.md lines 585-644: "Algorithm Summary: BR Method"
+        report_brief.md : "Flatten Data for ER and BR"
+        report_brief.md : "Algorithm Summary: BR Method"
 
     Args:
         dataset: FLATTENED training dataset from DataGenerator.get_flattened_training_dataset()
@@ -996,13 +994,21 @@ def train_basic_br(
         activation=net_config.activation
     )
 
+    actor_lr = opt_config.learning_rate
+    critic_lr = opt_config.learning_rate_critic if hasattr(opt_config, 'learning_rate_critic') and opt_config.learning_rate_critic else opt_config.learning_rate
+
+    optimizer_actor = tf.keras.optimizers.Adam(learning_rate=actor_lr)
+    optimizer_value = tf.keras.optimizers.Adam(learning_rate=critic_lr)
+
     trainer = BasicTrainerBR(
         policy_net=policy_net,
         value_net=value_net,
         params=params,
         shock_params=shock_params,
-        actor_lr=opt_config.learning_rate,
-        critic_lr=opt_config.learning_rate_critic if hasattr(opt_config, 'learning_rate_critic') and opt_config.learning_rate_critic else opt_config.learning_rate,
+        actor_learning_rate=actor_lr,
+        critic_learning_rate=critic_lr,
+        optimizer_actor=optimizer_actor,
+        optimizer_value=optimizer_value,
         n_critic_steps=method_config.n_critic,
         logit_clip=anneal_config.logit_clip,
         polyak_tau=method_config.polyak_tau if hasattr(method_config, 'polyak_tau') else 0.995

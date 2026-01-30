@@ -1,5 +1,5 @@
 """
-src/dnn/plotting.py
+src/utils/plotting.py
 
 Matplotlib plotting helpers for DNN experiments.
 Provides loss curves, policy slices, and scenario comparisons.

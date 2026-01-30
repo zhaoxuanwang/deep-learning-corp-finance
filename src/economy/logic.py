@@ -109,44 +109,6 @@ def external_financing_cost(
     return is_negative * (params.cost_inject_fixed + params.cost_inject_linear * tf.abs(e))
 
 
-def cash_flow_risky_debt(
-    k: Numeric,
-    k_next: Numeric,
-    b: Numeric,
-    b_next: Numeric,
-    z: Numeric,
-    r_tilde: Numeric,
-    params: EconomicParams,
-    temperature: float,
-    logit_clip: float
-) -> Numeric:
-    """
-    Cash flow for risky debt model, using interest rate directly.
-    """
-    # Basic cash flow components
-    profit = production_function(k, z, params)
-    investment = compute_investment(k, k_next, params)
-    costs_adjust = adjustment_costs(k, k_next, params, temperature=temperature, logit_clip=logit_clip)
-
-    # Bond price from rate: q = 1/(1+r̃)
-    safe_r = tf.maximum(1.0 + r_tilde, 1e-8)
-    bond_price = 1.0 / safe_r
-
-    # Market value of the debt issuance
-    debt_proceeds = b_next * bond_price
-
-    # Repayment of old debt
-    debt_repay = b
-
-    # Tax Shield: τ·r̃·b'/[(1+r̃)(1+r)]
-    tax_shield_debt = params.tax * r_tilde * debt_proceeds / (1 + params.r_rate)
-
-    # Net cash flow with risky debt
-    cash_flow = (1 - params.tax) * profit - investment - costs_adjust + debt_proceeds + tax_shield_debt - debt_repay
-
-    return cash_flow
-
-
 # --- 2. The AutoDiff Engine (Rigorous Derivatives) ---
 
 def take_derivative(
@@ -380,27 +342,135 @@ def pricing_residual_zero_profit(
     recovery: Numeric
 ) -> Numeric:
     """
-    Lender zero-profit pricing residual.
-    
+    Lender zero-profit pricing residual (rate-based formulation).
+
     f = b'(1+r) - [p^D · R + (1-p^D) · b'(1+r̃)]
-    
+
     When f = 0, the bond is fairly priced (zero expected profit for lender).
-    
+
+    Note: Prefer pricing_residual_bond_price() for BR method as it uses
+    bond price q directly per report_brief.md.
+
     Args:
         b_next: Next period debt (levels)
         r_risk_free: Risk-free rate (scalar float)
         r_tilde: Risky rate (batch,)
         p_default: Default probability (batch,)
         recovery: Recovery value R(k', z') (batch,)
-    
+
     Returns:
         f: Pricing residual (batch,). Positive = lender earns profit.
     """
     lhs = b_next * (1 + r_risk_free)
-    
+
     # Expected payoff to lender:
     # If default: get recovery R
     # If solvent: get full repayment b'*(1+r̃)
     rhs = p_default * recovery + (1 - p_default) * b_next * (1 + r_tilde)
-    
+
     return lhs - rhs
+
+
+def pricing_residual_bond_price(
+    q: Numeric,
+    b_next: Numeric,
+    r_risk_free: float,
+    p_default: Numeric,
+    recovery: Numeric
+) -> Numeric:
+    """
+    Lender zero-profit pricing residual (bond price formulation).
+
+    f = q · b' · (1+r) - β · [(1-p) · b' + p · R]
+
+    where β = 1/(1+r) is the discount factor.
+
+    Reference:
+        report_brief.md lines 1046-1059:
+        "Compute Lender Payoff P_ell: P_ell = β[(1-p_ell)·b' + p_ell·R]"
+        "f = (q * b' * (1+r) - P_ell)"
+
+    When f = 0, the bond is fairly priced (zero expected profit for lender).
+
+    Args:
+        q: Bond price (batch,) in [0, 1/(1+r)]
+        b_next: Next period debt face value (batch,)
+        r_risk_free: Risk-free rate (scalar float)
+        p_default: Default probability (batch,)
+        recovery: Recovery value R(k', z') (batch,)
+
+    Returns:
+        f: Pricing residual (batch,). Positive = lender earns profit.
+    """
+    beta = 1.0 / (1.0 + r_risk_free)
+
+    # LHS: Market value of bond * gross risk-free return
+    # This represents what the lender pays (discounted) times the opportunity cost
+    lhs = q * b_next * (1 + r_risk_free)
+
+    # RHS: Expected discounted payoff to lender
+    # If solvent: get full repayment b'
+    # If default: get recovery R
+    expected_payoff = (1 - p_default) * b_next + p_default * recovery
+    rhs = beta * expected_payoff
+
+    return lhs - rhs
+
+
+def cash_flow_risky_debt_q(
+    k: Numeric,
+    k_next: Numeric,
+    b: Numeric,
+    b_next: Numeric,
+    z: Numeric,
+    q: Numeric,
+    params: EconomicParams,
+    temperature: float,
+    logit_clip: float
+) -> Numeric:
+    """
+    Cash flow for risky debt model, using bond price q directly.
+
+    Reference:
+        report_brief.md lines 795-799:
+        e = (1-τ)π(k,z) - ψ(I,k) - I + b'·q + τ·r̃·b'·q/(1+r) - b
+
+    Note: Since q = 1/(1+r̃), we have r̃ = 1/q - 1
+
+    Args:
+        k: Current capital
+        k_next: Next period capital
+        b: Current debt (repayment)
+        b_next: Next period debt (face value)
+        z: Current productivity
+        q: Bond price in [0, 1/(1+r)]
+        params: Economic parameters
+        temperature: Gate temperature
+        logit_clip: Logit clipping bound
+
+    Returns:
+        e: Cash flow (can be negative, triggering external financing cost)
+    """
+    # Basic cash flow components
+    profit = production_function(k, z, params)
+    investment = compute_investment(k, k_next, params)
+    costs_adjust = adjustment_costs(k, k_next, params, temperature=temperature, logit_clip=logit_clip)
+
+    # Debt proceeds: b' * q (market value of new debt)
+    debt_proceeds = b_next * q
+
+    # Implied risky rate: r̃ = 1/q - 1
+    safe_q = tf.maximum(q, 1e-8)
+    r_tilde = 1.0 / safe_q - 1.0
+
+    # Tax shield: τ·r̃·b'·q / (1+r)
+    # Simplifies to: τ·(1-q)·b' / (1+r) since r̃·q = 1 - q
+    tax_shield = params.tax * r_tilde * debt_proceeds / (1 + params.r_rate)
+
+    # Repayment of old debt
+    debt_repay = b
+
+    # Net cash flow
+    cash_flow = (1 - params.tax) * profit - investment - costs_adjust + debt_proceeds + tax_shield - debt_repay
+
+    return cash_flow

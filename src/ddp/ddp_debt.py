@@ -112,8 +112,13 @@ class DebtModelDDP:
 
         # 1. Investment and Adjustment Costs (z-invariant)
         # Shape: (nk, nk, 1, 1)
+        # Note: Use small temperature for near-hard gates in discrete DP
         investment = logic.compute_investment(k_curr, k_next, params)
-        adj_costs = logic.adjustment_costs(k_curr, k_next, params)
+        adj_costs = logic.adjustment_costs(
+            k_curr, k_next, params,
+            temperature=1e-6,  # Near-hard gate for discrete DP
+            logit_clip=20.0
+        )
 
         # Define function to process a single Z
         def process_z_static(z_val):
@@ -208,7 +213,12 @@ class DebtModelDDP:
             # D. Apply Equity Injection Costs
             # Use shared logic: Cost = is_negative * (Fixed + Linear*|div|)
             # NOTE: external_financing_cost follows outline_v2.md (η₀ + η₁|e|, no k scaling)
-            injection_cost = logic.external_financing_cost(dividends, params)
+            # Note: Use small temperature for near-hard gates in discrete DP
+            injection_cost = logic.external_financing_cost(
+                dividends, params,
+                temperature=1e-6,  # Near-hard gate for discrete DP
+                logit_clip=20.0
+            )
 
             return dividends - injection_cost
 

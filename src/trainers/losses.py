@@ -273,10 +273,8 @@ def compute_br_actor_loss_risky(
     
     Returns:
         Scalar loss
-    
-    Reference: outline_v2.md lines 373-374
     """
-    V_next_avg = 0.5 * (V_next_1 + V_next_2)
+    V_next_avg = V_next_1
     payout = e - eta
     rhs = payout + beta * V_next_avg
     return -tf.reduce_mean(rhs)
@@ -349,44 +347,25 @@ def compute_price_residual(
 def compute_critic_objective(
     br_critic_loss: tf.Tensor,
     price_loss: tf.Tensor,
-    lambda_1: float
+    weight_br: float = 0.1
 ) -> tf.Tensor:
     """
     Combined critic objective for Risky Debt BR training.
-    
-    L_critic = L_BR_critic + lambda_1 * L_price
-    
+
+    L_critic = weight_br * L_BR + L_price
+
+    The price weight is implicitly 1.0 for better numerical stability.
+    BR loss is typically 100x larger than price loss (sums lifetime rewards),
+    so we normalize to price and weight down BR instead.
+
     Args:
         br_critic_loss: Bellman residual critic loss
         price_loss: Price loss
-        lambda_1: Weight on price loss for critic
-    
+        weight_br: Weight on BR loss for critic (default 0.1)
+
     Returns:
         Combined loss
-    
-    Reference: outline_v2.md line 381
-    """
-    return br_critic_loss + lambda_1 * price_loss
 
-
-def compute_actor_objective(
-    br_actor_loss: tf.Tensor,
-    price_loss: tf.Tensor,
-    lambda_2: float
-) -> tf.Tensor:
+    Reference: report_brief.md lines 1062-1063
     """
-    Combined actor objective for Risky Debt BR training.
-    
-    L_actor = L_BR_actor + lambda_2 * L_price
-    
-    Args:
-        br_actor_loss: Bellman residual actor loss
-        price_loss: Price loss
-        lambda_2: Weight on price loss for actor
-    
-    Returns:
-        Combined loss
-    
-    Reference: outline_v2.md line 382
-    """
-    return br_actor_loss + lambda_2 * price_loss
+    return weight_br * br_critic_loss + price_loss

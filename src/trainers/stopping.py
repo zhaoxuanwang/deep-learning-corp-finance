@@ -3,12 +3,12 @@ src/trainers/stopping.py
 
 Convergence and stopping criteria for training loops.
 
-Implements the hierarchical stopping logic from report_brief.md lines 723-784:
+Implements the hierarchical stopping logic from report_brief.md:
 1. Gatekeeper (Annealing): No early stopping before N_anneal
 2. Method-specific stopping rules (post-annealing)
 
 References:
-    report_brief.md lines 723-784: Convergence and Stopping Criteria
+    report_brief.md: Convergence and Stopping Criteria
 """
 
 import logging
@@ -46,8 +46,6 @@ class ConvergenceChecker:
     1. Gatekeeper: If step < n_anneal, ignore all early stopping
     2. Method-specific criteria (LR, ER, BR)
 
-    Reference:
-        report_brief.md lines 723-784
     """
 
     def __init__(
@@ -59,7 +57,8 @@ class ConvergenceChecker:
         lr_window: int = 100,
         er_epsilon: float = 1e-5,
         br_critic_epsilon: float = 1e-5,
-        br_actor_epsilon: float = 1e-4
+        br_actor_epsilon: float = 1e-4,
+        ma_window: int = 20
     ):
         """
         Initialize convergence checker.
@@ -73,6 +72,7 @@ class ConvergenceChecker:
             er_epsilon: Absolute loss threshold for ER
             br_critic_epsilon: Critic loss threshold for BR
             br_actor_epsilon: Actor relative improvement threshold for BR
+            ma_window: Moving average window size for smoothing
         """
         self.method = method.lower()
         self.n_anneal = n_anneal
@@ -84,10 +84,12 @@ class ConvergenceChecker:
         self.er_epsilon = er_epsilon
         self.br_critic_epsilon = br_critic_epsilon
         self.br_actor_epsilon = br_actor_epsilon
+        self.ma_window = ma_window
 
         # State tracking
         self.state = StoppingState()
-        self._lr_loss_buffer = deque(maxlen=lr_window * 2)  # Keep 2x window for comparison
+        # Buffer needs to hold enough for lookback (lr_window) plus averaging (ma_window)
+        self._lr_loss_buffer = deque(maxlen=(lr_window + ma_window) * 2)
 
     def reset(self):
         """Reset convergence state."""
@@ -108,9 +110,6 @@ class ConvergenceChecker:
 
         Returns:
             True if training should stop, False otherwise
-
-        Reference:
-            report_brief.md lines 723-784
         """
         # Step A: Gatekeeper for Annealing
         # If step < n_anneal, ignore all early stopping triggers
@@ -139,8 +138,6 @@ class ConvergenceChecker:
         """
         Check method-specific convergence criteria.
 
-        Reference:
-            report_brief.md lines 747-771
         """
         if self.method == 'lr':
             return self._check_lr_criteria(metrics)
@@ -159,8 +156,6 @@ class ConvergenceChecker:
         Criteria: Stop if relative improvement is negligible:
             (L_LR(j) - L_LR(j-s)) / |L_LR(j-s)| < epsilon_LR
 
-        Reference:
-            report_brief.md lines 747-753
         """
         loss_key = 'loss_LR'
         if loss_key not in metrics:
@@ -169,18 +164,40 @@ class ConvergenceChecker:
         current_loss = metrics[loss_key]
         self._lr_loss_buffer.append(current_loss)
 
-        # Need at least window + 1 samples to compare
-        if len(self._lr_loss_buffer) < self.lr_window + 1:
+        # Need enough samples for current MA and past MA
+        # We need samples at indices: [current], ..., [current - ma_window + 1]
+        # And: [current - lr_window], ..., [current - lr_window - ma_window + 1]
+        # Total history required: lr_window + ma_window
+        if len(self._lr_loss_buffer) < self.lr_window + self.ma_window:
             return False
 
-        # Get loss from lr_window steps ago
-        past_loss = self._lr_loss_buffer[-self.lr_window - 1]
+        # Helper to compute MA ending at specific index (0-based from end of deque)
+        def get_ma(buffer, end_idx, width):
+            # end_idx is 0 for last element, 1 for second to last, etc.
+            # python slicing: buffer[len-1-end_idx : len-1-end_idx-width : -1] is hard with deque
+            # cast to list for slicing validity (deque slicing is limited)
+            data = list(buffer)
+            start = len(data) - 1 - end_idx
+            stop = start - width
+            if stop < -1:
+                segment = data[start::-1][:width] # Take up to width elements backwards
+            else:
+                segment = []
+                for i in range(width):
+                    segment.append(data[start - i])
+            return sum(segment) / len(segment)
+
+        # Current MA: average of last ma_window elements
+        current_ma = get_ma(self._lr_loss_buffer, 0, self.ma_window)
+
+        # Past MA: average of ma_window elements ending at lr_window steps ago
+        past_ma = get_ma(self._lr_loss_buffer, self.lr_window, self.ma_window)
 
         # Relative improvement
-        if abs(past_loss) < 1e-10:
+        if abs(past_ma) < 1e-6:
             return False
 
-        relative_improvement = (current_loss - past_loss) / abs(past_loss)
+        relative_improvement = (current_ma - past_ma) / abs(past_ma)
 
         # For LR, we minimize negative reward, so improvement is when loss decreases
         # A small relative change indicates plateau
@@ -192,8 +209,6 @@ class ConvergenceChecker:
 
         Criteria: L_ER < epsilon_ER
 
-        Reference:
-            report_brief.md lines 755-762
         """
         loss_key = 'loss_ER'
         if loss_key not in metrics:
@@ -212,8 +227,6 @@ class ConvergenceChecker:
             1. Critic Accuracy: Bellman Residual < epsilon_crit
             2. Policy Stability: Actor value relative improvement < epsilon_act
 
-        Reference:
-            report_brief.md lines 764-771
         """
         critic_key = 'loss_critic'
         actor_key = 'loss_actor'
@@ -281,5 +294,6 @@ def create_convergence_checker(
         lr_window=early_stopping_config.lr_window,
         er_epsilon=early_stopping_config.er_epsilon,
         br_critic_epsilon=early_stopping_config.br_critic_epsilon,
-        br_actor_epsilon=early_stopping_config.br_actor_epsilon
+        br_actor_epsilon=early_stopping_config.br_actor_epsilon,
+        ma_window=early_stopping_config.ma_window
     )

@@ -25,7 +25,7 @@ from src.economy.logic import (
     adjustment_costs,
     # Cash flows
     compute_cash_flow_basic,
-    cash_flow_risky_debt,
+    cash_flow_risky_debt_q,
     external_financing_cost,
     # Recovery & default
     recovery_value,
@@ -66,7 +66,7 @@ __all__ = [
     "adjustment_costs",
     # Cash flows
     "compute_cash_flow_basic",
-    "cash_flow_risky_debt",
+    "cash_flow_risky_debt_q",
     "external_financing_cost",
     # Recovery & default
     "recovery_value",

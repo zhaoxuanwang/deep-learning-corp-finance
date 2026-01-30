@@ -118,7 +118,31 @@ class TestBasicBRTrainer:
         assert trainer.policy_net is not None
         assert trainer.value_net is not None
         assert trainer.n_critic_steps == 3
+        assert trainer.n_critic_steps == 3
         assert trainer.polyak_tau == 0.9
+
+    def test_optimizer_injection(self, networks, params, shock_params):
+        """Test that custom optimizers can be injected."""
+        policy_net, value_net = networks
+        
+        # Create custom optimizers
+        opt_actor = tf.keras.optimizers.SGD(learning_rate=0.01)
+        opt_value = tf.keras.optimizers.SGD(learning_rate=0.01)
+        
+        trainer = BasicTrainerBR(
+            policy_net=policy_net,
+            value_net=value_net,
+            params=params,
+            shock_params=shock_params,
+            optimizer_actor=opt_actor,
+            optimizer_value=opt_value
+        )
+        
+        # Verify injected optimizers are used
+        assert trainer.optimizer_policy is opt_actor
+        assert trainer.optimizer_value is opt_value
+        assert isinstance(trainer.optimizer_policy, tf.keras.optimizers.SGD)
+
 
     def test_train_step_with_flattened_data(self, trainer, flat_data):
         """Test train_step accepts flattened data format."""

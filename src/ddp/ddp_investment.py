@@ -100,7 +100,12 @@ class InvestmentModelDDP:
         
         # We can directly use the compute_cash_flow_basic function which wraps
         # Profit - I - Costs
-        net_cash_flow = logic.compute_cash_flow_basic(k_mesh, k_next_mesh, z_mesh, self.params)
+        # Note: Use small temperature for near-hard gates in discrete DP
+        net_cash_flow = logic.compute_cash_flow_basic(
+            k_mesh, k_next_mesh, z_mesh, self.params,
+            temperature=1e-6,  # Near-hard gate for discrete DP
+            logit_clip=20.0
+        )
 
         return net_cash_flow
 

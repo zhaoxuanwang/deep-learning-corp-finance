@@ -36,6 +36,7 @@ class EarlyStoppingConfig:
     # LR Method: Relative Improvement Plateau
     lr_epsilon: float = 1e-4  # Relative improvement threshold
     lr_window: int = 100  # Window size for improvement evaluation
+    ma_window: int = 20  # Moving average window size for smoothing
 
     # ER Method: Zero-Tolerance Plateau
     er_epsilon: float = 1e-5  # Absolute loss threshold
@@ -69,9 +70,10 @@ class AnnealingConfig:
 @dataclass
 class RiskyDebtConfig:
     """Configuration specific to Risky Debt models."""
-    # BR method: price constraint weights
-    lambda_1: float = 1.0
-    lambda_2: float = 1.0
+    # BR method: Bellman residual weight (price weight is implicitly 1.0)
+    # L_critic = weight_br * L_BR + L_price
+    # Default 0.1 because BR loss is typically 100x larger than price loss
+    weight_br: float = 0.1
 
     # LR method: adaptive Lagrange multiplier parameters
     lambda_price_init: float = 1.0
@@ -81,19 +83,14 @@ class RiskyDebtConfig:
     n_value_update_freq: int = 1
     learning_rate_value: Optional[float] = None
 
-    # Default probability smoothing (shared by LR and BR)
-    epsilon_D_0: float = 0.1
-    epsilon_D_min: float = 1e-4
-    decay_d: float = 0.99
+    # NOTE: Default probability smoothing (epsilon_D) is now handled by AnnealingConfig
+    # Use AnnealingConfig in train_risky_br() for temperature annealing
 
 
 @dataclass
 class MethodConfig:
     """
     Configuration for the solution method (Algorithm).
-
-    References:
-        - report_brief.md lines 407-644: Algorithm specifications for LR, ER, BR
     """
     name: str  # e.g., "basic_lr", "basic_er", "risky_br", etc.
     n_critic: int = 5   # Critic updates per actor update (BR methods)
