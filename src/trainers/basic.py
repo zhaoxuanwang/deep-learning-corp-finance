@@ -21,7 +21,12 @@ from src.trainers.losses import (
     compute_br_critic_diagnostics,
     compute_br_actor_loss
 )
-from src.trainers.config import NetworkConfig, OptimizationConfig, AnnealingConfig, MethodConfig, EarlyStoppingConfig
+from src.trainers.config import (
+    NetworkConfig, OptimizationConfig, AnnealingConfig, MethodConfig, EarlyStoppingConfig,
+    create_optimizer,
+    # Centralized defaults - reference these for documentation, actual values come from config
+    DEFAULT_LEARNING_RATE, DEFAULT_POLYAK_TAU, DEFAULT_N_CRITIC, DEFAULT_LOGIT_CLIP
+)
 from src.trainers.core import execute_training_loop
 
 logger = logging.getLogger(__name__)
@@ -43,12 +48,23 @@ class BasicTrainerLR:
         shock_params: ShockParams,
         T: int,
         logit_clip: float,
-        optimizer: Optional[tf.keras.optimizers.Optimizer] = None
+        optimizer: tf.keras.optimizers.Optimizer
     ):
+        """
+        Initialize LR trainer.
+
+        Args:
+            policy_net: Policy network to train.
+            params: Economic parameters.
+            shock_params: Shock process parameters.
+            T: Time horizon.
+            logit_clip: Logit clipping bound for smooth indicators.
+            optimizer: Configured optimizer (use create_optimizer() from config).
+        """
         self.policy_net = policy_net
         self.params = params
         self.shock_params = shock_params
-        self.optimizer = optimizer or tf.keras.optimizers.Adam(1e-3)
+        self.optimizer = optimizer
         self.T = T
         self.logit_clip = logit_clip
         self.beta = 1.0 / (1.0 + params.r_rate)
@@ -182,13 +198,24 @@ class BasicTrainerER:
         policy_net: BasicPolicyNetwork,
         params: EconomicParams,
         shock_params: ShockParams,
-        optimizer: Optional[tf.keras.optimizers.Optimizer] = None,
-        polyak_tau: float = 0.995  # Polyak averaging coefficient
+        optimizer: tf.keras.optimizers.Optimizer,
+        polyak_tau: float
     ):
+        """
+        Initialize ER trainer.
+
+        Args:
+            policy_net: Policy network to train.
+            params: Economic parameters.
+            shock_params: Shock process parameters.
+            optimizer: Configured optimizer (use create_optimizer() from config).
+            polyak_tau: Polyak averaging coefficient for target network updates.
+                Use MethodConfig.polyak_tau (default: DEFAULT_POLYAK_TAU = 0.995).
+        """
         self.policy_net = policy_net
         self.params = params
         self.shock_params = shock_params
-        self.optimizer = optimizer or tf.keras.optimizers.Adam(1e-3)
+        self.optimizer = optimizer
         self.beta = 1.0 / (1.0 + params.r_rate)
         self.polyak_tau = polyak_tau
 
@@ -250,12 +277,17 @@ class BasicTrainerER:
         Uses flattened i.i.d. transitions with All-in-One (AiO) estimator.
         Computes two-step lookahead k'' using TARGET policy for stability.
 
-        Algorithm (report_brief.md lines 494-519):
+        Algorithm (report_brief.md lines 605-642):
         1. Current Step (Trainable): k' = π(k, z; θ) and χ = 1 + ψ_I(I, k)
         2. Future Step (Target): k'' = π(k', z'; θ⁻) for both forks
-        3. Compute residuals: f = χ - β * m where m = π_k - ψ_k + (1-δ)χ'
+        3. Compute unit-free residuals: f = 1 - β * m / χ
+           where m = π_k - ψ_k + (1-δ)χ'
         4. AiO Loss: L_ER = mean(f_main * f_fork)
         5. Update θ and then update θ⁻ with Polyak averaging
+
+        Reference:
+            report_brief.md lines 601-604: Unit-free Euler residual formula
+            f_{i,ℓ} = 1 - β * m(k', k'', z') / (1 + ψ_I(I, k))
 
         Args:
             k: Current capital (batch_size,) - independent samples from ergodic distribution
@@ -287,16 +319,21 @@ class BasicTrainerER:
             # Compute k'' using TARGET policy for stability (DDPG-style)
             k_next_next_main = self.target_policy_net(k_next, z_next_main)
             m_main = euler_m(k_next, k_next_next_main, z_next_main, self.params)
-            f_main = chi - self.beta * m_main
 
             # === FUTURE STEP - FORK PATH (Target Policy) ===
             k_next_next_fork = self.target_policy_net(k_next, z_next_fork)
             m_fork = euler_m(k_next, k_next_next_fork, z_next_fork, self.params)
-            f_fork = chi - self.beta * m_fork
+
+            # === UNIT-FREE EULER RESIDUALS ===
+            # Reference: report_brief.md lines 601-604
+            # f = 1 - β * m / χ (unit-free form)
+            safe_chi = tf.maximum(chi, 1e-8)  # Avoid division by zero
+            f_main = 1.0 - self.beta * m_main / safe_chi
+            f_fork = 1.0 - self.beta * m_fork / safe_chi
 
             # === AiO LOSS ===
             # L_ER = mean(f_main * f_fork)
-            # Reference: report_brief.md line 516
+            # Reference: report_brief.md lines 599-600
             loss = compute_er_loss_aio(f_main, f_fork)
 
         # Update current policy
@@ -347,11 +384,14 @@ class BasicTrainerER:
         # Future step (target policy)
         k_next_next_main = self.target_policy_net(k_next, z_next_main)
         m_main = euler_m(k_next, k_next_next_main, z_next_main, self.params)
-        f_main = chi - self.beta * m_main
 
         k_next_next_fork = self.target_policy_net(k_next, z_next_fork)
         m_fork = euler_m(k_next, k_next_next_fork, z_next_fork, self.params)
-        f_fork = chi - self.beta * m_fork
+
+        # Unit-free Euler residuals: f = 1 - β * m / χ
+        safe_chi = tf.maximum(chi, 1e-8)
+        f_main = 1.0 - self.beta * m_main / safe_chi
+        f_fork = 1.0 - self.beta * m_fork / safe_chi
 
         loss = compute_er_loss_aio(f_main, f_fork)
 
@@ -384,20 +424,35 @@ class BasicTrainerBR:
         value_net: BasicValueNetwork,
         params: EconomicParams,
         shock_params: ShockParams,
-        actor_learning_rate: float = 1e-3,
-        critic_learning_rate: float = 1e-3,
-        optimizer_actor: Optional[tf.keras.optimizers.Optimizer] = None,
-        optimizer_value: Optional[tf.keras.optimizers.Optimizer] = None,
-        n_critic_steps: int = 20,
-        logit_clip: float = 20.0,
-        polyak_tau: float = 0.995  # Polyak averaging coefficient
+        optimizer_actor: tf.keras.optimizers.Optimizer,
+        optimizer_value: tf.keras.optimizers.Optimizer,
+        n_critic_steps: int,
+        logit_clip: float,
+        polyak_tau: float
     ):
+        """
+        Initialize BR (Actor-Critic) trainer.
+
+        Args:
+            policy_net: Policy (actor) network to train.
+            value_net: Value (critic) network to train.
+            params: Economic parameters.
+            shock_params: Shock process parameters.
+            optimizer_actor: Configured optimizer for actor (use create_optimizer()).
+            optimizer_value: Configured optimizer for critic (use create_optimizer()).
+            n_critic_steps: Number of critic updates per actor update.
+                Use MethodConfig.n_critic (default: DEFAULT_N_CRITIC = 5).
+            logit_clip: Logit clipping bound for smooth indicators.
+                Use AnnealingConfig.logit_clip (default: DEFAULT_LOGIT_CLIP = 20.0).
+            polyak_tau: Polyak averaging coefficient for target network updates.
+                Use MethodConfig.polyak_tau (default: DEFAULT_POLYAK_TAU = 0.995).
+        """
         self.policy_net = policy_net
         self.value_net = value_net
         self.params = params
         self.shock_params = shock_params
-        self.optimizer_policy = optimizer_actor or tf.keras.optimizers.Adam(actor_learning_rate)
-        self.optimizer_value = optimizer_value or tf.keras.optimizers.Adam(critic_learning_rate)
+        self.optimizer_policy = optimizer_actor
+        self.optimizer_value = optimizer_value
         self.n_critic_steps = n_critic_steps
         self.logit_clip = logit_clip
         self.beta = 1.0 / (1.0 + params.r_rate)
@@ -778,8 +833,8 @@ def train_basic_lr(
         activation=net_config.activation
     )
 
-    # 2. Setup Trainer
-    optimizer = tf.keras.optimizers.Adam(learning_rate=opt_config.learning_rate)
+    # 2. Setup Trainer with gradient clipping support
+    optimizer = create_optimizer(opt_config.learning_rate, opt_config.optimizer)
     trainer = BasicTrainerLR(
         policy_net=policy_net,
         params=params,
@@ -885,12 +940,15 @@ def train_basic_er(
         activation=net_config.activation
     )
 
+    # Create optimizer with gradient clipping support
+    optimizer = create_optimizer(opt_config.learning_rate, opt_config.optimizer)
+
     trainer = BasicTrainerER(
         policy_net=policy_net,
         params=params,
         shock_params=shock_params,
-        optimizer=tf.keras.optimizers.Adam(opt_config.learning_rate),
-        polyak_tau=method_config.polyak_tau if hasattr(method_config, 'polyak_tau') else 0.995
+        optimizer=optimizer,
+        polyak_tau=method_config.polyak_tau
     )
 
     # Setup validation function (for early stopping)
@@ -994,24 +1052,24 @@ def train_basic_br(
         activation=net_config.activation
     )
 
+    # Determine learning rates (critic defaults to actor LR if not specified)
     actor_lr = opt_config.learning_rate
-    critic_lr = opt_config.learning_rate_critic if hasattr(opt_config, 'learning_rate_critic') and opt_config.learning_rate_critic else opt_config.learning_rate
+    critic_lr = opt_config.learning_rate_critic if opt_config.learning_rate_critic else opt_config.learning_rate
 
-    optimizer_actor = tf.keras.optimizers.Adam(learning_rate=actor_lr)
-    optimizer_value = tf.keras.optimizers.Adam(learning_rate=critic_lr)
+    # Create optimizers with gradient clipping support
+    optimizer_actor = create_optimizer(actor_lr, opt_config.optimizer)
+    optimizer_value = create_optimizer(critic_lr, opt_config.optimizer)
 
     trainer = BasicTrainerBR(
         policy_net=policy_net,
         value_net=value_net,
         params=params,
         shock_params=shock_params,
-        actor_learning_rate=actor_lr,
-        critic_learning_rate=critic_lr,
         optimizer_actor=optimizer_actor,
         optimizer_value=optimizer_value,
         n_critic_steps=method_config.n_critic,
         logit_clip=anneal_config.logit_clip,
-        polyak_tau=method_config.polyak_tau if hasattr(method_config, 'polyak_tau') else 0.995
+        polyak_tau=method_config.polyak_tau
     )
 
     # Setup validation function (for early stopping)

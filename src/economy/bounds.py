@@ -1,18 +1,78 @@
 """
 src/economy/bounds.py
 
-Utilities for computing natural sampling bounds based on economic parameters.
+Utilities for computing normalized sampling bounds based on economic parameters.
 Used to determine safe regions for state space sampling (grids or DNN training).
+
+Key Design (report_brief.md lines 84-122):
+- Capital bounds are NORMALIZED as multipliers on k* (steady-state capital at z=e^μ)
+- k_min, k_max are multipliers such that k ∈ [k_min * k*, k_max * k*] in levels
+- For training, we work in normalized space where k ∈ [k_min, k_max]
+- k* is stored separately for de-normalization after training
+- Debt bounds are also normalized: b_max = π(k_max, z_max)/k_max + 1
+
+Input Constraints (validated in BoundsConfig):
+- m ∈ (2, 5): Standard deviations for log_z bounds
+- k_min ∈ (0, 0.5): Normalized lower bound on capital
+- k_max ∈ (1.5, 5): Normalized upper bound on capital
 """
 
 import numpy as np
 import logging
 from typing import Tuple, Optional, Dict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from src.economy.parameters import EconomicParams, ShockParams
 import warnings
 
 logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# BOUNDS CONFIGURATION
+# =============================================================================
+
+@dataclass
+class BoundsConfig:
+    """
+    Configuration for state space bounds with input validation.
+
+    All bounds are specified as MULTIPLIERS on the steady-state k* value,
+    enabling normalized training that avoids gradient explosion.
+
+    Reference:
+        report_brief.md lines 104-122: Summary of bounds module
+
+    Attributes:
+        m: Standard deviation multiplier for log_z bounds (2 < m < 5)
+        k_min: Capital lower bound as multiplier on k* (0 < k_min < 0.5)
+        k_max: Capital upper bound as multiplier on k* (1.5 < k_max < 5)
+        k_star_override: Optional override for steady-state k* calculation
+    """
+    m: float = 3.0
+    k_min: float = 0.2
+    k_max: float = 3.0
+    k_star_override: Optional[float] = None
+
+    def __post_init__(self):
+        """Validate bounds constraints per report_brief.md lines 111-114."""
+        if not (2.0 < self.m < 5.0):
+            raise ValueError(
+                f"m (std_dev_multiplier) must be in (2, 5), got {self.m}. "
+                f"This ensures log_z bounds cover the ergodic distribution "
+                f"while avoiding extreme rare events."
+            )
+        if not (0.0 < self.k_min < 0.5):
+            raise ValueError(
+                f"k_min must be in (0, 0.5), got {self.k_min}. "
+                f"This ensures normalized capital space avoids zero "
+                f"while allowing for small initial capital."
+            )
+        if not (1.5 < self.k_max < 5.0):
+            raise ValueError(
+                f"k_max must be in (1.5, 5), got {self.k_max}. "
+                f"This ensures normalized capital space covers above steady-state "
+                f"while avoiding gradient explosion."
+            )
 
 
 def compute_ergodic_log_z_bounds(
@@ -48,6 +108,90 @@ def compute_ergodic_log_z_bounds(
     return float(min_log_z), float(max_log_z)
 
 
+def compute_k_star(
+    theta: float,
+    r: float,
+    delta: float,
+    mu: float
+) -> float:
+    """
+    Compute steady-state capital k* at the stationary mean productivity z = e^μ.
+
+    The steady-state condition is MPK = r + δ:
+        k* = ((z * θ) / (r + δ)) ^ (1/(1-θ))
+
+    Reference:
+        report_brief.md lines 71-74: Steady-state capital formula
+
+    Args:
+        theta: Production elasticity (γ in the report)
+        r: Risk-free rate
+        delta: Depreciation rate
+        mu: Unconditional mean of log(z) (stationary mean)
+
+    Returns:
+        k_star: Steady-state capital level at z = e^μ
+    """
+    z_mean = np.exp(mu)
+    denom = r + delta
+
+    if denom <= 0:
+        logger.warning(f"r + delta = {denom} <= 0. Using fallback k_star = 1.0")
+        return 1.0
+
+    k_star = ((z_mean * theta) / denom) ** (1 / (1 - theta))
+    return float(k_star)
+
+
+def compute_normalized_k_bounds(
+    k_min_multiplier: float,
+    k_max_multiplier: float,
+    theta: float,
+    r: float,
+    delta: float,
+    mu: float,
+    k_star_override: Optional[float] = None
+) -> Tuple[Tuple[float, float], float]:
+    """
+    Compute normalized capital bounds as multipliers on k*.
+
+    In the normalized space, k ∈ [k_min, k_max] where the multipliers
+    represent fractions of the steady-state capital k*.
+
+    To recover level capital: k_level = k_normalized * k_star
+
+    Reference:
+        report_brief.md lines 89-94: Normalization approach
+
+    Args:
+        k_min_multiplier: Lower bound multiplier (0 < k_min < 0.5)
+        k_max_multiplier: Upper bound multiplier (1.5 < k_max < 5)
+        theta: Production elasticity
+        r: Risk-free rate
+        delta: Depreciation rate
+        mu: Unconditional mean of log(z)
+        k_star_override: Optional override for k* (if None, computed from params)
+
+    Returns:
+        Tuple of:
+            - k_bounds: (k_min, k_max) as normalized multipliers
+            - k_star: Steady-state capital for de-normalization
+    """
+    # Compute or use override for k*
+    if k_star_override is not None:
+        k_star = k_star_override
+        logger.info(f"Using k_star override: {k_star:.4f}")
+    else:
+        k_star = compute_k_star(theta, r, delta, mu)
+        logger.debug(f"Auto-computed k_star = {k_star:.4f} at z = e^{mu:.4f}")
+
+    # In normalized space, bounds ARE the multipliers
+    k_bounds = (float(k_min_multiplier), float(k_max_multiplier))
+
+    return k_bounds, k_star
+
+
+# Legacy function for backward compatibility
 def compute_natural_k_bounds(
     theta: float,
     r: float,
@@ -57,12 +201,15 @@ def compute_natural_k_bounds(
     k_max_multiplier: float
 ) -> Tuple[float, float]:
     """
-    Compute natural bounds for capital k based on steady-state logic.
-    
-    k* = ((z * theta) / (r + delta)) ^ (1/(1-theta))
-    k_min = multiplier_min * k*(z_min)
-    k_max = multiplier_max * k*(z_max)
-    
+    [DEPRECATED] Compute natural bounds for capital k based on steady-state logic.
+
+    NOTE: This function is deprecated. Use compute_normalized_k_bounds() instead.
+    The new approach computes k* at the stationary mean z=e^μ and returns
+    normalized bounds as multipliers.
+
+    This legacy function computes k* at z_min and z_max separately, which
+    leads to non-normalized bounds that can cause gradient explosion.
+
     Args:
         theta: Production elasticity
         r: Risk-free rate
@@ -70,53 +217,97 @@ def compute_natural_k_bounds(
         log_z_bounds: (min_log_z, max_log_z)
         k_min_multiplier: Factor for lower bound
         k_max_multiplier: Factor for upper bound
-    
+
     Returns:
-        (k_min, k_max)
+        (k_min, k_max) in LEVEL space (not normalized)
     """
+    warnings.warn(
+        "compute_natural_k_bounds is deprecated. Use compute_normalized_k_bounds() "
+        "which returns normalized bounds as multipliers on k*.",
+        DeprecationWarning,
+        stacklevel=2
+    )
+
     min_log_z, max_log_z = log_z_bounds
-    
+
     z_min = np.exp(min_log_z)
     z_max = np.exp(max_log_z)
 
     # Helper for steady state k given z
     def get_k_star(z_val):
-        # Prevent division by zero or negative base if parameters are extreme
-        # (Though parameters should be validated in EconomicParams)
         denom = r + delta
         if denom <= 0:
-            return 1.0 # Fallback
+            return 1.0  # Fallback
         return ((z_val * theta) / denom) ** (1 / (1 - theta))
-    
+
     k_star_low = get_k_star(z_min)
     k_star_high = get_k_star(z_max)
-    
+
     k_min = k_min_multiplier * k_star_low
     k_max = k_max_multiplier * k_star_high
-    
+
     return float(k_min), float(k_max)
 
 
+def compute_normalized_b_bound(
+    theta: float,
+    k_max: float,
+    z_max: float
+) -> float:
+    """
+    Compute normalized borrowing limit (b_max).
+
+    In the normalized space where capital is measured as multiplier on k*:
+        b_max = π(k_max, z_max) / k_max + 1
+              = z_max * k_max^θ / k_max + 1
+              = z_max * k_max^(θ-1) + 1
+
+    This ensures debt bounds are consistent with normalized capital space.
+
+    Reference:
+        report_brief.md lines 96-100: Normalized b_max formula
+
+    Args:
+        theta: Production elasticity (θ in the report)
+        k_max: Maximum capital as NORMALIZED multiplier (not level)
+        z_max: Maximum productivity LEVEL (not log)
+
+    Returns:
+        b_max: Normalized borrowing limit
+    """
+    # π(k_max, z_max) / k_max + 1 = z_max * k_max^(θ-1) + 1
+    b_max = z_max * (k_max ** (theta - 1)) + 1
+    return float(b_max)
+
+
+# Legacy function for backward compatibility
 def compute_natural_b_bound(
     theta: float,
     k_max: float,
     z_max: float
 ) -> float:
     """
-    Compute natural borrowing limit (B_max).
-    
+    [DEPRECATED] Compute natural borrowing limit (B_max) in level space.
+
+    NOTE: This function is deprecated. Use compute_normalized_b_bound() instead.
+    The new approach uses normalized bounds consistent with the k* normalization.
+
     B_max = z_max * (k_max)^theta + k_max
-    
-    Represents maximum repayable amount in best state with full liquidation.
-    
+
     Args:
         theta: Production elasticity
-        k_max: Maximum capital bound
+        k_max: Maximum capital bound (LEVEL, not normalized)
         z_max: Maximum productivity (level, not log)
-        
+
     Returns:
-        b_max (float)
+        b_max (float) in LEVEL space
     """
+    warnings.warn(
+        "compute_natural_b_bound is deprecated. Use compute_normalized_b_bound() "
+        "which returns normalized bounds consistent with k* normalization.",
+        DeprecationWarning,
+        stacklevel=2
+    )
     prod = z_max * (k_max ** theta)
     return float(prod + k_max)
 
@@ -128,52 +319,132 @@ def generate_states_bounds(
     shock_params: ShockParams,
     std_dev_multiplier: float,
     k_min_multiplier: float,
-    k_max_multiplier: float
-) -> Dict[str, Tuple[float, float]]:
+    k_max_multiplier: float,
+    k_star_override: Optional[float] = None,
+    validate: bool = True
+) -> Dict[str, any]:
     """
-    Generate consistent sampling bounds for (k, b, z).
-    
-    The bounds are generated sequentially to ensure consistency:
-    1. log_z_bounds: computed from ergodic distribution (mu +/- m*sigma_ergodic)
-    2. k_bounds: computed from steady-state k*(z) at z_min/z_max using multipliers
-    3. b_bounds: b_max computed from max repayment capacity at z_max, k_max
-    
+    Generate consistent NORMALIZED sampling bounds for (k, b, z).
+
+    All bounds are in normalized space suitable for DNN training:
+    - k ∈ [k_min, k_max] as multipliers on k* (steady-state capital)
+    - b ∈ [0, b_max] normalized using π(k_max, z_max)/k_max + 1
+    - log_z ∈ [μ - m·σ_ergodic, μ + m·σ_ergodic]
+
+    The function also returns k_star for de-normalization after training.
+
+    Reference:
+        report_brief.md lines 104-122: Summary of bounds module
+
     Args:
-        theta: Production elasticity
+        theta: Production elasticity (γ in the report)
         r: Risk-free rate
         delta: Depreciation rate
-        std_dev_multiplier: Multiplier for log z bounds
-        k_min_multiplier: Multiplier for k_min
-        k_max_multiplier: Multiplier for k_max
-        
+        shock_params: AR(1) shock parameters (μ, σ, ρ)
+        std_dev_multiplier: m, number of std devs for log_z bounds (2 < m < 5)
+        k_min_multiplier: k_min as multiplier on k* (0 < k_min < 0.5)
+        k_max_multiplier: k_max as multiplier on k* (1.5 < k_max < 5)
+        k_star_override: Optional override for k* (if None, auto-computed)
+        validate: If True, validate input constraints per report_brief.md
+
     Returns:
-        SamplingBounds objects properly configured
+        Dict containing:
+            - "k": (k_min, k_max) normalized capital bounds
+            - "b": (0, b_max) normalized debt bounds
+            - "log_z": (log_z_min, log_z_max) shock bounds
+            - "k_star": steady-state capital for de-normalization
+
+    Raises:
+        ValueError: If validate=True and constraints are violated
     """
-    # 1. Z bounds
+    # Validate input constraints if requested
+    if validate:
+        if not (2.0 < std_dev_multiplier < 5.0):
+            raise ValueError(
+                f"std_dev_multiplier (m) must be in (2, 5), got {std_dev_multiplier}"
+            )
+        if not (0.0 < k_min_multiplier < 0.5):
+            raise ValueError(
+                f"k_min_multiplier must be in (0, 0.5), got {k_min_multiplier}"
+            )
+        if not (1.5 < k_max_multiplier < 5.0):
+            raise ValueError(
+                f"k_max_multiplier must be in (1.5, 5), got {k_max_multiplier}"
+            )
+
+    # 1. Z bounds (unchanged from original)
     log_z_bounds = compute_ergodic_log_z_bounds(
-        shock_params, 
+        shock_params,
         std_dev_multiplier=std_dev_multiplier
     )
-    
-    # 2. K bounds (depend on Z bounds)
-    k_bounds = compute_natural_k_bounds(
-        theta, r, delta,
-        log_z_bounds,
+
+    # 2. K bounds (NORMALIZED) - compute k* at stationary mean z = e^μ
+    k_bounds, k_star = compute_normalized_k_bounds(
         k_min_multiplier=k_min_multiplier,
-        k_max_multiplier=k_max_multiplier
+        k_max_multiplier=k_max_multiplier,
+        theta=theta,
+        r=r,
+        delta=delta,
+        mu=shock_params.mu,
+        k_star_override=k_star_override
     )
-    
-    # 3. B bounds (depend on Z max and K max)
-    # b_min is always 0.0 for now
-    _, k_max = k_bounds
+
+    # 3. B bounds (NORMALIZED) - uses normalized k_max and z_max level
     _, log_z_max = log_z_bounds
     z_max = np.exp(log_z_max)
-    
-    b_max = compute_natural_b_bound(theta, k_max, z_max)
+    _, k_max = k_bounds
+
+    b_max = compute_normalized_b_bound(theta, k_max, z_max)
     b_bounds = (0.0, b_max)
-    
+
+    logger.debug(
+        f"Generated normalized bounds: k={k_bounds}, b={b_bounds}, "
+        f"log_z={log_z_bounds}, k_star={k_star:.4f}"
+    )
+
     return {
         "k": k_bounds,
         "b": b_bounds,
-        "log_z": log_z_bounds
+        "log_z": log_z_bounds,
+        "k_star": k_star
     }
+
+
+# =============================================================================
+# CONVENIENCE FUNCTION WITH BOUNDS CONFIG
+# =============================================================================
+
+def generate_bounds_from_config(
+    bounds_config: BoundsConfig,
+    theta: float,
+    r: float,
+    delta: float,
+    shock_params: ShockParams
+) -> Dict[str, any]:
+    """
+    Generate bounds using a BoundsConfig object.
+
+    This is a convenience wrapper around generate_states_bounds that
+    uses the validated BoundsConfig dataclass for input.
+
+    Args:
+        bounds_config: Validated bounds configuration
+        theta: Production elasticity
+        r: Risk-free rate
+        delta: Depreciation rate
+        shock_params: AR(1) shock parameters
+
+    Returns:
+        Dict with 'k', 'b', 'log_z', and 'k_star' keys
+    """
+    return generate_states_bounds(
+        theta=theta,
+        r=r,
+        delta=delta,
+        shock_params=shock_params,
+        std_dev_multiplier=bounds_config.m,
+        k_min_multiplier=bounds_config.k_min,
+        k_max_multiplier=bounds_config.k_max,
+        k_star_override=bounds_config.k_star_override,
+        validate=False  # Already validated in BoundsConfig.__post_init__
+    )

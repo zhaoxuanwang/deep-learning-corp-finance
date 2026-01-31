@@ -212,10 +212,10 @@ class DebtModelDDP:
 
             # D. Apply Equity Injection Costs
             # Use shared logic: Cost = is_negative * (Fixed + Linear*|div|)
-            # NOTE: external_financing_cost follows outline_v2.md (η₀ + η₁|e|, no k scaling)
+            # NOTE: indicator is evaluated on normalized e/k per report_brief.md lines 432-433
             # Note: Use small temperature for near-hard gates in discrete DP
             injection_cost = logic.external_financing_cost(
-                dividends, params,
+                dividends, k_safe, params,
                 temperature=1e-6,  # Near-hard gate for discrete DP
                 logit_clip=20.0
             )

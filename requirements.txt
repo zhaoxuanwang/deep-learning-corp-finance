@@ -24,8 +24,9 @@ protobuf==4.25.8
 termcolor==3.2.0
 wrapt==2.0.1
 
-# Numerical Computing
+# Numerical Computing & Data
 numpy==1.26.4
+pandas>=2.0.0  # Used by ExperimentConfig.summary() and notebooks
 
 # Visualization
 matplotlib==3.10.0

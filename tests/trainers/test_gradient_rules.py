@@ -31,7 +31,7 @@ class TestStopGradientRules:
         """Critic step should not produce gradients for policy params."""
         policy_net = BasicPolicyNetwork(k_min=0.01, k_max=10.0, n_layers=2, n_neurons=8, activation="swish")
         value_net = BasicValueNetwork(n_layers=2, n_neurons=8, activation="swish")
-        
+
         # Build networks
         k_dummy = tf.constant([[1.0]])
         z_dummy = tf.constant([[1.0]])
@@ -40,11 +40,17 @@ class TestStopGradientRules:
 
         params = EconomicParams()
         shock_params = ShockParams()
-        
+
         trainer = BasicTrainerBR(
-            policy_net, value_net, params,
+            policy_net=policy_net,
+            value_net=value_net,
+            params=params,
             shock_params=shock_params,
-            n_critic_steps=1
+            optimizer_actor=tf.keras.optimizers.Adam(learning_rate=1e-3),
+            optimizer_value=tf.keras.optimizers.Adam(learning_rate=1e-3),
+            n_critic_steps=1,
+            logit_clip=20.0,
+            polyak_tau=0.995
         )
         pass 
     
@@ -61,11 +67,17 @@ class TestStopGradientRules:
 
         params = EconomicParams()
         shock_params = ShockParams()
-        
+
         trainer = BasicTrainerBR(
-            policy_net, value_net, params,
+            policy_net=policy_net,
+            value_net=value_net,
+            params=params,
             shock_params=shock_params,
-            n_critic_steps=1
+            optimizer_actor=tf.keras.optimizers.Adam(learning_rate=1e-3),
+            optimizer_value=tf.keras.optimizers.Adam(learning_rate=1e-3),
+            n_critic_steps=1,
+            logit_clip=20.0,
+            polyak_tau=0.995
         )
         pass
 

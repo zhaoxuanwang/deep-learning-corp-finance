@@ -210,10 +210,23 @@ def execute_training_loop(
             
             # Console Log (less frequent)
             if i % (opt_config.log_every * 10) == 0:
-                 # Find a loss key to print
-                 loss_keys = [k for k in metrics.keys() if "loss" in k]
-                 loss_str = f"{loss_keys[0]}={metrics[loss_keys[0]]:.4f}" if loss_keys else ""
-                 logger.info(f"Iter {i}: {loss_str} Anneal_log={np.log10(current_temp):.2f}")
+                 # Find all loss keys and format them
+                 loss_keys = sorted([k for k in metrics.keys() if "loss" in k.lower()])
+
+                 if loss_keys:
+                     # For methods with multiple losses (BR, Risky BR), show all
+                     # For single-loss methods (LR, ER), show just one
+                     if len(loss_keys) == 1:
+                         loss_str = f"{loss_keys[0]}={metrics[loss_keys[0]]:.4f}"
+                     else:
+                         # Multiple losses: show all with abbreviated names
+                         # Remove 'loss_' prefix for cleaner display
+                         loss_parts = [f"{k.replace('loss_', '')}={metrics[k]:.4f}" for k in loss_keys]
+                         loss_str = " ".join(loss_parts)
+                 else:
+                     loss_str = ""
+
+                 logger.info(f"Iter {i}: {loss_str} Temp (log10)={np.log10(current_temp):.2f}")
         
         # Update annealing state
         anneal.update()

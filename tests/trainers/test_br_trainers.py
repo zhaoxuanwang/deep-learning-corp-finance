@@ -101,7 +101,10 @@ def trainer(networks, params, shock_params):
         value_net=value_net,
         params=params,
         shock_params=shock_params,
+        optimizer_actor=tf.keras.optimizers.Adam(learning_rate=1e-3),
+        optimizer_value=tf.keras.optimizers.Adam(learning_rate=1e-3),
         n_critic_steps=3,
+        logit_clip=20.0,
         polyak_tau=0.9  # Lower for easier testing
     )
 
@@ -124,20 +127,23 @@ class TestBasicBRTrainer:
     def test_optimizer_injection(self, networks, params, shock_params):
         """Test that custom optimizers can be injected."""
         policy_net, value_net = networks
-        
+
         # Create custom optimizers
         opt_actor = tf.keras.optimizers.SGD(learning_rate=0.01)
         opt_value = tf.keras.optimizers.SGD(learning_rate=0.01)
-        
+
         trainer = BasicTrainerBR(
             policy_net=policy_net,
             value_net=value_net,
             params=params,
             shock_params=shock_params,
             optimizer_actor=opt_actor,
-            optimizer_value=opt_value
+            optimizer_value=opt_value,
+            n_critic_steps=3,
+            logit_clip=20.0,
+            polyak_tau=0.9
         )
-        
+
         # Verify injected optimizers are used
         assert trainer.optimizer_policy is opt_actor
         assert trainer.optimizer_value is opt_value
@@ -279,7 +285,10 @@ class TestBRTargetNetworks:
             value_net=value_net,
             params=params,
             shock_params=shock_params,
+            optimizer_actor=tf.keras.optimizers.Adam(learning_rate=1e-3),
+            optimizer_value=tf.keras.optimizers.Adam(learning_rate=1e-3),
             n_critic_steps=2,
+            logit_clip=20.0,
             polyak_tau=0.99  # Slow updates
         )
 
@@ -304,7 +313,10 @@ class TestBRTargetNetworks:
             value_net=value_net2,
             params=params,
             shock_params=shock_params,
+            optimizer_actor=tf.keras.optimizers.Adam(learning_rate=1e-3),
+            optimizer_value=tf.keras.optimizers.Adam(learning_rate=1e-3),
             n_critic_steps=2,
+            logit_clip=20.0,
             polyak_tau=0.5  # Fast updates
         )
 
@@ -354,7 +366,10 @@ class TestBRCriticUpdate:
             value_net=value_net,
             params=params,
             shock_params=shock_params,
+            optimizer_actor=tf.keras.optimizers.Adam(learning_rate=1e-3),
+            optimizer_value=tf.keras.optimizers.Adam(learning_rate=1e-3),
             n_critic_steps=1,
+            logit_clip=20.0,
             polyak_tau=0.9
         )
 
@@ -379,7 +394,10 @@ class TestBRCriticUpdate:
             value_net=value_net2,
             params=params,
             shock_params=shock_params,
+            optimizer_actor=tf.keras.optimizers.Adam(learning_rate=1e-3),
+            optimizer_value=tf.keras.optimizers.Adam(learning_rate=1e-3),
             n_critic_steps=5,
+            logit_clip=20.0,
             polyak_tau=0.9
         )
 

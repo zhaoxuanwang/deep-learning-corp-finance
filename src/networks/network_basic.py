@@ -103,6 +103,17 @@ class BasicPolicyNetwork(tf.keras.Model):
         """Create instance from configuration."""
         return cls(**config)
 
+    def build_from_config(self, config):
+        """Build model state from config (for Keras serialization)."""
+        # Build by calling with dummy inputs
+        dummy_k = tf.constant([[1.0]], dtype=tf.float32)
+        dummy_z = tf.constant([[1.0]], dtype=tf.float32)
+        self(dummy_k, dummy_z)
+
+    def get_build_config(self):
+        """Return build configuration."""
+        return self.get_config()
+
 
 class BasicValueNetwork(tf.keras.Model):
     """
@@ -172,6 +183,16 @@ class BasicValueNetwork(tf.keras.Model):
     def from_config(cls, config):
         """Create instance from configuration."""
         return cls(**config)
+
+    def build_from_config(self, config):
+        """Build model state from config (for Keras serialization)."""
+        dummy_k = tf.constant([[1.0]], dtype=tf.float32)
+        dummy_z = tf.constant([[1.0]], dtype=tf.float32)
+        self(dummy_k, dummy_z)
+
+    def get_build_config(self):
+        """Return build configuration."""
+        return self.get_config()
 
 
 def build_basic_networks(

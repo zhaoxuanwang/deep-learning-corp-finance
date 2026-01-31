@@ -16,12 +16,19 @@ class TestAnnealingSchedule:
     
     def test_init_defaults(self):
         """Default initialization creates valid schedule."""
+        # All defaults are sourced from src/_defaults.py
+        from src._defaults import (
+            DEFAULT_TEMPERATURE_INIT,
+            DEFAULT_TEMPERATURE_MIN,
+            DEFAULT_ANNEAL_DECAY,
+            DEFAULT_ANNEAL_BUFFER
+        )
         schedule = AnnealingSchedule()
-        assert schedule.init_temp == 2.0  # Updated to match actual default
-        assert schedule.min_temp == 0.0001
-        assert schedule.decay_rate == 0.995  # Updated to match actual default
-        assert schedule.buffer == 0.25
-        assert schedule.value == 2.0  # Updated to match init_temp
+        assert schedule.init_temp == DEFAULT_TEMPERATURE_INIT  # 1.0
+        assert schedule.min_temp == DEFAULT_TEMPERATURE_MIN    # 1e-4
+        assert schedule.decay_rate == DEFAULT_ANNEAL_DECAY     # 0.995
+        assert schedule.buffer == DEFAULT_ANNEAL_BUFFER        # 0.25
+        assert schedule.value == DEFAULT_TEMPERATURE_INIT      # starts at init_temp
         assert schedule.step == 0
     
     def test_n_anneal_calculation(self):

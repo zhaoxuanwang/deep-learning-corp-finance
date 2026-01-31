@@ -77,7 +77,18 @@ class RiskyPolicyNetwork(tf.keras.Model):
     def from_config(cls, config):
         """Create from config."""
         return cls(**config)
-    
+
+    def build_from_config(self, config):
+        """Build model state from config (for Keras serialization)."""
+        dummy_k = tf.constant([[1.0]], dtype=tf.float32)
+        dummy_b = tf.constant([[0.5]], dtype=tf.float32)
+        dummy_z = tf.constant([[1.0]], dtype=tf.float32)
+        self(dummy_k, dummy_b, dummy_z)
+
+    def get_build_config(self):
+        """Return build configuration."""
+        return self.get_config()
+
     def call(
         self, k: tf.Tensor, b: tf.Tensor, z: tf.Tensor
     ) -> Tuple[tf.Tensor, tf.Tensor]:
@@ -164,7 +175,18 @@ class RiskyValueNetwork(tf.keras.Model):
     def from_config(cls, config):
         """Create from config."""
         return cls(**config)
-    
+
+    def build_from_config(self, config):
+        """Build model state from config (for Keras serialization)."""
+        dummy_k = tf.constant([[1.0]], dtype=tf.float32)
+        dummy_b = tf.constant([[0.5]], dtype=tf.float32)
+        dummy_z = tf.constant([[1.0]], dtype=tf.float32)
+        self(dummy_k, dummy_b, dummy_z)
+
+    def get_build_config(self):
+        """Return build configuration."""
+        return self.get_config()
+
     def call(self, k: tf.Tensor, b: tf.Tensor, z: tf.Tensor) -> tf.Tensor:
         """
         Forward pass.
@@ -251,6 +273,17 @@ class RiskyPriceNetwork(tf.keras.Model):
     def from_config(cls, config):
         """Create from config."""
         return cls(**config)
+
+    def build_from_config(self, config):
+        """Build model state from config (for Keras serialization)."""
+        dummy_k = tf.constant([[1.0]], dtype=tf.float32)
+        dummy_b = tf.constant([[0.5]], dtype=tf.float32)
+        dummy_z = tf.constant([[1.0]], dtype=tf.float32)
+        self(dummy_k, dummy_b, dummy_z)
+
+    def get_build_config(self):
+        """Return build configuration."""
+        return self.get_config()
 
     def call(
         self, k_next: tf.Tensor, b_next: tf.Tensor, z: tf.Tensor

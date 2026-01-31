@@ -94,7 +94,7 @@ from pathlib import Path
 from datetime import datetime
 import numpy as np
 import tensorflow as tf
-from typing import Dict, Iterator, Optional, Tuple, Any
+from typing import Dict, Iterator, Optional, Tuple, Any, List
 from dataclasses import dataclass
 
 from src.economy.parameters import EconomicParams, ShockParams
@@ -1036,19 +1036,29 @@ def create_data_generator(
     delta: float = EconomicParams.delta,
     shock_params: Optional[ShockParams] = None,
     # Bounds configuration
-    bounds: Optional[Dict[str, Tuple[float, float]]] = None,
-    auto_compute_bounds: bool = True,
+    # Allow for user input bound overrides
+    bounds: Optional[Dict[str, Any]] = None,
     # Auto-bounds parameters
+    auto_compute_bounds: bool = True,
     std_dev_multiplier: float = 3.0,
     k_min_multiplier: float = 0.2,
     k_max_multiplier: float = 3.0,
+    k_star_override: Optional[float] = None,
     # Config
     cache_dir: Optional[str] = None,
     save_to_disk: bool = True,
     verbose: bool = False
-) -> Tuple[DataGenerator, ShockParams, Dict[str, Tuple[float, float]]]:
+) -> Tuple[DataGenerator, ShockParams, Dict[str, Any]]:
     """
-    Factory function to create a DataGenerator.
+    Factory function to create a DataGenerator with NORMALIZED bounds.
+
+    IMPORTANT: Capital and debt bounds are now NORMALIZED as multipliers on k*.
+    - k ∈ [k_min, k_max] where these are multipliers on steady-state k*
+    - b ∈ [0, b_max] where b_max = π(k_max, z_max)/k_max + 1
+    - The bounds dict includes 'k_star' for de-normalization after training
+
+    Reference:
+        report_brief.md lines 84-122: Observation Normalization
 
     Args:
         master_seed: Master seed pair (m0, m1)
@@ -1061,11 +1071,12 @@ def create_data_generator(
         r: Risk-free rate (default: from EconomicParams)
         delta: Depreciation rate (default: from EconomicParams)
         shock_params: Shock parameters (if None, uses defaults)
-        bounds: Dictionary of bounds (k, log_z, b). Can be partial if auto_compute_bounds=True.
+        bounds: Dictionary of bounds (k, log_z, b, k_star). Can be partial if auto_compute_bounds=True.
         auto_compute_bounds: If True, missing bounds are auto-generated using economic params.
-        std_dev_multiplier: Multiplier for log z bounds (default 3.0)
-        k_min_multiplier: Multiplier for k_min (default 0.2)
-        k_max_multiplier: Multiplier for k_max (default 3.0)
+        std_dev_multiplier: m, number of std devs for log_z bounds (must be in (2, 5), default 3.0)
+        k_min_multiplier: k_min as multiplier on k* (must be in (0, 0.5), default 0.2)
+        k_max_multiplier: k_max as multiplier on k* (must be in (1.5, 5), default 3.0)
+        k_star_override: Optional override for k* (if None, auto-computed at z=e^μ)
         cache_dir: Directory for caching (default: None -> PROJECT_ROOT/data)
         save_to_disk: Whether to save to disk (default: True)
         verbose: Print configuration summary
@@ -1074,7 +1085,7 @@ def create_data_generator(
         Tuple containing:
         - DataGenerator instance
         - ShockParams used
-        - Bounds dictionary used
+        - Bounds dictionary (includes 'k', 'b', 'log_z', 'k_star')
     """
     from src.economy.bounds import generate_states_bounds
 
@@ -1090,10 +1101,10 @@ def create_data_generator(
     # Step 2: Generate/Resolve bounds
     if bounds is None:
         bounds = {}
-    
+
     # Auto-compute missing bounds if requested
     if auto_compute_bounds:
-        if 'k' not in bounds or 'log_z' not in bounds or 'b' not in bounds:
+        if 'k' not in bounds or 'log_z' not in bounds or 'b' not in bounds or 'k_star' not in bounds:
             auto_bounds = generate_states_bounds(
                 theta=theta,
                 r=r,
@@ -1101,29 +1112,40 @@ def create_data_generator(
                 shock_params=shock_params,
                 std_dev_multiplier=std_dev_multiplier,
                 k_min_multiplier=k_min_multiplier,
-                k_max_multiplier=k_max_multiplier
+                k_max_multiplier=k_max_multiplier,
+                k_star_override=k_star_override,
+                validate=True  # Enforce constraints from report_brief.md
             )
             # Fill missing
             if 'k' not in bounds: bounds['k'] = auto_bounds['k']
             if 'log_z' not in bounds: bounds['log_z'] = auto_bounds['log_z']
             if 'b' not in bounds: bounds['b'] = auto_bounds['b']
-            
+            if 'k_star' not in bounds: bounds['k_star'] = auto_bounds['k_star']
+
             if verbose:
-                print(" Auto-generated missing SamplingBounds")
+                print(" Auto-generated NORMALIZED bounds (k, b as multipliers on k*)")
     else:
         # Strict mode: verify all bounds exist
         missing = []
         if 'k' not in bounds: missing.append('k')
         if 'log_z' not in bounds: missing.append('log_z')
         if 'b' not in bounds: missing.append('b')
-        
+
         if missing:
             raise ValueError(f"auto_compute_bounds=False but bounds are missing: {missing}")
 
+        # If k_star not provided in strict mode, compute it
+        if 'k_star' not in bounds:
+            from src.economy.bounds import compute_k_star
+            bounds['k_star'] = compute_k_star(theta, r, delta, shock_params.mu)
+            if verbose:
+                print(f" Auto-computed k_star = {bounds['k_star']:.4f}")
+
     if verbose:
-        print(f"  k_bounds: {bounds['k']}")
+        print(f"  k_bounds (normalized): {bounds['k']}")
+        print(f"  b_bounds (normalized): {bounds['b']}")
         print(f"  log_z_bounds: {bounds['log_z']}")
-        print(f"  b_bounds: {bounds['b']}")
+        print(f"  k_star (for de-normalization): {bounds.get('k_star', 'N/A')}")
         print(f"  Master seed: {master_seed}")
 
     # Step 3: Create data generator
@@ -1148,5 +1170,81 @@ def create_data_generator(
         print(f"  Horizon (T): {generator.T}")
         print(f"  Simulation batches (J): {generator.n_sim_batches}")
         print(f"  Total samples: {generator.sim_batch_size * generator.n_sim_batches}")
-        
+        if 'k_star' in bounds:
+            print(f"  NOTE: Training in normalized space. Multiply k by k_star={bounds['k_star']:.4f} to get levels.")
+
     return generator, shock_params, bounds
+
+
+def cleanup_cache(
+    cache_dir: Optional[str] = None,
+    patterns: Optional[List[str]] = None,
+    verbose: bool = True
+) -> Dict[str, int]:
+    """
+    Clean up cached data files from the data directory.
+
+    This utility removes old cached datasets before starting a new experiment,
+    ensuring fresh data generation with current configuration.
+
+    Args:
+        cache_dir: Directory to clean. If None, uses PROJECT_ROOT/data.
+        patterns: List of glob patterns to match (default: ["*.npz", "*.png"])
+        verbose: Print deleted files
+
+    Returns:
+        Dict with 'deleted_count' and 'total_bytes' removed
+
+    Example:
+        >>> # Clean default cache directory
+        >>> cleanup_cache()
+
+        >>> # Clean specific directory with custom patterns
+        >>> cleanup_cache(cache_dir="../data", patterns=["*.npz"])
+
+        >>> # Silent mode
+        >>> stats = cleanup_cache(verbose=False)
+        >>> print(f"Removed {stats['deleted_count']} files")
+    """
+    from pathlib import Path
+
+    # Default patterns
+    if patterns is None:
+        patterns = ["*.npz", "*.png"]
+
+    # Resolve cache directory
+    if cache_dir is None:
+        project_root = Path(__file__).resolve().parent.parent.parent
+        cache_dir = str(project_root / "data")
+
+    cache_path = Path(cache_dir)
+
+    stats = {"deleted_count": 0, "total_bytes": 0}
+
+    if not cache_path.exists():
+        if verbose:
+            print(f"Cache directory does not exist: {cache_path}")
+        return stats
+
+    # Find and delete matching files
+    for pattern in patterns:
+        for filepath in cache_path.glob(pattern):
+            try:
+                file_size = filepath.stat().st_size
+                filepath.unlink()
+                stats["deleted_count"] += 1
+                stats["total_bytes"] += file_size
+                if verbose:
+                    print(f"  Deleted: {filepath.name}")
+            except OSError as e:
+                if verbose:
+                    print(f"  Error deleting {filepath}: {e}")
+
+    if verbose:
+        if stats["deleted_count"] > 0:
+            mb = stats["total_bytes"] / (1024 * 1024)
+            print(f"Cleaned {stats['deleted_count']} files ({mb:.2f} MB)")
+        else:
+            print("No cached files found to clean")
+
+    return stats

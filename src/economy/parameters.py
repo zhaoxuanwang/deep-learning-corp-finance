@@ -113,7 +113,7 @@ class EconomicParams:
     theta: float = 0.7
     
     # Adjustment costs
-    cost_convex: float = 0.01
+    cost_convex: float = 0.0
     cost_fixed: float = 0.0
     
     # Risky debt
