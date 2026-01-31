@@ -93,8 +93,13 @@ def trainer(networks, params, shock_params):
         price_net=price_net,
         params=params,
         shock_params=shock_params,
+        optimizer_actor=tf.keras.optimizers.Adam(learning_rate=1e-3),
+        optimizer_critic=tf.keras.optimizers.Adam(learning_rate=1e-3),
+        weight_br=0.1,
         n_critic_steps=3,
-        polyak_tau=0.9  # Lower for easier testing
+        polyak_tau=0.9,  # Lower for easier testing
+        smoothing=AnnealingSchedule(init_temp=1.0, min_temp=0.01, decay_rate=0.9),
+        logit_clip=20.0
     )
 
 

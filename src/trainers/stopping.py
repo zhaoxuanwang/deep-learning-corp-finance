@@ -16,6 +16,17 @@ from dataclasses import dataclass
 from typing import Optional, Dict, List, Callable, Any
 from collections import deque
 
+from src.trainers.config import (
+    DEFAULT_PATIENCE,
+    DEFAULT_LR_EPSILON,
+    DEFAULT_LR_WINDOW,
+    DEFAULT_MA_WINDOW,
+    DEFAULT_ER_EPSILON,
+    DEFAULT_BR_CRITIC_EPSILON,
+    DEFAULT_BR_ACTOR_EPSILON,
+    DEFAULT_DIVISION_EPSILON
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -52,27 +63,29 @@ class ConvergenceChecker:
         self,
         method: str,
         n_anneal: int,
-        patience: int = 5,
-        lr_epsilon: float = 1e-4,
-        lr_window: int = 100,
-        er_epsilon: float = 1e-5,
-        br_critic_epsilon: float = 1e-5,
-        br_actor_epsilon: float = 1e-4,
-        ma_window: int = 20
+        patience: int = DEFAULT_PATIENCE,
+        lr_epsilon: float = DEFAULT_LR_EPSILON,
+        lr_window: int = DEFAULT_LR_WINDOW,
+        er_epsilon: float = DEFAULT_ER_EPSILON,
+        br_critic_epsilon: float = DEFAULT_BR_CRITIC_EPSILON,
+        br_actor_epsilon: float = DEFAULT_BR_ACTOR_EPSILON,
+        ma_window: int = DEFAULT_MA_WINDOW
     ):
         """
         Initialize convergence checker.
 
+        All defaults are imported from src.trainers.config to avoid drift.
+
         Args:
             method: Training method ('lr', 'er', 'br')
             n_anneal: Steps required for annealing (gatekeeper)
-            patience: Consecutive checks before stopping
-            lr_epsilon: Relative improvement threshold for LR
-            lr_window: Window size for LR improvement evaluation
-            er_epsilon: Absolute loss threshold for ER
-            br_critic_epsilon: Critic loss threshold for BR
-            br_actor_epsilon: Actor relative improvement threshold for BR
-            ma_window: Moving average window size for smoothing
+            patience: Consecutive checks before stopping (default: DEFAULT_PATIENCE)
+            lr_epsilon: Relative improvement threshold for LR (default: DEFAULT_LR_EPSILON)
+            lr_window: Window size for LR improvement evaluation (default: DEFAULT_LR_WINDOW)
+            er_epsilon: Absolute loss threshold for ER (unit-free, 1e-4 → ~1% accuracy)
+            br_critic_epsilon: Critic loss threshold for BR (default: DEFAULT_BR_CRITIC_EPSILON)
+            br_actor_epsilon: Actor relative improvement threshold for BR (default: DEFAULT_BR_ACTOR_EPSILON)
+            ma_window: Moving average window size for smoothing (default: DEFAULT_MA_WINDOW)
         """
         self.method = method.lower()
         self.n_anneal = n_anneal
@@ -193,8 +206,8 @@ class ConvergenceChecker:
         # Past MA: average of ma_window elements ending at lr_window steps ago
         past_ma = get_ma(self._lr_loss_buffer, self.lr_window, self.ma_window)
 
-        # Relative improvement
-        if abs(past_ma) < 1e-6:
+        # Relative improvement (use DEFAULT_DIVISION_EPSILON to avoid division by zero)
+        if abs(past_ma) < DEFAULT_DIVISION_EPSILON:
             return False
 
         relative_improvement = (current_ma - past_ma) / abs(past_ma)
@@ -209,6 +222,13 @@ class ConvergenceChecker:
 
         Criteria: L_ER < epsilon_ER
 
+        For unit-free residuals f = 1 - β*m/χ:
+        - L_ER = E[f²] where f is the fractional Euler deviation
+        - epsilon_ER = 1e-4 corresponds to ~1% average Euler accuracy
+        - epsilon_ER = 1e-5 corresponds to ~0.3% average Euler accuracy
+        - epsilon_ER = 1e-3 corresponds to ~3% average Euler accuracy
+
+        Reference: report_brief.md lines 599-604, 723-784
         """
         loss_key = 'loss_ER'
         if loss_key not in metrics:
@@ -247,7 +267,7 @@ class ConvergenceChecker:
         actor_converged = False
         if len(self.state.loss_history) >= self.lr_window + 1:
             past_actor = self.state.loss_history[-self.lr_window - 1]
-            if abs(past_actor) > 1e-10:
+            if abs(past_actor) > DEFAULT_DIVISION_EPSILON:
                 relative_change = (actor_loss - past_actor) / abs(past_actor)
                 actor_converged = abs(relative_change) < self.br_actor_epsilon
 

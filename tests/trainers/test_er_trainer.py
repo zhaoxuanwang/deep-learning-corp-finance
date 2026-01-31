@@ -92,6 +92,7 @@ def trainer(policy_net, params, shock_params):
         policy_net=policy_net,
         params=params,
         shock_params=shock_params,
+        optimizer=tf.keras.optimizers.Adam(learning_rate=1e-3),
         polyak_tau=0.995
     )
 
@@ -223,6 +224,7 @@ class TestTargetNetwork:
             policy_net=policy_net,
             params=params,
             shock_params=shock_params,
+            optimizer=tf.keras.optimizers.Adam(learning_rate=1e-3),
             polyak_tau=0.99  # Slower updates
         )
 
@@ -237,6 +239,7 @@ class TestTargetNetwork:
             policy_net=policy_net2,
             params=params,
             shock_params=shock_params,
+            optimizer=tf.keras.optimizers.Adam(learning_rate=1e-3),
             polyak_tau=0.9  # Faster updates
         )
 

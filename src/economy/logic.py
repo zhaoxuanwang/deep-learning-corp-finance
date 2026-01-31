@@ -89,23 +89,43 @@ def compute_cash_flow_basic(
 
 def external_financing_cost(
     e: Numeric,
+    k: Numeric,
     params: EconomicParams,
     temperature: float,
     logit_clip: float
 ) -> Numeric:
     """
-    External equity injection cost per outline_v2.md.
-    
-    η(e) = (η₀ + η₁ · |e|) · 1_{e < 0}
-    
+    External equity injection cost per report_brief.md lines 432-433.
+
+    η(e) = (η₀ + η₁ · |e|) · 1_{e/k < -ε}
+
+    The indicator is evaluated on normalized e/k to avoid sigmoid saturation
+    when cash flows are large in levels.
+
+    Reference:
+        report_brief.md line 432-433:
+        "Equity injection: σ(-(e/k + ε)/τ)"
+
     Args:
         e: Cash flow / dividends (levels)
+        k: Current capital (for normalization of indicator)
         params: Contains cost_inject_fixed (η₀), cost_inject_linear (η₁)
         temperature: Sharpness of the < 0 gate
+        logit_clip: Logit clipping bound for smooth indicator
+
+    Returns:
+        External financing cost (levels, same units as e)
     """
     from src.utils.annealing import indicator_lt
-    
-    is_negative = indicator_lt(e, threshold=1e-8, temperature=temperature, logit_clip=logit_clip)
+
+    # Normalize e by k for the indicator to avoid sigmoid saturation
+    safe_k = tf.maximum(k, 1e-8)
+    e_normalized = e / safe_k
+
+    # Evaluate indicator on normalized value: 1_{e/k < -eps}
+    is_negative = indicator_lt(e_normalized, threshold=1e-8, temperature=temperature, logit_clip=logit_clip)
+
+    # Cost is still computed on levels (not normalized)
     return is_negative * (params.cost_inject_fixed + params.cost_inject_linear * tf.abs(e))
 
 

@@ -41,13 +41,14 @@ def params_with_injection_costs():
 # === SECTION 1: External Financing Cost Tests ===
 
 class TestExternalFinancingCost:
-    """Tests for external_financing_cost (η) per outline_v2.md."""
+    """Tests for external_financing_cost (η) per report_brief.md lines 432-433."""
 
     def test_zero_for_positive_cashflow(self, params):
         """η(e) = 0 when e >= 0."""
         e = tf.constant([0.0, 1.0, 10.0, 100.0])
+        k = tf.constant([1.0, 1.0, 1.0, 1.0])  # k=1 so e/k = e
         eta = logic.external_financing_cost(
-            e, params,
+            e, k, params,
             temperature=DEFAULT_TEMPERATURE,
             logit_clip=DEFAULT_LOGIT_CLIP
         )
@@ -58,8 +59,9 @@ class TestExternalFinancingCost:
     def test_formula_for_negative_cashflow(self, params_with_injection_costs):
         """η(e) = η₀ + η₁|e| when e < 0."""
         e = tf.constant([-5.0])
+        k = tf.constant([1.0])  # k=1 so e/k = e
         eta = logic.external_financing_cost(
-            e, params_with_injection_costs,
+            e, k, params_with_injection_costs,
             temperature=DEFAULT_TEMPERATURE,
             logit_clip=DEFAULT_LOGIT_CLIP
         )
@@ -70,22 +72,41 @@ class TestExternalFinancingCost:
         assert np.isclose(eta.numpy(), expected, rtol=0.01), \
             f"Expected η = {expected}, got {eta.numpy()}"
 
-    def test_no_k_dependence(self, params):
-        """η(e) does NOT depend on k — function signature doesn't include k."""
+    def test_k_used_for_indicator_normalization(self, params_with_injection_costs):
+        """Indicator is evaluated on normalized e/k per report_brief.md lines 432-433."""
         import inspect
         sig = inspect.signature(logic.external_financing_cost)
         param_names = list(sig.parameters.keys())
 
-        assert 'k' not in param_names, \
-            "external_financing_cost should not take 'k' as parameter"
+        # k is now a required parameter for normalization
+        assert 'k' in param_names, \
+            "external_financing_cost should take 'k' for indicator normalization"
         assert 'e' in param_names and 'params' in param_names, \
-            f"Expected e and params in signature, got {param_names}"
+            f"Expected e, k, and params in signature, got {param_names}"
+
+    def test_normalization_avoids_saturation(self, params_with_injection_costs):
+        """Large e values don't saturate sigmoid when k is large too."""
+        # Without k normalization, e=-100 would saturate the sigmoid
+        # With k normalization, e/k = -100/100 = -1, which is manageable
+        e = tf.constant([-100.0])
+        k = tf.constant([100.0])  # e/k = -1
+
+        eta = logic.external_financing_cost(
+            e, k, params_with_injection_costs,
+            temperature=0.1,  # Higher temperature to see soft gate behavior
+            logit_clip=DEFAULT_LOGIT_CLIP
+        )
+
+        # Should produce finite, positive cost
+        assert np.isfinite(eta.numpy())
+        assert eta.numpy() > 0
 
     def test_vectorized(self, params_with_injection_costs):
         """Works on batched inputs."""
         e = tf.constant([-1.0, 5.0, 1.0, -10.0])
+        k = tf.constant([1.0, 1.0, 1.0, 1.0])  # k=1 so e/k = e
         eta = logic.external_financing_cost(
-            e, params_with_injection_costs,
+            e, k, params_with_injection_costs,
             temperature=DEFAULT_TEMPERATURE,
             logit_clip=DEFAULT_LOGIT_CLIP
         )
@@ -99,10 +120,11 @@ class TestExternalFinancingCost:
     def test_ste_gradient_nonzero_for_negative_e(self, params_with_injection_costs):
         """Soft gate should provide non-zero gradient when e < 0."""
         e = tf.Variable([-0.5], dtype=tf.float32)  # Negative
+        k = tf.constant([1.0])
 
         with tf.GradientTape() as tape:
             eta = logic.external_financing_cost(
-                e, params_with_injection_costs,
+                e, k, params_with_injection_costs,
                 temperature=DEFAULT_TEMPERATURE,
                 logit_clip=DEFAULT_LOGIT_CLIP
             )

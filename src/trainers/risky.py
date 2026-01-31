@@ -32,7 +32,12 @@ from src.trainers.losses import (
     compute_br_actor_loss_risky,
 )
 from src.utils.annealing import AnnealingSchedule, indicator_default
-from src.trainers.config import NetworkConfig, OptimizationConfig, AnnealingConfig, MethodConfig
+from src.trainers.config import (
+    NetworkConfig, OptimizationConfig, AnnealingConfig, MethodConfig,
+    create_optimizer,
+    # Centralized defaults - reference these for documentation, actual values come from config
+    DEFAULT_LEARNING_RATE, DEFAULT_POLYAK_TAU, DEFAULT_N_CRITIC, DEFAULT_LOGIT_CLIP, DEFAULT_WEIGHT_BR
+)
 from src.trainers.core import execute_training_loop
 
 logger = logging.getLogger(__name__)
@@ -64,13 +69,13 @@ class RiskyDebtTrainerBR:
         price_net: RiskyPriceNetwork,
         params: EconomicParams,
         shock_params: ShockParams,
-        actor_lr: float = 1e-3,
-        critic_lr: float = 1e-3,
-        weight_br: float = 0.1,
-        n_critic_steps: int = 5,
-        polyak_tau: float = 0.995,
-        smoothing: Optional[AnnealingSchedule] = None,
-        logit_clip: float = 20.0
+        optimizer_actor: tf.keras.optimizers.Optimizer,
+        optimizer_critic: tf.keras.optimizers.Optimizer,
+        weight_br: float,
+        n_critic_steps: int,
+        polyak_tau: float,
+        smoothing: AnnealingSchedule,
+        logit_clip: float
     ):
         """
         Initialize the BR trainer with target networks.
@@ -81,15 +86,19 @@ class RiskyDebtTrainerBR:
             price_net: Price network (k', b', z) -> q (bond price)
             params: Economic parameters
             shock_params: Shock process parameters
-            actor_lr: Learning rate for policy network
-            critic_lr: Learning rate for value and price networks
-            weight_br: Weight on BR loss in critic objective (price weight = 1.0 implicit)
-                       L_critic = weight_br * L_BR + L_price
-                       Default 0.1 because BR loss is typically 100x larger than price loss
-            n_critic_steps: Number of critic updates per actor update
-            polyak_tau: Polyak averaging coefficient for target networks
-            smoothing: Annealing schedule for default probability temperature
-            logit_clip: Clipping bound for logits in smooth indicators
+            optimizer_actor: Configured optimizer for actor (use create_optimizer()).
+            optimizer_critic: Configured optimizer for critic (use create_optimizer()).
+            weight_br: Weight on BR loss in critic objective (price weight = 1.0 implicit).
+                L_critic = weight_br * L_BR + L_price
+                Use RiskyDebtConfig.weight_br (default: DEFAULT_WEIGHT_BR = 0.1).
+            n_critic_steps: Number of critic updates per actor update.
+                Use MethodConfig.n_critic (default: DEFAULT_N_CRITIC = 5).
+            polyak_tau: Polyak averaging coefficient for target networks.
+                Use MethodConfig.polyak_tau (default: DEFAULT_POLYAK_TAU = 0.995).
+            smoothing: Annealing schedule for default probability temperature.
+                Create from AnnealingConfig parameters.
+            logit_clip: Clipping bound for logits in smooth indicators.
+                Use AnnealingConfig.logit_clip (default: DEFAULT_LOGIT_CLIP = 20.0).
         """
         self.policy_net = policy_net
         self.value_net = value_net
@@ -99,13 +108,19 @@ class RiskyDebtTrainerBR:
         self.weight_br = weight_br
         self.n_critic_steps = n_critic_steps
         self.polyak_tau = polyak_tau
-        self.smoothing = smoothing or AnnealingSchedule(init_temp=1.0, min_temp=1e-4, decay_rate=0.99)
+        self.smoothing = smoothing
         self.logit_clip = logit_clip
         self.beta = 1.0 / (1.0 + params.r_rate)
 
-        # Separate optimizers for actor and critic
-        self.optimizer_actor = tf.keras.optimizers.Adam(actor_lr)
-        self.optimizer_critic = tf.keras.optimizers.Adam(critic_lr)
+        # Log critical hyperparameters for visibility in notebooks
+        logger.info(
+            f"RiskyDebtTrainerBR initialized: weight_br={weight_br:.2f}, "
+            f"n_critic={n_critic_steps}, polyak_tau={polyak_tau}"
+        )
+
+        # Store optimizers (created externally with gradient clipping support)
+        self.optimizer_actor = optimizer_actor
+        self.optimizer_critic = optimizer_critic
 
         # Build original networks first (required before cloning/copying weights)
         dummy_k = tf.constant([[1.0]], dtype=tf.float32)
@@ -209,7 +224,7 @@ class RiskyDebtTrainerBR:
             # === Compute Cash Flow ===
             e = cash_flow_risky_debt_q(k, k_next, b, b_next, z, q, self.params,
                                         temperature=temperature, logit_clip=self.logit_clip)
-            eta = external_financing_cost(e, self.params, temperature=temperature, logit_clip=self.logit_clip)
+            eta = external_financing_cost(e, k, self.params, temperature=temperature, logit_clip=self.logit_clip)
 
             # === Compute Continuation Values using TARGET Value Network ===
             # Reference: report_brief.md lines 1045-1047
@@ -305,7 +320,7 @@ class RiskyDebtTrainerBR:
             # === Compute Cash Flow ===
             e = cash_flow_risky_debt_q(k, k_next, b, b_next, z, q, self.params,
                                         temperature=temperature, logit_clip=self.logit_clip)
-            eta = external_financing_cost(e, self.params, temperature=temperature, logit_clip=self.logit_clip)
+            eta = external_financing_cost(e, k, self.params, temperature=temperature, logit_clip=self.logit_clip)
 
             # === Compute Continuation Value using CURRENT Value Network ===
             # Reference: report_brief.md line 1072: "Evaluate Value"
@@ -446,7 +461,7 @@ class RiskyDebtTrainerBR:
 
         e = cash_flow_risky_debt_q(k, k_next, b, b_next, z, q, self.params,
                                     temperature=temperature, logit_clip=self.logit_clip)
-        eta = external_financing_cost(e, self.params, temperature=temperature, logit_clip=self.logit_clip)
+        eta = external_financing_cost(e, k, self.params, temperature=temperature, logit_clip=self.logit_clip)
 
         V_tilde_next_1 = self.target_value_net(k_next, b_next, z_next_main)
         V_tilde_next_2 = self.target_value_net(k_next, b_next, z_next_fork)
@@ -466,7 +481,7 @@ class RiskyDebtTrainerBR:
         q_actor = self.price_net(k_next_actor, b_next_actor, z)
         e_actor = cash_flow_risky_debt_q(k, k_next_actor, b, b_next_actor, z, q_actor, self.params,
                                           temperature=temperature, logit_clip=self.logit_clip)
-        eta_actor = external_financing_cost(e_actor, self.params, temperature=temperature, logit_clip=self.logit_clip)
+        eta_actor = external_financing_cost(e_actor, k, self.params, temperature=temperature, logit_clip=self.logit_clip)
         V_tilde_next_actor = self.value_net(k_next_actor, b_next_actor, z_next_main)
         V_eff_actor, _ = compute_effective_value(V_tilde_next_actor, k_next_actor, temperature, self.logit_clip, noise=False)
         loss_actor = -tf.reduce_mean(e_actor - eta_actor + self.beta * V_eff_actor)
@@ -480,118 +495,6 @@ class RiskyDebtTrainerBR:
 # =============================================================================
 # HIGH-LEVEL ENTRY POINTS
 # =============================================================================
-
-def train_risky_lr(
-    dataset: Dict[str, tf.Tensor],
-    net_config: NetworkConfig,
-    opt_config: OptimizationConfig,
-    method_config: MethodConfig,
-    anneal_config: AnnealingConfig,
-    params: EconomicParams,
-    shock_params: ShockParams,
-    bounds: Dict[str, Tuple[float, float]]
-) -> Dict[str, Any]:
-    """
-    Train Risky Debt model via constrained lifetime reward maximization.
-
-    Uses adaptive Lagrange multiplier to enforce zero-profit bond pricing
-    constraint while maximizing firm value. The value network is trained
-    jointly to provide default probability estimates required for pricing.
-
-    Args:
-        dataset: Training data with trajectories
-        net_config: Network architecture configuration
-        opt_config: Optimization hyperparameters
-        method_config: Method-specific configuration (must include risky field)
-        anneal_config: Annealing schedule for smooth gates
-        params: Economic parameters
-        shock_params: Shock process parameters
-        bounds: State space bounds (k, b, log_z)
-
-    Returns:
-        Dictionary with training history and trained networks
-    """
-    k_bounds = bounds['k']
-    b_bounds = bounds['b']
-
-    # Check for risky config
-    if method_config.risky is None:
-        raise ValueError("RiskyDebtConfig required in method_config.risky for train_risky_lr")
-    risky_cfg = method_config.risky
-
-    # Data Setup
-    if 'z_path' in dataset:
-        T = dataset['z_path'].shape[1] - 1
-    else:
-        raise ValueError("Cannot infer Horizon T from dataset.")
-
-    # Create batched iterator
-    tf_dataset = tf.data.Dataset.from_tensor_slices(dataset)
-    tf_dataset = tf_dataset.shuffle(buffer_size=dataset['k0'].shape[0]).batch(opt_config.batch_size).repeat()
-    data_iter = iter(tf_dataset)
-
-    # Build all three networks
-    policy_net, value_net, price_net = build_risky_networks(
-        k_min=k_bounds[0], k_max=k_bounds[1],
-        b_min=b_bounds[0], b_max=b_bounds[1],
-        r_risk_free=params.r_rate,
-        n_layers=net_config.n_layers, n_neurons=net_config.n_neurons, activation=net_config.activation
-    )
-
-    # Setup annealing schedule for default probability
-    smoothing = AnnealingSchedule(
-        init_temp=risky_cfg.epsilon_D_0,
-        min=risky_cfg.epsilon_D_min,
-        decay=risky_cfg.decay_d,
-        schedule="exponential"
-    )
-
-    # Determine value network learning rate
-    lr_value = risky_cfg.learning_rate_value if risky_cfg.learning_rate_value is not None else opt_config.learning_rate
-
-    # Create trainer with adaptive Lagrange multiplier
-    trainer = RiskyDebtTrainerLR(
-        policy_net=policy_net,
-        price_net=price_net,
-        value_net=value_net,  # Now trained jointly
-        params=params,
-        shock_params=shock_params,
-        optimizer_policy=tf.keras.optimizers.Adam(opt_config.learning_rate),
-        optimizer_price=tf.keras.optimizers.Adam(opt_config.learning_rate),
-        optimizer_value=tf.keras.optimizers.Adam(lr_value),
-        T=T,
-        batch_size=opt_config.batch_size,
-        lambda_price_init=risky_cfg.lambda_price_init,
-        learning_rate_lambda=risky_cfg.learning_rate_lambda,
-        epsilon_price=risky_cfg.epsilon_price,
-        polyak_weight=risky_cfg.polyak_weight,
-        n_value_update_freq=risky_cfg.n_value_update_freq,
-        smoothing=smoothing,
-        logit_clip=anneal_config.logit_clip
-    )
-
-    history = execute_training_loop(
-        trainer,
-        data_iter,
-        opt_config,
-        anneal_config,
-        method_name="risky_lr"
-    )
-
-    return {
-        "history": history,
-        "_policy_net": policy_net,
-        "_price_net": price_net,
-        "_value_net": value_net,
-        "_configs": {
-            "network": net_config,
-            "optimization": opt_config,
-            "method": method_config,
-            "annealing": anneal_config
-        },
-        "_params": params
-    }
-
 
 def train_risky_br(
     dataset: Dict[str, tf.Tensor],
@@ -681,9 +584,13 @@ def train_risky_br(
         decay_rate=anneal_config.decay
     )
 
-    # Determine learning rates
+    # Determine learning rates (critic defaults to actor LR if not specified)
     actor_lr = opt_config.learning_rate
     critic_lr = opt_config.learning_rate_critic if opt_config.learning_rate_critic else opt_config.learning_rate
+
+    # Create optimizers with gradient clipping support
+    optimizer_actor = create_optimizer(actor_lr, opt_config.optimizer)
+    optimizer_critic = create_optimizer(critic_lr, opt_config.optimizer)
 
     # Create trainer with target networks
     trainer = RiskyDebtTrainerBR(
@@ -692,8 +599,8 @@ def train_risky_br(
         price_net=price_net,
         params=params,
         shock_params=shock_params,
-        actor_lr=actor_lr,
-        critic_lr=critic_lr,
+        optimizer_actor=optimizer_actor,
+        optimizer_critic=optimizer_critic,
         weight_br=risky_cfg.weight_br,
         n_critic_steps=method_config.n_critic,
         polyak_tau=method_config.polyak_tau,

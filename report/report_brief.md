@@ -34,15 +34,27 @@ $$(\log z_{\min},\log z_{\max}) \equiv (\mu - m \sigma_{\log z}, \; \mu + m \sig
 - Risky interest rate lower bound: $\tilde r_t \ge r$ where $r>0$ is the risk-free rate
 - Risky-debt latent value $\widetilde V(k_t,b_t,z_t)$ can be either positive or negative
 
-**Abbreviations**
-For the reminder of the report, abbreviations of the three main methods are commonly used:
-- **LR**: Lifetime Reward, e.g., loss  $\widehat{\mathcal{L}}_{\text{LR}}$
-- **ER**: Euler Equation Residual, e.g., loss $\widehat{\mathcal{L}}_{\text{ER}}$
+**Methods**
+Commonly used notations for the three methods:
+- **LR**: Lifetime Reward, e.g., loss  $\mathcal{L}_{\text{LR}}$
+- **ER**: Euler Equation Residual, e.g., loss $\mathcal{L}_{\text{ER}}$
 - **BR**: Bellman Equation Residual
-	- BR-Critic Loss: $\widehat{\mathcal{L}}^{\text{BR}}_{\text{critic}}(\theta_{\text{value}})$
-	- BR-Actor Loss: $\widehat{\mathcal{L}}^{\text{BR}}_{\text{actor}}(\theta_{\text{policy}})$
+	- BR-Critic Loss: $\mathcal{L}^{\text{BR}}_{\text{critic}}(\theta_{\text{value}})$
+	- BR-Actor Loss: $\mathcal{L}^{\text{BR}}_{\text{actor}}(\theta_{\text{policy}})$
 
-# Data Generation
+# Synthetic Data Generation
+
+I implement the methods on synthetic data to verify its effectiveness. There are several important issues that need to be handled properly:
+
+1. Datasets should be generated with deterministic RNG seeds to ensure reproducibility
+2. The state spaces for capital, debt, and shock should be
+   - Consistent with the economic environment and theory
+   - Normalized to avoid numerical overflow and gradient explosion in training
+3. The shapes and features of the dataset need to be consistent with DL methods
+   - Shapes: $T$-horizon rullout for LR, one-period transition for ER and BR
+   - Features: Draw main and "fork" AR(1) shocks for the AiO estimator
+
+The sections below describe these implementations in detail.
 
 ## State Space
 
@@ -53,38 +65,61 @@ $$
 \quad \text{where} \quad 
 \sigma_{\log z} = \frac{\sigma}{\sqrt{1-\rho^2}}
 $$
- where $m$ is the number of standard deviation around the stationary mean $\mu$. With default value $m=3$ this will covers most of the mass of possible $z$ values.
+ where $m$ is the number of standard deviation around the stationary mean $\mu$. With default value $m=3$ this will cover the mass of possible $z$ values.
  
 **Capital stock grids** 
 The steady state capital stock with no frictional costs is determined by the condition when MPK equals marginal rental cost, $\pi_k \equiv \gamma \cdot z \cdot k^{\gamma-1}  = r + \delta$. Rearrange this equation gives
 $$ 
 k^*(z) = \left(\frac{z\cdot\gamma}{r+\delta}\right)^{\frac{1}{1-\gamma}}
 $$
-and I set the "natural" upper and lower limit to be 
-$$
-k_{\max} = \bar{c} \cdot k^*(z_{\max}) \qquad k_{\min} = \underline{c} \cdot k^*(z_{\min})
-$$
-with default multiplier $\bar{c}=3$ and $\underline{c}=0.2$ which ensures that the bands are generously wide. This approach recenters the capital grids around the steady state level.
+and the "natural" lower and upper limit of the $k$ state space can be "centered" around the steady state level. For example, given the stationary mean $z = e^\mu$, we can set the $k$ state space to range between 1% and 200% around $k^*(e^\mu)$. This allows for firm to start with either a tiny or huge initial $k_0$ and converge to the steady state $k^*$ over time.
 
 **Debt grids** 
 Define the natural borrowing limit to be
 $$
-b_{\max} = z_{\max}\cdot(k_{\max})^\gamma + k_{\max}
+\pi(k_{\max},z_{\max}) + k_{\max}
 $$
-which is the maximum amount that firm can repay debt in the best world $z_{\max}$ and with no liquidation cost (so that firm can sell all capital stock).
+which is the maximum amount that firm can repay debt in the best world $z_{\max}$ and with no liquidation cost (so that firm can sell all capital stock). Note that in the risk-free debt model (sec 3.4) there usually exist a collateral constraint for borrowing (action). The $b_{\max}$ defined here is by construction much higher than the collateral constraint.
 
-##### Implementation
+## Observation Normalization
+
+It is important to normalize the observations ($k,b,z$) in the synthetic data before training. Although in theory the solution of the optimization problem is invariant to scale, in practice the large values of $k$ and $b$ can lead to numerical overflow and gradient explosion in training. For example, the fictionless steady state $k^*\approx 213.7$ at $z=1$ with $r=0.04$, $\gamma=0.7$, and $\delta=0.1$. This leads to a very large cash flow and lifetime rewards/bellman firm value and can easily cause the gradient of empirical risk (squared residuals) to explode.
+
+
+In implementation, I treat steady state $k^*$ as a scalar (auto-computed pre-training or override by user), and then pass the user-input multipliers on $k^*$ as effective bounds: 
+$$
+k_{\max} = \frac{k^{\text{level}}_{\max}}{k^*(z_{\max})} \qquad k_{\min} = \frac{k^{\text{level}}_{\min}}{k^*(z_{\min})}
+$$
+
+For example, when user inputs $k_{\min} = 0.01$ and $k_{\max} = 2.0$, the effective state space is normalized to $[0.01, 2]$ and pass to training. The actual level (scalar) of capital stock can always be restored by multiplying $k^*$ after training. For safety, I impose $k_{\max} \in (1.5, 5)$ and $k_{\min} \in (0, 0.5)$, which ensures that the largest normalized space $k \in (0,5)$ to avoid gradient explosion.
+
+The borrowing (risky debt) bounds are also normalized:
+$$
+b_{\max} = \frac{\pi(k_{\max},z_{\max})}{k_{\max}} + 1
+$$
+and I set the lower bound $b_{\min}=0$.
+
+I did not impose further limitation on $\log z$ because it is already truncated by $m$ (user-input) standard deviations around $\mu$, so that it is already well-bounded. For safety, I impose $m<5$ so that extreme rare events are truncated.
+
+**Summary** 
+
+Module: `src/economy/bounds.py`
 
 Inputs: 
 - Shock parameters: $\mu, \sigma, \rho$ 
 - Economic parameters: $\gamma, r, \delta$
-- Multipliers: $m, \bar{c}, \underline{c}$
-
+- User-chosen bounds: $m, k_{\min}, k_{\max}$ with constraints (post_init):
+  - $m \in (2, 5)$
+  - $0 < k_{\min} < 0.5$
+  - $1.5 < k_{\max} < 5$
+- Optional: scalar $k^*$ that will override auto-computed value
+  
 Output (Tuples): 
 - Shock (log) state range $[\log z_{\min}, \log z_{\max}] = \left[ \mu - m \cdot \sigma_{\log z}, \, \mu + m \cdot \sigma_{\log z} \right]$
-- Capital state range: $[K_{\min}, K_{\max}]$
-- Debt state range $[0, B_{\max}]$
-- Frictionless steady state $k^*(e^\mu)=\left(\frac{e^\mu\cdot\gamma}{r+\delta}\right)^{\frac{1}{1-\gamma}}$ where $\mu$ is stationary AR-1 mean for $\log z$
+- If user did not specify $k^*$: compute steady state $k^*(e^\mu)=\left(\frac{e^\mu\cdot\gamma}{r+\delta}\right)^{\frac{1}{1-\gamma}}$
+- Capital state range: $[k_{\min}, k_{\max}]$
+- Debt state range $[0, b_{\max}]$
+
 
 ## Datasets
 Core ideas:
@@ -387,7 +422,7 @@ $$
 \sigma\left(\frac{|I/k|-\epsilon}{\tau}\right) \rightarrow \mathbb{1}\{|I/k|\gt \epsilon\} \quad \text{as} \quad \tau \rightarrow 0, \, |I|\neq \epsilon
 $$
 
-where the point $I \neq 0$ is approximated with a small inaction region $[-\epsilon, \epsilon]$ in computation. Normalizing investment by capital is important to avoid saturation.
+where the point $I \neq 0$ is approximated with a small inaction region $[-\epsilon, \epsilon]$ in computation. Normalizing investment by current capital is important to avoid saturation.
 
 #### Costly external finance
 
@@ -563,8 +598,9 @@ $$1+\psi_I(I_t,k_t) = \beta \mathbb{E} \left[ \pi_k(z_{t+1},k_{t+1})-\psi_k(I_{t
 $$ m(k_{t+1}, k_{t+2}, z_{t+1}) \equiv \pi_k(z_{t+1},k_{t+1}) - \psi_k(I_{t+1},k_{t+1}) + (1-\delta)(1+\psi_I(I_{t+1},k_{t+1})) $$
 - All-in-One (AiO) Loss: To estimate the squared expectation $\mathbb{E}[f]^2$ unbiasedly, I use two i.i.d. shock realizations $z'_{1}, z'_{2}$ (forks) for the next period. The empirical loss is the cross-product of residuals: 
 $$ \mathcal{L}^{\text{ER}} = \frac{1}{n} \sum_{i=1}^n \left( f_{i,1} \times f_{i,2} \right) $$ 
-where the realized Euler residual for branch $\ell \in {1, 2}$ is: 
-$$ f_{i,\ell} = \big(1 + \psi_I(I_{i}, k_{i})\big) - \beta \cdot m(k'_{i}, k''_{i,\ell}, z'_{i,\ell}), \quad \ell = 1,2$$
+
+where the unit-free Euler residuals for branch $\ell \in {1, 2}$ is: 
+$$ f_{i,\ell} = 1 - \beta \left( \frac{m(k'_{i}, k''_{i,\ell}, z'_{i,\ell})}{1 + \psi_I(I_{i}, k_{i})} \right), \quad \ell = 1,2$$
 
 ### Algorithm Summary: ER Method
 **Initialization:**
@@ -593,9 +629,9 @@ $$ k''_{\ell} = \Gamma_{\text{policy}}(k', z'_{\ell}; \theta^-_{\text{policy}}) 
 
 4. **Compute Residuals**:
 - Calculate the realized marginal benefit $m_{\ell}$ for both $\ell=1$ and $\ell=2$ using $(k', k''_{\ell}, z'_{\ell})$.
-- Compute residuals: $f_{\ell} = \chi - \beta \cdot m_{\ell}$.
+- Compute unit-free Euler residuals: $f_{\ell} = 1 - \beta \frac{m_{\ell}}{\chi}$.
 
-5. **Update Policy**:
+1. **Update Policy**:
 - Compute Empirical Loss $\mathcal{L}^{\text{ER}} = \frac{1}{|\mathcal B|}\sum_{i\in \mathcal B} (f_{i,1} \times f_{i,2})$
 
 - Update $\theta_{\text{policy}}$ using gradient descent to minimize $\mathcal{L}^{\text{ER}}$.
@@ -890,8 +926,8 @@ First let us define an empirical loss for the zero-profit condition. This is ess
 
 Since the default indicator $D=\mathbb{1}\{\widetilde{V}<0\}$ is non-differentiable, I approximate the default indicator using Gumbel-Sigmoid: 
 $$ p(k',b',z') \equiv \sigma \left( 
-    \frac{- \widetilde V/k + \log(u) - \log(1-u)}{\tau}
-\right) \to \mathbb{1}\left\{\frac{\widetilde V}{k}<0 \right\} \quad \text{as} \quad \tau \rightarrow 0 $$
+    \frac{- \widetilde V + \log(u) - \log(1-u)}{\tau}
+\right) \to \mathbb{1}\left\{\widetilde V<0 \right\} \quad \text{as} \quad \tau \rightarrow 0 $$
 where the random uniform noise $u \sim \text{Uniform}(0,1)$ to force exploration around default boundary. As in the basic model, I use an annealing schedule for $\tau$ to converge to near-zero over iterations.
 
 **Pricing equation residual**
@@ -1083,5 +1119,14 @@ Update: Gradient descent on $\theta_{policy}$. Polyak update $\theta^-_{policy}$
 - Repeat Step A-B until convergence/early stopping rule is met.
 
 
-## Extensions
-Under-development.
+## Codebase Details
+
+### Centralized Configuration
+
+I separate configuration into two layers to prevent circular imports and configuration and parameter drift.
+
+Technical defaults (`src/_defaults.py`) contains only constants with zero imports—making it a safe leaf module. The default values of all training hyperparameters (e.g., learning rate, batch size, temperature annealing, convergence thresholds) are defined here. Both `config.py` and `annealing.py` import from this single source, ensuring consistency across the codebase.
+
+Economic parameters (`src/economy/parameters.py`) uses frozen dataclasses (`EconomicParams`, `ShockParams`) for domain knowledge. The `frozen=True` setting prevents accidental mutation after creation, and `__post_init__` validates constraints (e.g., $0 < \theta < 1$). Changes require explicit `with_overrides()` calls, which log all modifications for reproducibility.
+
+This separation ensures that changing a default in one place (`src/_defaults.py`) automatically propagates everywhere, while economic assumptions remain immutable and validated.

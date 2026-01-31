@@ -100,23 +100,24 @@ def compute_er_loss_aio(
 ) -> tf.Tensor:
     """
     Compute Euler Residual loss using All-in-One (AiO) method.
-    
+
     L_ER = mean(f1 * f2)
-    
-    where f = chi(k,z) - beta * m(k',z')
-    and chi = 1 + psi_I(I, k), m = pi_k - psi_k + (1-delta)*chi
-    
+
+    where f is the unit-free Euler residual:
+        f = 1 - beta * m(k', k'', z') / chi(k, k')
+    and chi = 1 + psi_I(I, k), m = pi_k - psi_k + (1-delta)*chi'
+
     The AiO trick: E[(f)^2] = E[f1 * f2] when f1, f2 are computed with
     independent draws of z'.
-    
+
     Args:
-        f1: Euler residual computed with shock draw 1
-        f2: Euler residual computed with shock draw 2
-    
+        f1: Unit-free Euler residual computed with shock draw 1
+        f2: Unit-free Euler residual computed with shock draw 2
+
     Returns:
         Scalar loss
-    
-    Reference: outline_v2.md lines 225-229
+
+    Reference: report_brief.md lines 599-604
     """
     return tf.reduce_mean(f1 * f2)
 

@@ -1,53 +1,43 @@
+# Core Deep Learning Framework
+tensorflow==2.16.2
+keras==3.13.0
+# NOTE: For Apple Silicon, install tensorflow-macos and tensorflow-metal manually
+
+# TensorFlow Dependencies
+tensorboard==2.16.2
+tensorboard-data-server==0.7.2
 absl-py==2.3.1
 astunparse==1.6.3
-certifi==2025.11.12
-charset-normalizer==3.4.4
 flatbuffers==25.12.19
 gast==0.7.0
 google-pasta==0.2.0
 grpcio==1.76.0
 h5py==3.15.1
-idna==3.11
-iniconfig==2.3.0
-keras==3.13.0
 libclang==18.1.1
-llvmlite==0.46.0
 Markdown==3.10
-markdown-it-py==4.0.0
 MarkupSafe==3.0.3
-mdurl==0.1.2
 ml-dtypes==0.3.2
-mpmath==1.3.0
 namex==0.1.0
-numba==0.63.1
-numpy==1.26.4
 opt_einsum==3.4.0
 optree==0.18.0
-packaging==25.0
-pandas==2.3.3
-pluggy==1.6.0
 protobuf==4.25.8
-Pygments==2.19.2
-pytest==9.0.2
-python-dateutil==2.9.0.post0
-pytz==2025.2
-quantecon==0.10.1
-requests==2.32.5
-rich==14.2.0
-scipy==1.16.3
-setuptools==80.9.0
-six==1.17.0
-sympy==1.14.0
-tensorboard==2.16.2
-tensorboard-data-server==0.7.2
-tensorflow==2.16.2
-# NOTE: For Apple Silicon, install tensorflow-macos and tensorflow-metal manually
 termcolor==3.2.0
-typing_extensions==4.15.0
-tzdata==2025.3
-urllib3==2.6.2
-Werkzeug==3.1.4
-wheel==0.45.1
 wrapt==2.0.1
+
+# Numerical Computing & Data
+numpy==1.26.4
+pandas>=2.0.0  # Used by ExperimentConfig.summary() and notebooks
+
+# Visualization
 matplotlib==3.10.0
 seaborn==0.14.0
+
+# Economic Modeling (for DDP reference solvers)
+quantecon==0.10.1
+
+# Testing
+pytest==9.0.2
+
+# Utilities
+packaging==25.0
+typing_extensions==4.15.0

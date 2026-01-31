@@ -6,6 +6,8 @@ Provides a unified schedule for controlling sigmoid sharpness in:
 - Smooth default probability: sigmoid(-V / epsilon)
 
 As tau → 0, soft sigmoids → hard indicator functions.
+
+All defaults are imported from src.trainers.config to avoid config drift.
 """
 
 import math
@@ -13,29 +15,42 @@ from typing import Literal, Union, Any
 from dataclasses import dataclass
 import tensorflow as tf
 
+# Import from src/_defaults.py to avoid circular imports with config.py
+from src._defaults import (
+    DEFAULT_TEMPERATURE_INIT,
+    DEFAULT_TEMPERATURE_MIN,
+    DEFAULT_ANNEAL_DECAY,
+    DEFAULT_ANNEAL_BUFFER,
+    DEFAULT_LOGIT_CLIP,
+    DEFAULT_INDICATOR_THRESHOLD,
+    DEFAULT_INDICATOR_LOGIT_CLIP,
+)
+
 
 @dataclass
 class AnnealingSchedule:
     """
     Multiplicative annealing schedule for temperature parameters.
-    
+
     Implements: tau[step] = max(min_temp, init_temp * decay_rate^step)
-    
+
+    All defaults are imported from src.trainers.config to ensure consistency.
+
     Attributes:
-        init_temp: Initial temperature 
-        min_temp: Minimum temperature floor 
-        decay_rate: Multiplicative decay factor per step 
-        buffer: Stabilization buffer fraction (default 0.25)
-    
+        init_temp: Initial temperature (default: DEFAULT_TEMPERATURE_INIT)
+        min_temp: Minimum temperature floor (default: DEFAULT_TEMPERATURE_MIN)
+        decay_rate: Multiplicative decay factor per step (default: DEFAULT_ANNEAL_DECAY)
+        buffer: Stabilization buffer fraction (default: DEFAULT_ANNEAL_BUFFER)
+
     Properties:
         value: Current temperature
         step: Current iteration
         n_anneal: Projected iterations to reach convergence (including buffer)
     """
-    init_temp: float = 2.0
-    min_temp: float = 1e-4
-    decay_rate: float = 0.995
-    buffer: float = 0.25
+    init_temp: float = DEFAULT_TEMPERATURE_INIT
+    min_temp: float = DEFAULT_TEMPERATURE_MIN
+    decay_rate: float = DEFAULT_ANNEAL_DECAY
+    buffer: float = DEFAULT_ANNEAL_BUFFER
     
     def __post_init__(self):
         self._value: float = self.init_temp
@@ -110,21 +125,21 @@ def _resolve_temp(arg: Union[float, AnnealingSchedule]) -> float:
 
 
 def indicator_default(
-    V_tilde_norm: Numeric, 
-    temperature: Union[float, AnnealingSchedule], 
-    logit_clip: float = 20.0,
+    V_tilde_norm: Numeric,
+    temperature: Union[float, AnnealingSchedule],
+    logit_clip: float = DEFAULT_INDICATOR_LOGIT_CLIP,
     noise: bool = True
 ):
     """
     Compute smooth default probability using Gumbel-Sigmoid for exploration.
-    
+
     Formula:
         sigma( (-V_tilde/k + log(u) - log(1-u)) / tau )
-        
+
     Args:
         V_tilde_norm: Normalized latent value (V_tilde / k)
         temperature: Temperature parameter (tau)
-        logit_clip: Clip range for the normalized value (default 20.0)
+        logit_clip: Clip range for the normalized value (default: DEFAULT_INDICATOR_LOGIT_CLIP)
         noise: If True, add Gumbel noise. If False, use plain Sigmoid.
     """
     x = tf.convert_to_tensor(V_tilde_norm)
@@ -153,14 +168,14 @@ def indicator_default(
 
 def indicator_abs_gt(
     x: Numeric,
-    threshold: float = 1e-4,
+    threshold: float = DEFAULT_INDICATOR_THRESHOLD,
     temperature: Union[float, AnnealingSchedule] = 0.1,
-    logit_clip: float = 20.0,
+    logit_clip: float = DEFAULT_INDICATOR_LOGIT_CLIP,
     mode: Literal["hard", "ste", "soft"] = "soft"
 ) -> tf.Tensor:
     """
     Gate for |x| > threshold (epsilon).
-    
+
     Soft approximation: sigma( (|x| - epsilon) / tau )
     
     Args:
@@ -198,21 +213,21 @@ def indicator_abs_gt(
 
 def indicator_lt(
     x: Numeric,
-    threshold: float = 1e-4,
+    threshold: float = DEFAULT_INDICATOR_THRESHOLD,
     temperature: Union[float, AnnealingSchedule] = 0.1,
-    logit_clip: float = 20.0,
+    logit_clip: float = DEFAULT_INDICATOR_LOGIT_CLIP,
     mode: Literal["hard", "ste", "soft"] = "soft"
 ) -> tf.Tensor:
     """
     Gate for x < -threshold.
-    
+
     Soft approximation: sigma( -(x + epsilon) / tau )
-    
+
     Args:
         x: Input tensor (e.g. e/k)
-        threshold: Epsilon tolerance (epsilon)
+        threshold: Epsilon tolerance (default: DEFAULT_INDICATOR_THRESHOLD)
         temperature: Annealing temperature (tau)
-        logit_clip: Logit clipping bound
+        logit_clip: Logit clipping bound (default: DEFAULT_INDICATOR_LOGIT_CLIP)
         mode: "hard" (true indicator), "soft" (sigmoid), "ste" (straight-through)
     """
     x = tf.convert_to_tensor(x)
