@@ -1,10 +1,14 @@
 """
 tests/economy/test_natural_bounds.py
 
-Tests for normalized bounds calculation in src.economy.bounds.
+Tests for bounds calculation in src.economy.bounds.
 
 Reference:
     report_brief.md lines 84-122: Observation Normalization
+
+Note: Bounds are now returned in LEVELS (not as multipliers on k*).
+The user specifies bounds as multipliers, but the returned bounds are
+already converted to level space for direct use by networks.
 """
 
 import pytest
@@ -14,8 +18,8 @@ from src.economy.bounds import (
     BoundsConfig,
     compute_ergodic_log_z_bounds,
     compute_k_star,
-    compute_normalized_k_bounds,
-    compute_normalized_b_bound,
+    compute_k_bounds_levels,
+    compute_b_bound_levels,
     generate_states_bounds,
     generate_bounds_from_config,
     # Legacy functions (deprecated)
@@ -110,12 +114,12 @@ class TestComputeKStar:
         assert np.isclose(k_star, 100.0), f"Expected k_star=100.0, got {k_star}"
 
 
-class TestNormalizedKBounds:
-    """Tests for compute_normalized_k_bounds function."""
+class TestKBoundsLevels:
+    """Tests for compute_k_bounds_levels function."""
 
-    def test_normalized_bounds_are_multipliers(self):
-        """Normalized k bounds ARE the multipliers, not level bounds."""
-        k_bounds, k_star = compute_normalized_k_bounds(
+    def test_k_bounds_are_levels(self):
+        """k bounds are returned in LEVELS (multiplier * k_star)."""
+        k_bounds, k_star = compute_k_bounds_levels(
             k_min_multiplier=0.2,
             k_max_multiplier=3.0,
             theta=0.5,
@@ -124,46 +128,48 @@ class TestNormalizedKBounds:
             mu=0.0
         )
 
-        # Bounds should be exactly the multipliers
-        assert k_bounds == (0.2, 3.0), f"Expected (0.2, 3.0), got {k_bounds}"
-
         # k_star should be 25.0 (from previous test)
         assert np.isclose(k_star, 25.0), f"Expected k_star=25.0, got {k_star}"
 
+        # Bounds should be multipliers * k_star = (0.2 * 25, 3.0 * 25) = (5.0, 75.0)
+        assert np.isclose(k_bounds[0], 5.0), f"Expected k_min=5.0, got {k_bounds[0]}"
+        assert np.isclose(k_bounds[1], 75.0), f"Expected k_max=75.0, got {k_bounds[1]}"
+
     def test_k_star_override(self):
         """k_star_override bypasses auto-calculation."""
-        k_bounds, k_star = compute_normalized_k_bounds(
+        k_bounds, k_star = compute_k_bounds_levels(
             k_min_multiplier=0.2,
             k_max_multiplier=3.0,
             theta=0.5,
             r=0.04,
             delta=0.06,
             mu=0.0,
-            k_star_override=999.0
+            k_star_override=100.0
         )
 
         # k_star should be the override value
-        assert k_star == 999.0, f"Expected k_star=999.0, got {k_star}"
+        assert k_star == 100.0, f"Expected k_star=100.0, got {k_star}"
 
-        # Bounds should still be the multipliers
-        assert k_bounds == (0.2, 3.0)
+        # Bounds should be multipliers * k_star = (0.2 * 100, 3.0 * 100) = (20.0, 300.0)
+        assert np.isclose(k_bounds[0], 20.0), f"Expected k_min=20.0, got {k_bounds[0]}"
+        assert np.isclose(k_bounds[1], 300.0), f"Expected k_max=300.0, got {k_bounds[1]}"
 
 
-class TestNormalizedBBound:
-    """Tests for compute_normalized_b_bound function."""
+class TestBBoundLevels:
+    """Tests for compute_b_bound_levels function."""
 
-    def test_normalized_b_max_formula(self):
-        """b_max = z_max * k_max^(theta-1) + 1."""
-        # k_max = 3.0 (normalized), z_max = 1.0, theta = 0.5
-        # b_max = 1.0 * 3.0^(-0.5) + 1 = 1/sqrt(3) + 1 ≈ 0.577 + 1 = 1.577
-        b_max = compute_normalized_b_bound(theta=0.5, k_max=3.0, z_max=1.0)
-        expected = 1.0 * (3.0 ** (-0.5)) + 1
+    def test_b_bound_levels_formula(self):
+        """b_max = z_max * k_max^theta + k_max (in LEVELS)."""
+        # k_max = 75.0 (level), z_max = 1.0, theta = 0.5
+        # b_max = 1.0 * 75.0^0.5 + 75.0 = sqrt(75) + 75 ≈ 8.66 + 75 = 83.66
+        b_max = compute_b_bound_levels(theta=0.5, k_max=75.0, z_max=1.0)
+        expected = 1.0 * (75.0 ** 0.5) + 75.0
         assert np.isclose(b_max, expected), f"Expected {expected}, got {b_max}"
 
-    def test_normalized_b_max_large_z(self):
-        """b_max scales with z_max."""
-        b_max = compute_normalized_b_bound(theta=0.5, k_max=2.0, z_max=10.0)
-        expected = 10.0 * (2.0 ** (-0.5)) + 1
+    def test_b_bound_scales_with_z_and_k(self):
+        """b_max scales with z_max and k_max."""
+        b_max = compute_b_bound_levels(theta=0.5, k_max=100.0, z_max=2.0)
+        expected = 2.0 * (100.0 ** 0.5) + 100.0  # 2 * 10 + 100 = 120
         assert np.isclose(b_max, expected), f"Expected {expected}, got {b_max}"
 
 
@@ -171,7 +177,7 @@ class TestGenerateStatesBounds:
     """Tests for generate_states_bounds (main integration function)."""
 
     def test_full_bounds_generation(self):
-        """Integration test for full normalized bounds generation."""
+        """Integration test for bounds generation in LEVELS."""
         shock_params = ShockParams(rho=0.0, sigma=1e-8, mu=0.0)  # approx deterministic z=1
 
         bounds = generate_states_bounds(
@@ -190,16 +196,17 @@ class TestGenerateStatesBounds:
         assert "log_z" in bounds
         assert "k_star" in bounds
 
-        # k bounds should be the multipliers directly
-        assert bounds["k"] == (0.2, 3.0), f"Expected k=(0.2, 3.0), got {bounds['k']}"
-
         # k_star should be 25.0
         assert np.isclose(bounds["k_star"], 25.0), f"Expected k_star=25.0, got {bounds['k_star']}"
 
-        # b bounds: (0, b_max) where b_max = z_max * k_max^(theta-1) + 1
-        # With z_max ≈ 1, k_max = 3.0, theta = 0.5:
-        # b_max = 1.0 * 3.0^(-0.5) + 1 ≈ 1.577
-        expected_b_max = 1.0 * (3.0 ** (-0.5)) + 1
+        # k bounds should be in LEVELS: (0.2 * 25, 3.0 * 25) = (5.0, 75.0)
+        assert np.isclose(bounds["k"][0], 5.0), f"Expected k_min=5.0, got {bounds['k'][0]}"
+        assert np.isclose(bounds["k"][1], 75.0), f"Expected k_max=75.0, got {bounds['k'][1]}"
+
+        # b bounds: (0, b_max) where b_max = z_max * k_max^theta + k_max (in LEVELS)
+        # With z_max ≈ 1, k_max = 75.0 (level), theta = 0.5:
+        # b_max = 1.0 * 75.0^0.5 + 75.0 ≈ 8.66 + 75 = 83.66
+        expected_b_max = 1.0 * (75.0 ** 0.5) + 75.0
         assert bounds["b"][0] == 0.0
         assert np.isclose(bounds["b"][1], expected_b_max, rtol=0.01)
 
@@ -238,7 +245,7 @@ class TestGenerateBoundsFromConfig:
     """Tests for generate_bounds_from_config convenience function."""
 
     def test_from_config(self):
-        """Bounds generated from BoundsConfig object."""
+        """Bounds generated from BoundsConfig object are in LEVELS."""
         config = BoundsConfig(m=3.0, k_min=0.2, k_max=3.0)
         shock_params = ShockParams(rho=0.0, sigma=1e-8, mu=0.0)
 
@@ -250,8 +257,12 @@ class TestGenerateBoundsFromConfig:
             shock_params=shock_params
         )
 
-        assert bounds["k"] == (0.2, 3.0)
+        # k_star = 25.0
         assert np.isclose(bounds["k_star"], 25.0)
+
+        # k bounds in LEVELS: (0.2 * 25, 3.0 * 25) = (5.0, 75.0)
+        assert np.isclose(bounds["k"][0], 5.0)
+        assert np.isclose(bounds["k"][1], 75.0)
 
 
 class TestLegacyFunctions:

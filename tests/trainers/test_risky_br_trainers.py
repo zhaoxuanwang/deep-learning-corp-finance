@@ -66,6 +66,8 @@ def networks(params, bounds):
         k_max=bounds['k'][1],
         b_min=bounds['b'][0],
         b_max=bounds['b'][1],
+        logz_min=bounds['log_z'][0],
+        logz_max=bounds['log_z'][1],
         r_risk_free=params.r_rate,
         n_layers=2,
         n_neurons=16,

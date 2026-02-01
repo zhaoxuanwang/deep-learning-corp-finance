@@ -33,11 +33,17 @@ from src.networks import (
 def basic_networks():
     """Create basic model networks."""
     policy = BasicPolicyNetwork(
-        k_min=0.01, k_max=10.0, 
-        n_layers=2, n_neurons=16, 
+        k_min=0.01, k_max=10.0,
+        logz_min=-1.0, logz_max=1.0,
+        n_layers=2, n_neurons=16,
         activation="swish"
     )
-    value = BasicValueNetwork(n_layers=2, n_neurons=16, activation="swish")
+    value = BasicValueNetwork(
+        k_min=0.01, k_max=10.0,
+        logz_min=-1.0, logz_max=1.0,
+        n_layers=2, n_neurons=16,
+        activation="swish"
+    )
     # Build networks
     k = tf.constant([[1.0]])
     z = tf.constant([[1.0]])
@@ -52,10 +58,17 @@ def risky_networks():
     tf.random.set_seed(42)
     policy = RiskyPolicyNetwork(
         k_min=0.01, k_max=10.0, b_min=0.0, b_max=5.0,
+        logz_min=-1.0, logz_max=1.0,
         n_layers=2, n_neurons=16, activation="swish"
     )
-    value = RiskyValueNetwork(n_layers=2, n_neurons=16, activation="swish")
+    value = RiskyValueNetwork(
+        k_min=0.01, k_max=10.0, b_max=5.0,
+        logz_min=-1.0, logz_max=1.0,
+        n_layers=2, n_neurons=16, activation="swish"
+    )
     price = RiskyPriceNetwork(
+        k_min=0.01, k_max=10.0, b_max=5.0,
+        logz_min=-1.0, logz_max=1.0,
         r_risk_free=0.04, n_layers=2, n_neurons=16, activation="swish"
     )
     # Build networks

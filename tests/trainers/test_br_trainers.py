@@ -79,6 +79,7 @@ def networks():
     """Build policy and value networks."""
     policy_net, value_net = build_basic_networks(
         k_min=0.1, k_max=10.0,
+        logz_min=-0.5, logz_max=0.5,
         n_layers=2, n_neurons=16,
         activation='relu'
     )
@@ -295,6 +296,7 @@ class TestBRTargetNetworks:
         # Clone networks for second trainer
         policy_net2, value_net2 = build_basic_networks(
             k_min=0.1, k_max=10.0,
+            logz_min=-0.5, logz_max=0.5,
             n_layers=2, n_neurons=16,
             activation='relu'
         )
@@ -376,6 +378,7 @@ class TestBRCriticUpdate:
         # Clone for trainer with more steps
         policy_net2, value_net2 = build_basic_networks(
             k_min=0.1, k_max=10.0,
+            logz_min=-0.5, logz_max=0.5,
             n_layers=2, n_neurons=16,
             activation='relu'
         )

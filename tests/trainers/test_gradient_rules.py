@@ -29,8 +29,8 @@ class TestStopGradientRules:
     
     def test_critic_does_not_update_policy(self):
         """Critic step should not produce gradients for policy params."""
-        policy_net = BasicPolicyNetwork(k_min=0.01, k_max=10.0, n_layers=2, n_neurons=8, activation="swish")
-        value_net = BasicValueNetwork(n_layers=2, n_neurons=8, activation="swish")
+        policy_net = BasicPolicyNetwork(k_min=0.01, k_max=10.0, logz_min=-1.0, logz_max=1.0, n_layers=2, n_neurons=8, activation="swish")
+        value_net = BasicValueNetwork(k_min=0.01, k_max=10.0, logz_min=-1.0, logz_max=1.0, n_layers=2, n_neurons=8, activation="swish")
 
         # Build networks
         k_dummy = tf.constant([[1.0]])
@@ -56,8 +56,8 @@ class TestStopGradientRules:
     
     def test_actor_does_not_update_value(self):
         """Actor step should not update value network parameters."""
-        policy_net = BasicPolicyNetwork(k_min=0.01, k_max=10.0, n_layers=2, n_neurons=8, activation="swish")
-        value_net = BasicValueNetwork(n_layers=2, n_neurons=8, activation="swish")
+        policy_net = BasicPolicyNetwork(k_min=0.01, k_max=10.0, logz_min=-1.0, logz_max=1.0, n_layers=2, n_neurons=8, activation="swish")
+        value_net = BasicValueNetwork(k_min=0.01, k_max=10.0, logz_min=-1.0, logz_max=1.0, n_layers=2, n_neurons=8, activation="swish")
 
         # Build networks
         k_dummy = tf.constant([[1.0]])
@@ -83,8 +83,8 @@ class TestStopGradientRules:
 
     def test_actor_has_gradient_through_value(self):
         """Actor loss should have gradient w.r.t. policy via value function."""
-        policy_net = BasicPolicyNetwork(k_min=0.01, k_max=10.0, n_layers=2, n_neurons=8, activation="swish")
-        value_net = BasicValueNetwork(n_layers=2, n_neurons=8, activation="swish")
+        policy_net = BasicPolicyNetwork(k_min=0.01, k_max=10.0, logz_min=-1.0, logz_max=1.0, n_layers=2, n_neurons=8, activation="swish")
+        value_net = BasicValueNetwork(k_min=0.01, k_max=10.0, logz_min=-1.0, logz_max=1.0, n_layers=2, n_neurons=8, activation="swish")
         
         k = tf.constant([[2.0]], dtype=tf.float32)
         z = tf.constant([[1.0]], dtype=tf.float32)

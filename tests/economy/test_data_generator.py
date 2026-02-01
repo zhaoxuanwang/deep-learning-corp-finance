@@ -50,7 +50,8 @@ def basic_generator(shock_params):
         T=5,
         n_sim_batches=10,
         N_val=32,
-        N_test=64
+        N_test=64,
+        save_to_disk=False  # Prevent cache pollution during tests
     )
 
 
@@ -595,7 +596,8 @@ class TestConvenienceFunction:
             theta=params.theta, r=params.r_rate, delta=params.delta,
             sim_batch_size=16,
             T=5,
-            n_sim_batches=10
+            n_sim_batches=10,
+            save_to_disk=False  # Prevent cache pollution during tests
         )
 
         assert isinstance(gen, DataGenerator)
@@ -613,7 +615,8 @@ class TestConvenienceFunction:
                 'log_z': (-0.3, 0.3),
                 'b': (0.0, 5.0)
             },
-            auto_compute_bounds=False
+            auto_compute_bounds=False,
+            save_to_disk=False  # Prevent cache pollution during tests
         )
 
         # Check defaults

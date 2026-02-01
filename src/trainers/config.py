@@ -284,36 +284,46 @@ class ExperimentConfig:
 @dataclass
 class DataConfig:
     """
-    Configuration for data generation with normalized bounds.
+    Configuration for data generation with economically-anchored bounds.
 
-    This config wraps all data generation settings and provides:
-    1. Normalized bounds computation (k and b as multipliers on k*)
-    2. Clean summary display of all parameters
-    3. Cache management utilities
+    This config supports TWO modes for specifying bounds:
 
-    Bounds Constraints (per report_brief.md lines 111-114):
+    1. MODEL-BASED AUTO-COMPUTATION (default, recommended for economic models):
+       - Specify bounds as multipliers on steady-state k* (e.g., k_min=0.2, k_max=3.0)
+       - Bounds are converted to LEVELS internally
+       - Networks receive level values directly; no post-hoc conversion needed
+
+    2. DIRECT SPECIFICATION (for custom data or arbitrary units):
+       - Set auto_compute_bounds=False
+       - Pass bounds directly via custom_bounds in whatever units your data uses
+       - Framework is completely unit-agnostic
+
+    IMPORTANT: All bounds are ultimately expressed in LEVELS (actual values).
+    The multiplier notation is just a convenient way to specify bounds relative
+    to economic steady-state. Networks internally normalize to [0,1] for stability.
+
+    Bounds Constraints (for auto-compute mode):
         - std_dev_multiplier (m): Must be in (2, 5)
         - k_min_multiplier: Must be in (0, 0.5)
         - k_max_multiplier: Must be in (1.5, 5)
 
-    Usage Modes:
-        1. RECOMMENDED: Auto-compute bounds from economic parameters
+    Usage Examples:
+        1. Model-based (bounds computed from economic parameters):
            >>> data_config = DataConfig(
            ...     master_seed=(42, 0),
            ...     std_dev_multiplier=3.0,  # m for log_z bounds
-           ...     k_min_multiplier=0.2,    # k_min as fraction of k*
-           ...     k_max_multiplier=3.0     # k_max as multiple of k*
+           ...     k_min_multiplier=0.2,    # 20% of steady-state k*
+           ...     k_max_multiplier=3.0     # 300% of steady-state k*
            ... )
+           # Result: k_bounds might be (15.4, 231.7) in levels for k*=77.24
 
-        2. CUSTOM: Provide explicit bounds (disable auto-compute)
+        2. Custom bounds (for arbitrary data units):
            >>> data_config = DataConfig(
            ...     master_seed=(42, 0),
            ...     auto_compute_bounds=False,
-           ...     custom_bounds={'k': (0.1, 2.0), 'log_z': (-0.5, 0.5), 'b': (0.0, 1.5)}
+           ...     custom_bounds={'k': (5000, 10000), 'log_z': (-0.5, 0.5), 'b': (0, 20000)}
            ... )
-
-    Reference:
-        report_brief.md lines 84-122: Observation Normalization
+           # Result: Bounds used exactly as specified
     """
     # === Required ===
     master_seed: tuple  # (m0, m1) for RNG reproducibility
@@ -398,6 +408,60 @@ class DataConfig:
         print(f"{'='*width}")
         print(self.summary().to_string())
         print(f"{'='*width}\n")
+
+    def create_generator(
+        self,
+        params: "EconomicParams",
+        shock_params: "ShockParams",
+        verbose: bool = True
+    ):
+        """
+        Create a DataGenerator from this configuration.
+
+        This is a convenience method that calls create_data_generator() with
+        all fields from this DataConfig, avoiding verbose parameter passing.
+
+        Args:
+            params: Economic parameters (for bounds computation)
+            shock_params: Shock process parameters
+            verbose: Print configuration summary (default: True)
+
+        Returns:
+            Tuple of (DataGenerator, ShockParams, bounds_dict)
+
+        Example:
+            >>> data_config = DataConfig(master_seed=(42, 0), save_to_disk=False)
+            >>> generator, shock_params, bounds = data_config.create_generator(
+            ...     params=EconomicParams(),
+            ...     shock_params=ShockParams()
+            ... )
+        """
+        from src.economy.data_generator import create_data_generator
+
+        # Determine bounds to pass
+        bounds = self.custom_bounds if not self.auto_compute_bounds else None
+
+        return create_data_generator(
+            master_seed=self.master_seed,
+            T=self.T,
+            sim_batch_size=self.sim_batch_size,
+            n_sim_batches=self.n_sim_batches,
+            N_val=self.N_val,
+            N_test=self.N_test,
+            theta=params.theta,
+            r=params.r_rate,
+            delta=params.delta,
+            shock_params=shock_params,
+            bounds=bounds,
+            auto_compute_bounds=self.auto_compute_bounds,
+            std_dev_multiplier=self.std_dev_multiplier,
+            k_min_multiplier=self.k_min_multiplier,
+            k_max_multiplier=self.k_max_multiplier,
+            k_star_override=self.k_star_override,
+            cache_dir=self.cache_dir,
+            save_to_disk=self.save_to_disk,
+            verbose=verbose
+        )
 
 
 # =============================================================================

@@ -3,7 +3,7 @@ archive/
 notebooks/
 .venv/
 .DS_Store
-src/evaluation/  # Work-in-progress evaluation module (not ready for commit)
+docs/
 
 # --- Python Standard Exclusions ---
 __pycache__/
@@ -23,3 +23,26 @@ __pycache__/
 *.npz
 *.csv
 *.png
+
+# --- Model Checkpoints ---
+*.keras
+results/
+checkpoints/
+
+# --- Quarto / LaTeX Generated Files ---
+# Keep only: .md, .ipynb, .pdf in report/
+*.aux
+*.log
+*.tex
+*.toc
+*.out
+*.fls
+*.fdb_latexmk
+*.synctex.gz
+*.bbl
+*.blg
+*.nav
+*.snm
+*.vrb
+*_files/
+.quarto/

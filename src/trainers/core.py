@@ -208,8 +208,8 @@ def execute_training_loop(
                     history[k] = []
                 history[k].append(v)
             
-            # Console Log (less frequent)
-            if i % (opt_config.log_every * 10) == 0:
+            # Console Log
+            if i % opt_config.log_every == 0:
                  # Find all loss keys and format them
                  loss_keys = sorted([k for k in metrics.keys() if "loss" in k.lower()])
 

@@ -92,6 +92,7 @@ def networks():
     """Build policy and value networks."""
     policy_net, value_net = build_basic_networks(
         k_min=0.1, k_max=10.0,
+        logz_min=-0.5, logz_max=0.5,
         n_layers=2, n_neurons=16,
         activation='swish'
     )
@@ -177,8 +178,8 @@ class TestBasicERIgnoresDebt:
     ):
         """ER trainer produces identical loss whether data has 'b' or not."""
         # Build two identical networks
-        policy_net1, _ = build_basic_networks(k_min=0.1, k_max=10.0, n_layers=2, n_neurons=16, activation='swish')
-        policy_net2, _ = build_basic_networks(k_min=0.1, k_max=10.0, n_layers=2, n_neurons=16, activation='swish')
+        policy_net1, _ = build_basic_networks(k_min=0.1, k_max=10.0, logz_min=-0.5, logz_max=0.5, n_layers=2, n_neurons=16, activation='swish')
+        policy_net2, _ = build_basic_networks(k_min=0.1, k_max=10.0, logz_min=-0.5, logz_max=0.5, n_layers=2, n_neurons=16, activation='swish')
 
         # Build them
         dummy_k = tf.constant([[1.0]], dtype=tf.float32)

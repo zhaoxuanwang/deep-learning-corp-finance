@@ -73,6 +73,7 @@ def policy_net():
     """Policy network for testing."""
     policy, _ = build_basic_networks(
         k_min=0.1, k_max=10.0,
+        logz_min=-0.5, logz_max=0.5,
         n_layers=2, n_neurons=16,
         activation='swish'
     )
@@ -230,6 +231,7 @@ class TestTargetNetwork:
 
         policy_net2, _ = build_basic_networks(
             k_min=0.1, k_max=10.0,
+            logz_min=-0.5, logz_max=0.5,
             n_layers=2, n_neurons=16,
             activation='swish'
         )

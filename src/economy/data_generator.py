@@ -1050,15 +1050,22 @@ def create_data_generator(
     verbose: bool = False
 ) -> Tuple[DataGenerator, ShockParams, Dict[str, Any]]:
     """
-    Factory function to create a DataGenerator with NORMALIZED bounds.
+    Factory function to create a DataGenerator with economically-anchored bounds.
 
-    IMPORTANT: Capital and debt bounds are now NORMALIZED as multipliers on k*.
-    - k ∈ [k_min, k_max] where these are multipliers on steady-state k*
-    - b ∈ [0, b_max] where b_max = π(k_max, z_max)/k_max + 1
-    - The bounds dict includes 'k_star' for de-normalization after training
+    This function supports TWO modes:
 
-    Reference:
-        report_brief.md lines 84-122: Observation Normalization
+    1. MODEL-BASED AUTO-COMPUTATION (default, recommended for economic models):
+       - Specify bounds as multipliers on steady-state k* (e.g., k_min=0.2, k_max=3.0)
+       - Bounds are converted to LEVELS internally and returned ready for use
+       - Networks receive level values directly; no post-hoc conversion needed
+
+    2. DIRECT SPECIFICATION (for custom data or arbitrary units):
+       - Pass bounds directly via the `bounds` parameter
+       - Set auto_compute_bounds=False to skip economic model
+       - Use any units your data requires - framework is unit-agnostic
+
+    The returned bounds dict contains all values in LEVELS (actual values, not
+    multipliers). The k_star field is included for reference/documentation only.
 
     Args:
         master_seed: Master seed pair (m0, m1)
@@ -1071,8 +1078,10 @@ def create_data_generator(
         r: Risk-free rate (default: from EconomicParams)
         delta: Depreciation rate (default: from EconomicParams)
         shock_params: Shock parameters (if None, uses defaults)
-        bounds: Dictionary of bounds (k, log_z, b, k_star). Can be partial if auto_compute_bounds=True.
-        auto_compute_bounds: If True, missing bounds are auto-generated using economic params.
+        bounds: Dictionary of bounds in LEVELS (k, log_z, b). Can be partial if auto_compute_bounds=True.
+            For custom data, pass bounds directly in your data's units.
+        auto_compute_bounds: If True, missing bounds are auto-generated from economic params.
+            Set to False when using custom bounds with arbitrary units.
         std_dev_multiplier: m, number of std devs for log_z bounds (must be in (2, 5), default 3.0)
         k_min_multiplier: k_min as multiplier on k* (must be in (0, 0.5), default 0.2)
         k_max_multiplier: k_max as multiplier on k* (must be in (1.5, 5), default 3.0)
@@ -1085,7 +1094,8 @@ def create_data_generator(
         Tuple containing:
         - DataGenerator instance
         - ShockParams used
-        - Bounds dictionary (includes 'k', 'b', 'log_z', 'k_star')
+        - Bounds dictionary in LEVELS (includes 'k', 'b', 'log_z', 'k_star')
+          Note: k_star is for reference only; k bounds are already in levels.
     """
     from src.economy.bounds import generate_states_bounds
 
@@ -1123,7 +1133,7 @@ def create_data_generator(
             if 'k_star' not in bounds: bounds['k_star'] = auto_bounds['k_star']
 
             if verbose:
-                print(" Auto-generated NORMALIZED bounds (k, b as multipliers on k*)")
+                print(" Auto-generated bounds in LEVELS (from economic parameters)")
     else:
         # Strict mode: verify all bounds exist
         missing = []
@@ -1142,10 +1152,10 @@ def create_data_generator(
                 print(f" Auto-computed k_star = {bounds['k_star']:.4f}")
 
     if verbose:
-        print(f"  k_bounds (normalized): {bounds['k']}")
-        print(f"  b_bounds (normalized): {bounds['b']}")
+        print(f"  k_bounds (LEVELS): {bounds['k']}")
+        print(f"  b_bounds (LEVELS): {bounds['b']}")
         print(f"  log_z_bounds: {bounds['log_z']}")
-        print(f"  k_star (for de-normalization): {bounds.get('k_star', 'N/A')}")
+        print(f"  k_star (reference): {bounds.get('k_star', 'N/A')}")
         print(f"  Master seed: {master_seed}")
 
     # Step 3: Create data generator
@@ -1171,7 +1181,7 @@ def create_data_generator(
         print(f"  Simulation batches (J): {generator.n_sim_batches}")
         print(f"  Total samples: {generator.sim_batch_size * generator.n_sim_batches}")
         if 'k_star' in bounds:
-            print(f"  NOTE: Training in normalized space. Multiply k by k_star={bounds['k_star']:.4f} to get levels.")
+            print(f"  NOTE: Bounds are in LEVELS. k_star={bounds['k_star']:.4f} is for reference only.")
 
     return generator, shock_params, bounds
 
