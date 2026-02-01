@@ -40,6 +40,9 @@ class BasicTrainerLR:
     """
     Method 1: Lifetime Reward Maximization for Basic model.
     Trains policy network by maximizing expected discounted rewards.
+
+    Note: Network and data operate in LEVELS. The network's internal
+    normalization (bounded sigmoid) handles numerical stability.
     """
     def __init__(
         self,
@@ -101,6 +104,8 @@ class BasicTrainerLR:
                 z_curr = tf.reshape(z_path[:, t], [-1, 1])
 
                 k_next = self.policy_net(k, z_curr)
+
+                # k and k_next are in LEVELS - pass directly to economic functions
                 reward = compute_cash_flow_basic(k, k_next, z_curr, self.params, temperature=temperature, logit_clip=self.logit_clip)
                 rewards_list.append(reward)
 
@@ -155,6 +160,8 @@ class BasicTrainerLR:
         for t in range(self.T):
             z_curr = tf.reshape(z_path[:, t], [-1, 1])
             k_next = self.policy_net(k, z_curr)
+
+            # k and k_next are in LEVELS - pass directly to economic functions
             reward = compute_cash_flow_basic(k, k_next, z_curr, self.params, temperature=temperature, logit_clip=self.logit_clip)
             rewards_list.append(reward)
             k = k_next
@@ -189,6 +196,9 @@ class BasicTrainerER:
     - Uses target policy network for computing k'' (two-step lookahead)
     - Polyak averaging to update target network
     - No time loops - batch-based one-step optimization
+
+    Note: Network and data operate in LEVELS. The network's internal
+    normalization (bounded sigmoid) handles numerical stability.
 
     Reference:
         report_brief.md lines 486-520: "Algorithm Summary: ER Method"
@@ -312,7 +322,7 @@ class BasicTrainerER:
             # Compute k' using current policy
             k_next = self.policy_net(k, z)
 
-            # Compute Euler LHS: χ = 1 + ψ_I(I, k)
+            # k and k_next are in LEVELS - pass directly to Euler primitives
             chi = euler_chi(k, k_next, self.params)
 
             # === FUTURE STEP - MAIN FORK (Target Policy) ===
@@ -379,6 +389,8 @@ class BasicTrainerER:
 
         # Current step
         k_next = self.policy_net(k, z)
+
+        # k and k_next are in LEVELS - pass directly to Euler primitives
         chi = euler_chi(k, k_next, self.params)
 
         # Future step (target policy)
@@ -417,6 +429,8 @@ class BasicTrainerBR:
     - Critic uses TARGET networks for computing targets (stability)
     - Actor uses CURRENT networks but freezes value weights during update
 
+    Note: Network and data operate in LEVELS. The network's internal
+    normalization (bounded sigmoid) handles numerical stability.
     """
     def __init__(
         self,
@@ -608,6 +622,7 @@ class BasicTrainerBR:
                 # === Compute Critic Targets (Detached) ===
                 # Reference: report_brief.md line 605-606
                 # "Compute the fixed Bellman target (detach gradients)"
+                # k and k_next are already in LEVELS - pass directly to economic functions
                 e = compute_cash_flow_basic(
                     k, k_next, z,
                     self.params,
@@ -661,6 +676,7 @@ class BasicTrainerBR:
             V_next_main = self.value_net(k_next, z_next_main)
 
             # === Compute Cash Flow ===
+            # k and k_next are already in LEVELS - pass directly to economic functions
             e = compute_cash_flow_basic(
                 k, k_next, z,
                 self.params,
@@ -725,6 +741,7 @@ class BasicTrainerBR:
         V_next_main = self.target_value_net(k_next, z_next_main)
         V_next_fork = self.target_value_net(k_next, z_next_fork)
 
+        # k and k_next are already in LEVELS - pass directly to economic functions
         e = compute_cash_flow_basic(k, k_next, z, self.params, temperature=temperature, logit_clip=self.logit_clip)
 
         y1 = e + self.beta * V_next_main
@@ -736,6 +753,7 @@ class BasicTrainerBR:
         # Actor evaluation (using current policy)
         k_next_actor = self.policy_net(k, z)
         V_next_actor = self.value_net(k_next_actor, z_next_main)
+        # k and k_next_actor are already in LEVELS - pass directly to economic functions
         e_actor = compute_cash_flow_basic(k, k_next_actor, z, self.params, temperature=temperature, logit_clip=self.logit_clip)
         loss_actor = -tf.reduce_mean(e_actor + self.beta * V_next_actor)
 
@@ -824,10 +842,15 @@ def train_basic_lr(
     tf_dataset = tf_dataset.shuffle(buffer_size=dataset['k0'].shape[0]).batch(opt_config.batch_size).repeat()
     data_iter = iter(tf_dataset)
 
+    # Extract log_z bounds
+    logz_bounds = bounds['log_z']
+
     # 1. Build Networks
     policy_net, _ = build_basic_networks(
         k_min=k_bounds[0],
         k_max=k_bounds[1],
+        logz_min=logz_bounds[0],
+        logz_max=logz_bounds[1],
         n_layers=net_config.n_layers,
         n_neurons=net_config.n_neurons,
         activation=net_config.activation
@@ -835,6 +858,7 @@ def train_basic_lr(
 
     # 2. Setup Trainer with gradient clipping support
     optimizer = create_optimizer(opt_config.learning_rate, opt_config.optimizer)
+
     trainer = BasicTrainerLR(
         policy_net=policy_net,
         params=params,
@@ -917,6 +941,7 @@ def train_basic_er(
             - _params: Economic parameters
     """
     k_bounds = bounds['k']
+    logz_bounds = bounds['log_z']
 
     # Validate dataset format
     required_keys = {'k', 'z', 'z_next_main', 'z_next_fork'}
@@ -935,6 +960,8 @@ def train_basic_er(
     policy_net, _ = build_basic_networks(
         k_min=k_bounds[0],
         k_max=k_bounds[1],
+        logz_min=logz_bounds[0],
+        logz_max=logz_bounds[1],
         n_layers=net_config.n_layers,
         n_neurons=net_config.n_neurons,
         activation=net_config.activation
@@ -1029,6 +1056,7 @@ def train_basic_br(
             - _params: Economic parameters
     """
     k_bounds = bounds['k']
+    logz_bounds = bounds['log_z']
 
     # Validate dataset format
     required_keys = {'k', 'z', 'z_next_main', 'z_next_fork'}
@@ -1047,6 +1075,8 @@ def train_basic_br(
     policy_net, value_net = build_basic_networks(
         k_min=k_bounds[0],
         k_max=k_bounds[1],
+        logz_min=logz_bounds[0],
+        logz_max=logz_bounds[1],
         n_layers=net_config.n_layers,
         n_neurons=net_config.n_neurons,
         activation=net_config.activation

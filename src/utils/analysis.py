@@ -131,14 +131,72 @@ def summarize_batch(batch: dict, batch_idx: int = 1):
                   f"min={values.min():.4f} max={values.max():.4f}")
 
 
+# =============================================================================
+# ANALYTICAL SOLUTIONS
+# =============================================================================
+
+def compute_frictionless_policy(z, params, shock_params):
+    """
+    Compute analytical optimal policy for basic model without adjustment costs.
+
+    The frictionless solution (no adjustment costs) has closed-form:
+
+        k'(z) = [γ * E[z' | z] / (r + δ)]^(1/(1-γ))
+
+    where E[z' | z] is the expected next-period productivity given current z.
+
+    For the AR(1) process: log(z') = (1-ρ)*μ + ρ*log(z) + σ*ε, ε ~ N(0,1)
+
+        E[z' | z] = exp((1-ρ)*μ) * z^ρ * exp(0.5*σ²)
+
+    This gives the final formula:
+
+        k'(z) = [γ * exp((1-ρ)*μ + 0.5*σ²) * z^ρ / (r + δ)]^(1/(1-γ))
+
+    Note: The optimal policy depends only on z, not on current capital k.
+
+    Args:
+        z: Productivity level(s). Can be scalar or array.
+        params: EconomicParams with theta (γ), r_rate, delta.
+        shock_params: ShockParams with rho, sigma, mu.
+
+    Returns:
+        Optimal next-period capital k'(z) in levels. Same shape as input z.
+    """
+    gamma = params.theta
+    rho = shock_params.rho
+    sigma = shock_params.sigma
+    mu = shock_params.mu
+
+    r = params.r_rate
+    delta = params.delta
+
+    # E[z' | z] = exp((1-rho)*mu) * z^rho * exp(0.5*sigma^2)
+    # k' = [gamma * E[z' | z] / (r + delta)]^(1/(1-gamma))
+    #
+    # Combining the exp() terms for clarity:
+    # exp_correction = exp((1-rho)*mu + 0.5*sigma^2)
+    exp_correction = np.exp((1 - rho) * mu + 0.5 * sigma ** 2)
+
+    numerator = gamma * (z ** rho) * exp_correction
+    denominator = r + delta
+    k_prime = (numerator / denominator) ** (1 / (1 - gamma))
+
+    return k_prime
+
+
+# =============================================================================
+# POLICY EVALUATION
+# =============================================================================
+
 def evaluate_policy(
     result: Dict[str, Any],
     k_bounds: tuple,
     logz_bounds: tuple,
     b_bounds: Optional[tuple] = None,
-    n_k: int = 50,
-    n_z: int = 15,
-    n_b: int = 10,
+    n_k: int = 100,
+    n_z: int = 50,
+    n_b: int = 100,
     # Fixed indices (alternative to fixed values)
     fixed_k_idx: Optional[int] = None,
     fixed_z_idx: Optional[int] = None,
@@ -387,7 +445,7 @@ def get_steady_state_policy(
     k_bounds: tuple,
     logz_bounds: tuple,
     b_bounds: Optional[tuple] = None,
-    n_grid: int = 200,
+    n_grid: int = 500,
     outlier_pct: float = 0.05,
 ) -> Dict[str, Any]:
     """

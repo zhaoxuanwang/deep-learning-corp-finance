@@ -562,6 +562,9 @@ def train_risky_br(
             f"Use DataGenerator.get_flattened_training_dataset(include_debt=True) for Risky BR method."
         )
 
+    # Extract log_z bounds
+    logz_bounds = bounds['log_z']
+
     # Create batched iterator
     tf_dataset = tf.data.Dataset.from_tensor_slices(dataset)
     tf_dataset = tf_dataset.shuffle(buffer_size=dataset['k'].shape[0]).batch(opt_config.batch_size).repeat()
@@ -571,6 +574,7 @@ def train_risky_br(
     policy_net, value_net, price_net = build_risky_networks(
         k_min=k_bounds[0], k_max=k_bounds[1],
         b_min=b_bounds[0], b_max=b_bounds[1],
+        logz_min=logz_bounds[0], logz_max=logz_bounds[1],
         r_risk_free=params.r_rate,
         n_layers=net_config.n_layers,
         n_neurons=net_config.n_neurons,

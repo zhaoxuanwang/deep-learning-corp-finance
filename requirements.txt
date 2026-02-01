@@ -1,43 +1,18 @@
 # Core Deep Learning Framework
-tensorflow==2.16.2
-keras==3.13.0
-# NOTE: For Apple Silicon, install tensorflow-macos and tensorflow-metal manually
-
-# TensorFlow Dependencies
-tensorboard==2.16.2
-tensorboard-data-server==0.7.2
-absl-py==2.3.1
-astunparse==1.6.3
-flatbuffers==25.12.19
-gast==0.7.0
-google-pasta==0.2.0
-grpcio==1.76.0
-h5py==3.15.1
-libclang==18.1.1
-Markdown==3.10
-MarkupSafe==3.0.3
-ml-dtypes==0.3.2
-namex==0.1.0
-opt_einsum==3.4.0
-optree==0.18.0
-protobuf==4.25.8
-termcolor==3.2.0
-wrapt==2.0.1
+tensorflow>=2.16.0,<2.18.0
+keras>=3.0.0
+# NOTE: For Apple Silicon, install tensorflow-macos and tensorflow-metal instead
 
 # Numerical Computing & Data
-numpy==1.26.4
-pandas>=2.0.0  # Used by ExperimentConfig.summary() and notebooks
+numpy>=1.26.0,<2.0.0
+pandas>=2.0.0  # Used in notebooks and ExperimentConfig.summary()
 
 # Visualization
-matplotlib==3.10.0
-seaborn==0.14.0
+matplotlib>=3.8.0
+seaborn>=0.13.0
 
-# Economic Modeling (for DDP reference solvers)
-quantecon==0.10.1
+# Economic Modeling (DDP reference solvers)
+quantecon>=0.7.0
 
 # Testing
-pytest==9.0.2
-
-# Utilities
-packaging==25.0
-typing_extensions==4.15.0
+pytest>=8.0.0
