@@ -1044,6 +1044,9 @@ def create_data_generator(
     k_min_multiplier: float = 0.2,
     k_max_multiplier: float = 3.0,
     k_star_override: Optional[float] = None,
+    # Collateral constraint parameters for debt bounds
+    tax: float = EconomicParams.tax,
+    frac_liquid: float = EconomicParams.frac_liquid,
     # Config
     cache_dir: Optional[str] = None,
     save_to_disk: bool = True,
@@ -1086,6 +1089,8 @@ def create_data_generator(
         k_min_multiplier: k_min as multiplier on k* (must be in (0, 0.5), default 0.2)
         k_max_multiplier: k_max as multiplier on k* (must be in (1.5, 5), default 3.0)
         k_star_override: Optional override for k* (if None, auto-computed at z=e^μ)
+        tax: Corporate tax rate for collateral constraint (default: from EconomicParams)
+        frac_liquid: Liquidation fraction for collateral constraint (default: from EconomicParams)
         cache_dir: Directory for caching (default: None -> PROJECT_ROOT/data)
         save_to_disk: Whether to save to disk (default: True)
         verbose: Print configuration summary
@@ -1124,7 +1129,9 @@ def create_data_generator(
                 k_min_multiplier=k_min_multiplier,
                 k_max_multiplier=k_max_multiplier,
                 k_star_override=k_star_override,
-                validate=True  # Enforce constraints from report_brief.md
+                validate=True,  # Enforce constraints from report_brief.md
+                tax=tax,
+                frac_liquid=frac_liquid
             )
             # Fill missing
             if 'k' not in bounds: bounds['k'] = auto_bounds['k']

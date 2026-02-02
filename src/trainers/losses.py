@@ -99,7 +99,7 @@ def compute_er_loss_aio(
     f2: tf.Tensor
 ) -> tf.Tensor:
     """
-    Compute Euler Residual loss using All-in-One (AiO) method.
+    Compute Euler Residual loss using AiO (cross-product) method.
 
     L_ER = mean(f1 * f2)
 
@@ -107,19 +107,46 @@ def compute_er_loss_aio(
         f = 1 - beta * m(k', k'', z') / chi(k, k')
     and chi = 1 + psi_I(I, k), m = pi_k - psi_k + (1-delta)*chi'
 
-    The AiO trick: E[(f)^2] = E[f1 * f2] when f1, f2 are computed with
-    independent draws of z'.
+    This is an UNBIASED estimator of E[f²], but the loss value can be
+    negative when residuals have opposite signs.
 
     Args:
         f1: Unit-free Euler residual computed with shock draw 1
         f2: Unit-free Euler residual computed with shock draw 2
 
     Returns:
-        Scalar loss
+        Scalar loss (can be negative)
 
     Reference: report_brief.md lines 599-604
     """
     return tf.reduce_mean(f1 * f2)
+
+
+def compute_er_loss_mse(
+    f1: tf.Tensor,
+    f2: tf.Tensor
+) -> tf.Tensor:
+    """
+    Compute Euler Residual loss using MSE (Mean Squared Error).
+
+    L_ER = mean(0.5 * (f1² + f2²))
+
+    where f is the unit-free Euler residual:
+        f = 1 - beta * m(k', k'', z') / chi(k, k')
+
+    This is BIASED but stable:
+    - Always non-negative (easier to monitor convergence)
+    - The bias is a constant that doesn't affect gradient direction
+    - Industry standard for residual minimization
+
+    Args:
+        f1: Unit-free Euler residual computed with shock draw 1
+        f2: Unit-free Euler residual computed with shock draw 2
+
+    Returns:
+        Scalar loss (always >= 0)
+    """
+    return tf.reduce_mean(0.5 * (f1**2 + f2**2))
 
 
 def compute_lifetime_er_loss_aio(
@@ -152,28 +179,63 @@ def compute_br_critic_loss_aio(
     y2: tf.Tensor
 ) -> tf.Tensor:
     """
-    Compute Bellman Residual critic loss using AiO method.
-    
+    Compute Bellman Residual critic loss using AiO (cross-product) method.
+
     L_critic = mean((V - y1) * (V - y2))
-    
+
     where y = e + beta * V_next (with V_next DETACHED).
-    
+
+    This is an UNBIASED estimator of E[(V - E[y])²], but the loss value
+    can be negative when residuals have opposite signs, making convergence
+    monitoring difficult.
+
     IMPORTANT: y1, y2 should be computed with detached V_next values.
     The LHS V_curr remains trainable.
-    
+
     Args:
         V_curr: Current value prediction (trainable)
         y1: Target computed with shock draw 1 (contains detached continuation)
         y2: Target computed with shock draw 2 (contains detached continuation)
-    
+
     Returns:
-        Scalar loss
-    
+        Scalar loss (can be negative)
+
     Reference: outline_v2.md lines 262-264
     """
     delta1 = V_curr - y1
     delta2 = V_curr - y2
     return tf.reduce_mean(delta1 * delta2)
+
+
+def compute_br_critic_loss_mse(
+    V_curr: tf.Tensor,
+    y1: tf.Tensor,
+    y2: tf.Tensor
+) -> tf.Tensor:
+    """
+    Compute Bellman Residual critic loss using MSE (Mean Squared Error).
+
+    L_critic = mean(0.5 * (delta1² + delta2²))
+
+    where delta = V - y, and y = e + beta * V_next (with V_next DETACHED).
+
+    This is the standard TD-learning loss, which is BIASED but stable:
+    - Always non-negative (easier to monitor convergence)
+    - The bias (includes Var(y)) is a constant that doesn't affect gradient direction
+    - Industry standard for actor-critic methods (DDPG, TD3, SAC, etc.)
+
+    Args:
+        V_curr: Current value prediction (trainable)
+        y1: Target computed with shock draw 1 (contains detached continuation)
+        y2: Target computed with shock draw 2 (contains detached continuation)
+
+    Returns:
+        Scalar loss (always >= 0)
+    """
+    delta1 = V_curr - y1
+    delta2 = V_curr - y2
+    # Average the squared errors from both forks
+    return tf.reduce_mean(0.5 * (delta1**2 + delta2**2))
 
 
 def compute_br_critic_diagnostics(
@@ -183,70 +245,87 @@ def compute_br_critic_diagnostics(
 ) -> Dict[str, float]:
     """
     Compute diagnostic metrics for BR critic.
-    
+
     The cross-product loss mean(delta1 * delta2) is unbiased but can be negative
     and non-monotone. These diagnostics provide more interpretable metrics.
-    
+
+    IMPORTANT: The absolute MSE naturally increases as the value function learns
+    to predict larger (more meaningful) values. The RELATIVE metrics (rel_mse,
+    rel_mae) are scale-invariant and better indicators of convergence.
+
     Args:
         V_curr: Current value prediction
         y1: Target computed with shock draw 1
         y2: Target computed with shock draw 2
-    
+
     Returns:
         Dict with:
             1. cross_product (the actual loss): mean(delta1 * delta2)
-            2. mse_proxy (always positive): mean(0.5 * (delta1^2 + delta2^2)) 
+            2. mse_proxy (always positive): mean(0.5 * (delta1^2 + delta2^2))
             3. mae_proxy (always positive): mean(0.5 * (|delta1| + |delta2|))
+            4. rel_mse (scale-invariant): mean((delta / |y|)^2), better for convergence monitoring
+            5. rel_mae (scale-invariant): mean(|delta / y|), interpretable as % error
+            6. mean_value_scale: mean(|y|), context for absolute metrics
     """
     delta1 = V_curr - y1
     delta2 = V_curr - y2
-    
+
     cross_product = float(tf.reduce_mean(delta1 * delta2))
     mse_proxy = float(tf.reduce_mean(0.5 * (delta1**2 + delta2**2)))
     mae_proxy = float(tf.reduce_mean(0.5 * (tf.abs(delta1) + tf.abs(delta2))))
-    
+
+    # Scale-invariant relative metrics (what really matters for convergence)
+    # Use |y| as denominator with small epsilon for stability
+    y_avg = 0.5 * (y1 + y2)
+    scale = tf.maximum(tf.abs(y_avg), 1.0)  # Avoid division by zero, min scale of 1
+
+    rel_delta1 = delta1 / scale
+    rel_delta2 = delta2 / scale
+
+    rel_mse = float(tf.reduce_mean(0.5 * (rel_delta1**2 + rel_delta2**2)))
+    rel_mae = float(tf.reduce_mean(0.5 * (tf.abs(rel_delta1) + tf.abs(rel_delta2))))
+    mean_value_scale = float(tf.reduce_mean(tf.abs(y_avg)))
+
     return {
         "cross_product": cross_product,
         "mse_proxy": mse_proxy,
         "mae_proxy": mae_proxy,
+        "rel_mse": rel_mse,
+        "rel_mae": rel_mae,
+        "mean_value_scale": mean_value_scale,
     }
 
 def compute_br_actor_loss(
     e: tf.Tensor,
-    V_next_1: tf.Tensor,
-    V_next_2: tf.Tensor,
+    V_next: tf.Tensor,
     beta: float
 ) -> tf.Tensor:
     """
     Compute Bellman Residual actor loss.
-    
-    L_actor = -mean(e + beta * (V'_1 + V'_2) / 2)
-    
-    Uses AVERAGED continuation values (not cross-product).
-    This is different from critic which uses product of residuals.
-    
+
+    L_actor = -mean(e + beta * V')
+
+    Uses only the MAIN shock continuation value (not cross-product or average).
+    This is different from critic which uses product of residuals from two forks.
+
     For actor: we want to MAXIMIZE the RHS, so we minimize the negative.
-    
-    IMPORTANT: V_next values should NOT be detached - gradients must flow
+
+    IMPORTANT: V_next should NOT be detached - gradients must flow
     through (k', b') to policy parameters.
-    
+
     Args:
         e: Current period reward (batch,)
-        V_next_1: Continuation value with shock draw 1
-        V_next_2: Continuation value with shock draw 2
+        V_next: Continuation value with main shock draw
         beta: Discount factor
-    
+
     Returns:
         Scalar loss
-    
-    Reference: outline_v2.md lines 267-271
+
+    Reference: report_brief.md lines 754-761
     """
-    # Average the two continuation values for variance reduction
-    V_next_avg = 0.5 * (V_next_1 + V_next_2)
-    
     # RHS of Bellman = e + beta * E[V']
-    rhs = e + beta * V_next_avg
-    
+    rhs = e + beta * V_next
+
     # MAXIMIZE RHS => minimize -RHS
     return -tf.reduce_mean(rhs)
 
@@ -254,30 +333,30 @@ def compute_br_actor_loss(
 def compute_br_actor_loss_risky(
     e: tf.Tensor,
     eta: tf.Tensor,
-    V_next_1: tf.Tensor,
-    V_next_2: tf.Tensor,
+    V_next: tf.Tensor,
     beta: float
 ) -> tf.Tensor:
     """
     Compute BR actor loss for Risky Debt model.
-    
-    L_actor = -mean(e - eta + beta * (V'_1 + V'_2) / 2)
-    
+
+    L_actor = -mean(e - eta + beta * V')
+
+    Uses only the MAIN shock continuation value (not cross-product or average).
     where V' = max{0, V_tilde'} (limited liability applied)
-    
+
     Args:
         e: Cash flow (batch,)
         eta: External financing cost (batch,)
-        V_next_1: Continuation value with shock draw 1 (after relu)
-        V_next_2: Continuation value with shock draw 2 (after relu)
+        V_next: Continuation value with main shock draw (after limited liability)
         beta: Discount factor
-    
+
     Returns:
         Scalar loss
+
+    Reference: report_brief.md lines 988-989
     """
-    V_next_avg = V_next_1
     payout = e - eta
-    rhs = payout + beta * V_next_avg
+    rhs = payout + beta * V_next
     return -tf.reduce_mean(rhs)
 
 
@@ -290,22 +369,50 @@ def compute_price_loss_aio(
     f2: tf.Tensor
 ) -> tf.Tensor:
     """
-    Compute price loss using AiO method.
-    
+    Compute price loss using AiO (cross-product) method.
+
     L_price = mean(f1 * f2)
-    
+
     where f = b'(1+r) - [p^D * R + (1-p^D) * b'*(1+r_tilde)]
-    
+
+    This is an UNBIASED estimator of E[f²], but the loss value can be
+    negative when residuals have opposite signs.
+
     Args:
         f1: Price residual with shock draw 1
         f2: Price residual with shock draw 2
-    
+
     Returns:
-        Scalar loss
-    
+        Scalar loss (can be negative)
+
     Reference: outline_v2.md lines 322-325
     """
     return tf.reduce_mean(f1 * f2)
+
+
+def compute_price_loss_mse(
+    f1: tf.Tensor,
+    f2: tf.Tensor
+) -> tf.Tensor:
+    """
+    Compute price loss using MSE (Mean Squared Error).
+
+    L_price = mean(0.5 * (f1² + f2²))
+
+    where f = b'(1+r) - [p^D * R + (1-p^D) * b'*(1+r_tilde)]
+
+    This is BIASED but stable:
+    - Always non-negative (easier to monitor convergence)
+    - The bias is a constant that doesn't affect gradient direction
+
+    Args:
+        f1: Price residual with shock draw 1
+        f2: Price residual with shock draw 2
+
+    Returns:
+        Scalar loss (always >= 0)
+    """
+    return tf.reduce_mean(0.5 * (f1**2 + f2**2))
 
 
 def compute_price_residual(

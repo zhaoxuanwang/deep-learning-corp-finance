@@ -139,6 +139,11 @@ class RiskyDebtConfig:
     # Default 0.1 because BR loss is typically 100x larger than price loss
     weight_br: float = DEFAULT_WEIGHT_BR
 
+    # Loss computation method for critic:
+    # - "mse": Mean Squared Error, L = E[f²], biased but stable (industry standard)
+    # - "crossprod": AiO cross-product, L = E[f₁·f₂], unbiased but can be negative
+    loss_type: str = "mse"
+
     # LR method: adaptive Lagrange multiplier parameters
     lambda_price_init: float = 1.0
     learning_rate_lambda: float = 0.01
@@ -150,16 +155,42 @@ class RiskyDebtConfig:
     # NOTE: Default probability smoothing (epsilon_D) is now handled by AnnealingConfig
     # Use AnnealingConfig in train_risky_br() for temperature annealing
 
+    def __post_init__(self):
+        valid_loss_types = {"mse", "crossprod"}
+        if self.loss_type not in valid_loss_types:
+            raise ValueError(
+                f"loss_type must be one of {valid_loss_types}, got '{self.loss_type}'"
+            )
+
 
 @dataclass
 class MethodConfig:
     """
     Configuration for the solution method (Algorithm).
+
+    Attributes:
+        name: Method identifier (e.g., "basic_lr", "basic_er", "basic_br", "risky_br")
+        n_critic: Number of critic updates per actor update (BR methods only)
+        polyak_tau: Polyak averaging coefficient for target networks (ER/BR methods)
+        loss_type: Loss computation method for ER/BR critic updates:
+            - "crossprod": AiO cross-product E[f₁·f₂], unbiased but can be negative (default)
+            - "mse": Mean Squared Error E[f²], biased but stable (industry standard)
+            For basic models, "crossprod" is default (backward compatible, works adequately).
+            For risky debt, configure via RiskyDebtConfig.loss_type instead.
+        risky: Optional configuration for risky debt model
     """
     name: str  # e.g., "basic_lr", "basic_er", "risky_br", etc.
     n_critic: int = DEFAULT_N_CRITIC  # Critic updates per actor update (BR methods)
     polyak_tau: float = DEFAULT_POLYAK_TAU  # Polyak averaging coefficient for target networks (ER/BR methods)
+    loss_type: str = "crossprod"  # "crossprod" (default, backward compatible) or "mse" (stable)
     risky: Optional[RiskyDebtConfig] = None
+
+    def __post_init__(self):
+        valid_loss_types = {"mse", "crossprod"}
+        if self.loss_type not in valid_loss_types:
+            raise ValueError(
+                f"loss_type must be one of {valid_loss_types}, got '{self.loss_type}'"
+            )
 
 
 # =============================================================================

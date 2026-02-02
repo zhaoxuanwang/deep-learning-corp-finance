@@ -156,38 +156,65 @@ class TestKBoundsLevels:
 
 
 class TestBBoundLevels:
-    """Tests for compute_b_bound_levels function."""
+    """Tests for compute_b_bound_levels function with collateral constraint."""
 
     def test_b_bound_levels_formula(self):
-        """b_max = z_max * k_max^theta + k_max (in LEVELS)."""
-        # k_max = 75.0 (level), z_max = 1.0, theta = 0.5
-        # b_max = 1.0 * 75.0^0.5 + 75.0 = sqrt(75) + 75 ≈ 8.66 + 75 = 83.66
-        b_max = compute_b_bound_levels(theta=0.5, k_max=75.0, z_max=1.0)
-        expected = 1.0 * (75.0 ** 0.5) + 75.0
+        """
+        b_max = (1-τ) * π(k_max, z_min) + τ * δ * k_max + s_liquid * k_max
+
+        This is the collateral constraint formula from report_brief.md.
+        """
+        # Parameters: k_max=75.0, z_min=1.0, theta=0.5, tax=0.3, delta=0.06, frac_liquid=0.5
+        # π(k_max, z_min) = 1.0 * 75^0.5 = 8.66
+        # b_max = 0.7 * 8.66 + 0.3 * 0.06 * 75 + 0.5 * 75 = 6.06 + 1.35 + 37.5 = 44.91
+        b_max = compute_b_bound_levels(
+            theta=0.5, k_max=75.0, z_min=1.0,
+            tax=0.3, delta=0.06, frac_liquid=0.5
+        )
+        pi_worst = 1.0 * (75.0 ** 0.5)
+        expected = 0.7 * pi_worst + 0.3 * 0.06 * 75.0 + 0.5 * 75.0
         assert np.isclose(b_max, expected), f"Expected {expected}, got {b_max}"
 
-    def test_b_bound_scales_with_z_and_k(self):
-        """b_max scales with z_max and k_max."""
-        b_max = compute_b_bound_levels(theta=0.5, k_max=100.0, z_max=2.0)
-        expected = 2.0 * (100.0 ** 0.5) + 100.0  # 2 * 10 + 100 = 120
-        assert np.isclose(b_max, expected), f"Expected {expected}, got {b_max}"
+    def test_b_bound_scales_with_z_min_and_k(self):
+        """b_max scales with z_min and k_max under collateral constraint."""
+        # Lower z_min should reduce b_max (worse productivity = lower collateral value)
+        b_max_high_z = compute_b_bound_levels(
+            theta=0.5, k_max=100.0, z_min=1.0,
+            tax=0.3, delta=0.06, frac_liquid=0.5
+        )
+        b_max_low_z = compute_b_bound_levels(
+            theta=0.5, k_max=100.0, z_min=0.5,
+            tax=0.3, delta=0.06, frac_liquid=0.5
+        )
+        # Lower z_min should give lower b_max
+        assert b_max_low_z < b_max_high_z, (
+            f"Lower z_min should reduce b_max: z_min=0.5 gave {b_max_low_z}, "
+            f"z_min=1.0 gave {b_max_high_z}"
+        )
 
 
 class TestGenerateStatesBounds:
     """Tests for generate_states_bounds (main integration function)."""
 
     def test_full_bounds_generation(self):
-        """Integration test for bounds generation in LEVELS."""
+        """Integration test for bounds generation in LEVELS with collateral constraint."""
         shock_params = ShockParams(rho=0.0, sigma=1e-8, mu=0.0)  # approx deterministic z=1
+
+        # Use explicit collateral constraint parameters
+        tax = 0.3
+        delta = 0.06
+        frac_liquid = 0.5
 
         bounds = generate_states_bounds(
             theta=0.5,
             r=0.04,
-            delta=0.06,
+            delta=delta,
             shock_params=shock_params,
             std_dev_multiplier=3.0,
             k_min_multiplier=0.2,
-            k_max_multiplier=3.0
+            k_max_multiplier=3.0,
+            tax=tax,
+            frac_liquid=frac_liquid
         )
 
         # Check all expected keys exist
@@ -203,12 +230,17 @@ class TestGenerateStatesBounds:
         assert np.isclose(bounds["k"][0], 5.0), f"Expected k_min=5.0, got {bounds['k'][0]}"
         assert np.isclose(bounds["k"][1], 75.0), f"Expected k_max=75.0, got {bounds['k'][1]}"
 
-        # b bounds: (0, b_max) where b_max = z_max * k_max^theta + k_max (in LEVELS)
-        # With z_max ≈ 1, k_max = 75.0 (level), theta = 0.5:
-        # b_max = 1.0 * 75.0^0.5 + 75.0 ≈ 8.66 + 75 = 83.66
-        expected_b_max = 1.0 * (75.0 ** 0.5) + 75.0
+        # b bounds: (0, b_max) using COLLATERAL CONSTRAINT:
+        # b_max = (1-τ) * π(k_max, z_min) + τ * δ * k_max + s_liquid * k_max
+        # With z_min ≈ 1, k_max = 75.0 (level), theta = 0.5, tax=0.3, delta=0.06, frac_liquid=0.5:
+        # π(k_max, z_min) = 1.0 * 75^0.5 = 8.66
+        # b_max = 0.7 * 8.66 + 0.3 * 0.06 * 75 + 0.5 * 75 = 6.06 + 1.35 + 37.5 ≈ 44.91
+        pi_worst = 1.0 * (75.0 ** 0.5)
+        expected_b_max = (1 - tax) * pi_worst + tax * delta * 75.0 + frac_liquid * 75.0
         assert bounds["b"][0] == 0.0
-        assert np.isclose(bounds["b"][1], expected_b_max, rtol=0.01)
+        assert np.isclose(bounds["b"][1], expected_b_max, rtol=0.01), (
+            f"Expected b_max={expected_b_max:.2f}, got {bounds['b'][1]:.2f}"
+        )
 
     def test_validation_enforced(self):
         """Validation rejects out-of-range parameters."""

@@ -28,7 +28,10 @@ from src.networks.network_risky import (
 from src.trainers.losses import (
     compute_lr_loss,
     compute_price_loss_aio,
+    compute_price_loss_mse,
     compute_br_critic_loss_aio,
+    compute_br_critic_loss_mse,
+    compute_br_critic_diagnostics,
     compute_br_actor_loss_risky,
 )
 from src.utils.annealing import AnnealingSchedule, indicator_default
@@ -75,7 +78,9 @@ class RiskyDebtTrainerBR:
         n_critic_steps: int,
         polyak_tau: float,
         smoothing: AnnealingSchedule,
-        logit_clip: float
+        logit_clip: float,
+        b_max: float = None,
+        loss_type: str = "mse"
     ):
         """
         Initialize the BR trainer with target networks.
@@ -99,6 +104,12 @@ class RiskyDebtTrainerBR:
                 Create from AnnealingConfig parameters.
             logit_clip: Clipping bound for logits in smooth indicators.
                 Use AnnealingConfig.logit_clip (default: DEFAULT_LOGIT_CLIP = 20.0).
+            b_max: Maximum debt bound for constraint binding diagnostics.
+                If None, diagnostics related to constraint binding are skipped.
+            loss_type: Loss computation method for critic.
+                - "mse": Mean Squared Error (biased but stable, industry standard)
+                - "crossprod": AiO cross-product (unbiased but can be negative)
+                Use RiskyDebtConfig.loss_type (default: "mse").
         """
         self.policy_net = policy_net
         self.value_net = value_net
@@ -111,11 +122,18 @@ class RiskyDebtTrainerBR:
         self.smoothing = smoothing
         self.logit_clip = logit_clip
         self.beta = 1.0 / (1.0 + params.r_rate)
+        self.b_max = b_max  # For constraint binding diagnostics
+        self.loss_type = loss_type  # "mse" or "crossprod"
+
+        # Validate loss_type
+        valid_loss_types = {"mse", "crossprod"}
+        if loss_type not in valid_loss_types:
+            raise ValueError(f"loss_type must be one of {valid_loss_types}, got '{loss_type}'")
 
         # Log critical hyperparameters for visibility in notebooks
         logger.info(
             f"RiskyDebtTrainerBR initialized: weight_br={weight_br:.2f}, "
-            f"n_critic={n_critic_steps}, polyak_tau={polyak_tau}"
+            f"n_critic={n_critic_steps}, polyak_tau={polyak_tau}, loss_type={loss_type}"
         )
 
         # Store optimizers (created externally with gradient clipping support)
@@ -218,11 +236,14 @@ class RiskyDebtTrainerBR:
             # Reference: report_brief.md line 1044: "Get next actions"
             k_next, b_next = self.target_policy_net(k, b, z)
 
-            # === Compute Bond Price using CURRENT Price Network (Trainable) ===
-            q = self.price_net(k_next, b_next, z)
+            # === Compute Bond Prices ===
+            # For Bellman target: use TARGET price network (stable target)
+            # For pricing loss: use CURRENT price network (trainable)
+            q_target = self.target_price_net(k_next, b_next, z)  # For Bellman target
+            q = self.price_net(k_next, b_next, z)  # For pricing residual (trainable)
 
-            # === Compute Cash Flow ===
-            e = cash_flow_risky_debt_q(k, k_next, b, b_next, z, q, self.params,
+            # === Compute Cash Flow using TARGET price (for stable Bellman target) ===
+            e = cash_flow_risky_debt_q(k, k_next, b, b_next, z, q_target, self.params,
                                         temperature=temperature, logit_clip=self.logit_clip)
             eta = external_financing_cost(e, k, self.params, temperature=temperature, logit_clip=self.logit_clip)
 
@@ -237,6 +258,7 @@ class RiskyDebtTrainerBR:
             V_eff_2, p_D_2 = compute_effective_value(V_tilde_next_2, k_next, temperature, self.logit_clip, noise=True)
 
             # === Compute Bellman Targets (Detached) ===
+            # All components use TARGET networks for stability
             # Reference: report_brief.md line 1047: "y = e - η + β·V_eff"
             y1 = tf.stop_gradient(e - eta + self.beta * V_eff_1)
             y2 = tf.stop_gradient(e - eta + self.beta * V_eff_2)
@@ -244,11 +266,14 @@ class RiskyDebtTrainerBR:
             # === Compute Current Value (Trainable) ===
             V_curr = self.value_net(k, b, z)
 
-            # === Bellman Residual Loss (AiO) ===
+            # === Bellman Residual Loss ===
             # Reference: report_brief.md lines 1056-1057
-            loss_br = compute_br_critic_loss_aio(V_curr, y1, y2)
+            if self.loss_type == "mse":
+                loss_br = compute_br_critic_loss_mse(V_curr, y1, y2)
+            else:  # "crossprod"
+                loss_br = compute_br_critic_loss_aio(V_curr, y1, y2)
 
-            # === Pricing Residual Loss (AiO) ===
+            # === Pricing Residual Loss ===
             # Reference: report_brief.md lines 1048-1062
             R_1 = recovery_value(k_next, z_next_main, self.params)
             R_2 = recovery_value(k_next, z_next_fork, self.params)
@@ -256,7 +281,10 @@ class RiskyDebtTrainerBR:
             # Pricing residual: f = q·b'·(1+r) - β·[(1-p)·b' + p·R]
             f_p1 = pricing_residual_bond_price(q, b_next, self.params.r_rate, p_D_1, R_1)
             f_p2 = pricing_residual_bond_price(q, b_next, self.params.r_rate, p_D_2, R_2)
-            loss_price = compute_price_loss_aio(f_p1, f_p2)
+            if self.loss_type == "mse":
+                loss_price = compute_price_loss_mse(f_p1, f_p2)
+            else:  # "crossprod"
+                loss_price = compute_price_loss_aio(f_p1, f_p2)
 
             # === Combined Critic Loss ===
             # L_critic = weight_br * L_BR + L_price (price weight = 1.0 implicit)
@@ -269,10 +297,16 @@ class RiskyDebtTrainerBR:
         grads = tape.gradient(total_loss, critic_vars)
         self.optimizer_critic.apply_gradients(zip(grads, critic_vars))
 
+        # Compute relative diagnostics (scale-invariant metrics for monitoring)
+        diagnostics = compute_br_critic_diagnostics(V_curr, y1, y2)
+
         return {
             "loss_br": float(loss_br),
             "loss_price": float(loss_price),
-            "mean_p_default": float(tf.reduce_mean(0.5 * (p_D_1 + p_D_2)))
+            "mean_p_default": float(tf.reduce_mean(0.5 * (p_D_1 + p_D_2))),
+            "rel_mse": diagnostics["rel_mse"],
+            "rel_mae": diagnostics["rel_mae"],
+            "mean_value_scale": diagnostics["mean_value_scale"],
         }
 
     def _actor_step(
@@ -348,6 +382,110 @@ class RiskyDebtTrainerBR:
             "mean_p_default_actor": float(tf.reduce_mean(p_D))
         }
 
+    def _compute_diagnostics(
+        self,
+        k: tf.Tensor,
+        b: tf.Tensor,
+        z: tf.Tensor,
+        z_next_main: tf.Tensor,
+        temperature: float
+    ) -> Dict[str, float]:
+        """
+        Compute diagnostic metrics for monitoring training health.
+
+        Tracks:
+        1. Constraint binding: fraction of b' near b_max
+        2. Default rate: fraction of observations with high default probability
+        3. Leverage statistics: mean and max b'/k'
+
+        These diagnostics help verify:
+        - The collateral constraint isn't binding at optimum (should be << 100%)
+        - Default rates are reasonable (not 0% or 100%)
+        - Leverage is within economically sensible ranges
+
+        Args:
+            k: Current capital (batch_size, 1)
+            b: Current debt (batch_size, 1)
+            z: Current productivity (batch_size, 1)
+            z_next_main: Next productivity (batch_size, 1)
+            temperature: Current annealing temperature
+
+        Returns:
+            Dict with diagnostic metrics
+        """
+        from src.networks.network_risky import compute_effective_value
+
+        # Get policy outputs (without gradients)
+        k_next, b_next = self.policy_net(k, b, z)
+
+        # === 1. Constraint Binding Diagnostics ===
+        constraint_metrics = {}
+        if self.b_max is not None:
+            # Fraction of b' within 5% of b_max
+            b_next_flat = tf.reshape(b_next, [-1])
+            threshold_high = 0.95 * self.b_max
+            frac_at_limit = tf.reduce_mean(
+                tf.cast(b_next_flat >= threshold_high, tf.float32)
+            )
+            constraint_metrics["frac_b_at_limit"] = float(frac_at_limit)
+
+            # Also track fraction at very low b (near 0)
+            threshold_low = 0.05 * self.b_max
+            frac_at_zero = tf.reduce_mean(
+                tf.cast(b_next_flat <= threshold_low, tf.float32)
+            )
+            constraint_metrics["frac_b_near_zero"] = float(frac_at_zero)
+
+        # === 2. Default Probability Diagnostics ===
+        # Compute value at next state
+        V_tilde_next = self.value_net(k_next, b_next, z_next_main)
+        V_eff, p_default = compute_effective_value(
+            V_tilde_next, k_next, temperature, self.logit_clip, noise=False
+        )
+
+        # Hard default rate: p_default > 0.5
+        p_default_flat = tf.reshape(p_default, [-1])
+        frac_default_hard = tf.reduce_mean(
+            tf.cast(p_default_flat > 0.5, tf.float32)
+        )
+
+        # Soft default rate: p_default > 0.1 (early warning)
+        frac_default_soft = tf.reduce_mean(
+            tf.cast(p_default_flat > 0.1, tf.float32)
+        )
+
+        default_metrics = {
+            "frac_default_hard": float(frac_default_hard),  # p > 0.5
+            "frac_default_soft": float(frac_default_soft),  # p > 0.1
+            "p_default_max": float(tf.reduce_max(p_default_flat)),
+            "p_default_std": float(tf.math.reduce_std(p_default_flat))
+        }
+
+        # === 3. Leverage Diagnostics ===
+        k_next_flat = tf.reshape(k_next, [-1])
+        safe_k = tf.maximum(k_next_flat, 1e-8)
+        leverage = tf.reshape(b_next, [-1]) / safe_k
+
+        leverage_metrics = {
+            "leverage_mean": float(tf.reduce_mean(leverage)),
+            "leverage_max": float(tf.reduce_max(leverage)),
+            "leverage_std": float(tf.math.reduce_std(leverage))
+        }
+
+        # === 4. Policy Output Statistics ===
+        policy_metrics = {
+            "k_next_mean": float(tf.reduce_mean(k_next)),
+            "b_next_mean": float(tf.reduce_mean(b_next)),
+            "V_eff_mean": float(tf.reduce_mean(V_eff))
+        }
+
+        return {
+            **constraint_metrics,
+            **default_metrics,
+            **leverage_metrics,
+            **policy_metrics
+        }
+
     def train_step(
         self,
         k: tf.Tensor,
@@ -394,12 +532,18 @@ class RiskyDebtTrainerBR:
         critic_losses = []
         price_losses = []
         p_defaults = []
+        rel_mses = []
+        rel_maes = []
+        value_scales = []
 
         for _ in range(self.n_critic_steps):
             critic_metrics = self._critic_step(k, b, z, z_next_main, z_next_fork, temp)
             critic_losses.append(critic_metrics["loss_br"])
             price_losses.append(critic_metrics["loss_price"])
             p_defaults.append(critic_metrics["mean_p_default"])
+            rel_mses.append(critic_metrics["rel_mse"])
+            rel_maes.append(critic_metrics["rel_mae"])
+            value_scales.append(critic_metrics["mean_value_scale"])
 
         # === B. Actor Update (Once) ===
         actor_metrics = self._actor_step(k, b, z, z_next_main, temp)
@@ -410,14 +554,21 @@ class RiskyDebtTrainerBR:
         # === Update Annealing Schedule ===
         self.smoothing.update()
 
+        # === C. Compute Diagnostic Metrics ===
+        diagnostics = self._compute_diagnostics(k, b, z, z_next_main, temp)
+
         return {
             "loss_critic": float(np.mean(critic_losses)),
             "loss_actor": actor_metrics["loss_actor"],
             "loss_price": float(np.mean(price_losses)),
             "mean_p_default": float(np.mean(p_defaults)),
             "mean_bellman_rhs": actor_metrics["mean_bellman_rhs"],
+            "rel_mse": float(np.mean(rel_mses)),
+            "rel_mae": float(np.mean(rel_maes)),
+            "mean_value_scale": float(np.mean(value_scales)),
             "temperature": temp,
-            **target_updates
+            **target_updates,
+            **diagnostics
         }
 
     def evaluate(
@@ -455,11 +606,11 @@ class RiskyDebtTrainerBR:
         z_next_main = tf.reshape(z_next_main, [-1, 1])
         z_next_fork = tf.reshape(z_next_fork, [-1, 1])
 
-        # Critic evaluation (using target networks)
+        # Critic evaluation (using target networks for consistent Bellman target)
         k_next, b_next = self.target_policy_net(k, b, z)
-        q = self.price_net(k_next, b_next, z)
+        q_target = self.target_price_net(k_next, b_next, z)  # Use target price for Bellman target
 
-        e = cash_flow_risky_debt_q(k, k_next, b, b_next, z, q, self.params,
+        e = cash_flow_risky_debt_q(k, k_next, b, b_next, z, q_target, self.params,
                                     temperature=temperature, logit_clip=self.logit_clip)
         eta = external_financing_cost(e, k, self.params, temperature=temperature, logit_clip=self.logit_clip)
 
@@ -609,7 +760,9 @@ def train_risky_br(
         n_critic_steps=method_config.n_critic,
         polyak_tau=method_config.polyak_tau,
         smoothing=smoothing,
-        logit_clip=anneal_config.logit_clip
+        logit_clip=anneal_config.logit_clip,
+        b_max=b_bounds[1],  # For constraint binding diagnostics
+        loss_type=risky_cfg.loss_type  # "mse" (stable) or "crossprod" (unbiased)
     )
 
     # Setup validation function (for early stopping)
