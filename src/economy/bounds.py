@@ -284,31 +284,46 @@ def compute_natural_k_bounds(
 def compute_b_bound_levels(
     theta: float,
     k_max: float,
-    z_max: float
+    z_min: float,
+    tax: float,
+    delta: float,
+    frac_liquid: float
 ) -> float:
     """
-    Compute borrowing limit in LEVELS.
+    Compute borrowing limit in LEVELS using collateral constraint.
 
-    The natural borrowing limit is the maximum value a firm can generate:
-        b_max = π(k_max, z_max) + k_max
-              = z_max * k_max^θ + k_max
+    The maximum borrowing is capped by the collateral constraint:
+        b_max = (1-τ) π(k_max, z_min) + τ δ k_max + s_liquid · k_max
 
-    This represents production plus liquidation value of capital.
+    This represents the worst-case liquidation value of the firm at z_min,
+    which is much tighter than the old "natural borrowing limit" that used z_max.
+
+    The constraint ensures firms cannot borrow more than they could repay
+    even in the worst productivity state, preventing excessive leverage.
 
     Reference:
-        report_brief.md lines 96-100: Borrowing limit formula
+        report_brief.md "Debt Bounds" section: Collateral constraint formula
 
     Args:
         theta: Production elasticity (θ in the report)
         k_max: Maximum capital in LEVELS
-        z_max: Maximum productivity LEVEL (not log)
+        z_min: Minimum productivity LEVEL (not log) - worst case scenario
+        tax: Corporate tax rate (τ)
+        delta: Depreciation rate (δ)
+        frac_liquid: Liquidation fraction (s_liquid) in [0, 1]
 
     Returns:
         b_max: Borrowing limit in LEVELS
     """
-    # b_max = production + capital value
-    production = z_max * (k_max ** theta)
-    b_max = production + k_max
+    # Production at worst state: π(k_max, z_min) = z_min * k_max^θ
+    pi_worst = z_min * (k_max ** theta)
+
+    # Collateral constraint components:
+    # 1. After-tax production value: (1-τ) * π
+    # 2. Tax shield on depreciation: τ * δ * k
+    # 3. Liquidation value of capital: s_liquid * k
+    b_max = (1 - tax) * pi_worst + tax * delta * k_max + frac_liquid * k_max
+
     return float(b_max)
 
 
@@ -321,10 +336,14 @@ def compute_natural_b_bound(
     """
     [DEPRECATED] Compute natural borrowing limit (B_max) in level space.
 
-    NOTE: This function is deprecated. Use compute_b_bound_levels() instead.
-    Both functions are equivalent; this one is kept for backward compatibility.
+    NOTE: This function is deprecated and uses the OLD formula.
+    Use compute_b_bound_levels() instead, which implements the tighter
+    collateral constraint from report_brief.md.
 
-    B_max = z_max * (k_max)^theta + k_max
+    OLD formula: B_max = z_max * (k_max)^theta + k_max
+    NEW formula: B_max = (1-τ) π(k_max, z_min) + τ δ k_max + s_liquid · k_max
+
+    The new formula is much tighter and prevents excessive leverage.
 
     Args:
         theta: Production elasticity
@@ -332,10 +351,11 @@ def compute_natural_b_bound(
         z_max: Maximum productivity (level, not log)
 
     Returns:
-        b_max (float) in LEVEL space
+        b_max (float) in LEVEL space (using OLD formula)
     """
     warnings.warn(
-        "compute_natural_b_bound is deprecated. Use compute_b_bound_levels() instead.",
+        "compute_natural_b_bound is deprecated and uses the OLD formula. "
+        "Use compute_b_bound_levels() with collateral constraint parameters instead.",
         DeprecationWarning,
         stacklevel=2
     )
@@ -352,25 +372,34 @@ def generate_states_bounds(
     k_min_multiplier: float,
     k_max_multiplier: float,
     k_star_override: Optional[float] = None,
-    validate: bool = True
+    validate: bool = True,
+    # Collateral constraint parameters (with defaults from EconomicParams)
+    tax: float = 0.3,
+    frac_liquid: float = 0.5
 ) -> Dict[str, any]:
     """
     Generate consistent sampling bounds for (k, b, z) in LEVELS.
 
     This function computes economically-anchored bounds:
     - k bounds are specified as multipliers on k* (steady-state), returned in LEVELS
-    - b bounds are the natural borrowing limit in LEVELS
+    - b bounds use collateral constraint at worst-case z_min (tighter than old formula)
     - log_z bounds cover the ergodic distribution
 
     The network's internal normalization (to [0,1]) is separate from these
     economic bounds. Networks receive level bounds and handle normalization
     internally via bounded sigmoid outputs.
 
+    Debt Bound Formula (Collateral Constraint):
+        b_max = (1-τ) π(k_max, z_min) + τ δ k_max + s_liquid · k_max
+
+    This is tighter than the old "natural borrowing limit" (which used z_max)
+    and prevents excessive leverage that destabilizes training.
+
     Reference:
-        report_brief.md lines 104-122: Summary of bounds module
+        report_brief.md "Debt Bounds" section: Collateral constraint
 
     Args:
-        theta: Production elasticity (γ in the report)
+        theta: Production elasticity (θ in the report)
         r: Risk-free rate
         delta: Depreciation rate
         shock_params: AR(1) shock parameters (μ, σ, ρ)
@@ -379,11 +408,13 @@ def generate_states_bounds(
         k_max_multiplier: k_max as multiplier on k* (1.5 < k_max < 5)
         k_star_override: Optional override for k* (if None, auto-computed)
         validate: If True, validate input constraints per report_brief.md
+        tax: Corporate tax rate τ (default: 0.3 from EconomicParams)
+        frac_liquid: Liquidation fraction s_liquid (default: 0.5 from EconomicParams)
 
     Returns:
         Dict containing:
             - "k": (k_min, k_max) capital bounds in LEVELS
-            - "b": (0, b_max) debt bounds in LEVELS
+            - "b": (0, b_max) debt bounds in LEVELS (using collateral constraint)
             - "log_z": (log_z_min, log_z_max) shock bounds
             - "k_star": steady-state capital (for reference/documentation)
 
@@ -404,6 +435,14 @@ def generate_states_bounds(
             raise ValueError(
                 f"k_max_multiplier must be in (1.5, 5), got {k_max_multiplier}"
             )
+        if not (0.0 <= tax < 1.0):
+            raise ValueError(
+                f"tax must be in [0, 1), got {tax}"
+            )
+        if not (0.0 <= frac_liquid <= 1.0):
+            raise ValueError(
+                f"frac_liquid must be in [0, 1], got {frac_liquid}"
+            )
 
     # 1. Z bounds (unchanged)
     log_z_bounds = compute_ergodic_log_z_bounds(
@@ -422,12 +461,20 @@ def generate_states_bounds(
         k_star_override=k_star_override
     )
 
-    # 3. B bounds in LEVELS - uses k_max in levels and z_max level
-    _, log_z_max = log_z_bounds
-    z_max = np.exp(log_z_max)
+    # 3. B bounds in LEVELS - uses collateral constraint at WORST case z_min
+    # This is much tighter than the old formula that used z_max
+    log_z_min, _ = log_z_bounds
+    z_min = np.exp(log_z_min)  # Worst-case productivity
     _, k_max = k_bounds  # k_max is now in LEVELS
 
-    b_max = compute_b_bound_levels(theta, k_max, z_max)
+    b_max = compute_b_bound_levels(
+        theta=theta,
+        k_max=k_max,
+        z_min=z_min,
+        tax=tax,
+        delta=delta,
+        frac_liquid=frac_liquid
+    )
     b_bounds = (0.0, b_max)
 
     logger.debug(
@@ -452,7 +499,9 @@ def generate_bounds_from_config(
     theta: float,
     r: float,
     delta: float,
-    shock_params: ShockParams
+    shock_params: ShockParams,
+    tax: float = 0.3,
+    frac_liquid: float = 0.5
 ) -> Dict[str, any]:
     """
     Generate bounds using a BoundsConfig object.
@@ -466,6 +515,8 @@ def generate_bounds_from_config(
         r: Risk-free rate
         delta: Depreciation rate
         shock_params: AR(1) shock parameters
+        tax: Corporate tax rate for collateral constraint (default: 0.3)
+        frac_liquid: Liquidation fraction for collateral constraint (default: 0.5)
 
     Returns:
         Dict with 'k', 'b', 'log_z', and 'k_star' keys
@@ -479,5 +530,7 @@ def generate_bounds_from_config(
         k_min_multiplier=bounds_config.k_min,
         k_max_multiplier=bounds_config.k_max,
         k_star_override=bounds_config.k_star_override,
-        validate=False  # Already validated in BoundsConfig.__post_init__
+        validate=False,  # Already validated in BoundsConfig.__post_init__
+        tax=tax,
+        frac_liquid=frac_liquid
     )

@@ -17,7 +17,9 @@ from src.networks.network_basic import BasicPolicyNetwork, BasicValueNetwork, bu
 from src.trainers.losses import (
     compute_lr_loss,
     compute_er_loss_aio,
+    compute_er_loss_mse,
     compute_br_critic_loss_aio,
+    compute_br_critic_loss_mse,
     compute_br_critic_diagnostics,
     compute_br_actor_loss
 )
@@ -209,7 +211,8 @@ class BasicTrainerER:
         params: EconomicParams,
         shock_params: ShockParams,
         optimizer: tf.keras.optimizers.Optimizer,
-        polyak_tau: float
+        polyak_tau: float,
+        loss_type: str = "crossprod"
     ):
         """
         Initialize ER trainer.
@@ -221,6 +224,10 @@ class BasicTrainerER:
             optimizer: Configured optimizer (use create_optimizer() from config).
             polyak_tau: Polyak averaging coefficient for target network updates.
                 Use MethodConfig.polyak_tau (default: DEFAULT_POLYAK_TAU = 0.995).
+            loss_type: Loss computation method for Euler residual:
+                - "crossprod": AiO cross-product E[f₁·f₂], unbiased but can be negative (default)
+                - "mse": Mean Squared Error E[f²], biased but stable
+                Use MethodConfig.loss_type (default: "crossprod").
         """
         self.policy_net = policy_net
         self.params = params
@@ -228,6 +235,12 @@ class BasicTrainerER:
         self.optimizer = optimizer
         self.beta = 1.0 / (1.0 + params.r_rate)
         self.polyak_tau = polyak_tau
+        self.loss_type = loss_type
+
+        # Validate loss_type
+        valid_loss_types = {"mse", "crossprod"}
+        if loss_type not in valid_loss_types:
+            raise ValueError(f"loss_type must be one of {valid_loss_types}, got '{loss_type}'")
 
         # Create target policy network (frozen copy of policy_net)
         # Reference: report_brief.md line 491 "Initiate target policy"
@@ -341,10 +354,12 @@ class BasicTrainerER:
             f_main = 1.0 - self.beta * m_main / safe_chi
             f_fork = 1.0 - self.beta * m_fork / safe_chi
 
-            # === AiO LOSS ===
-            # L_ER = mean(f_main * f_fork)
+            # === ER LOSS ===
             # Reference: report_brief.md lines 599-600
-            loss = compute_er_loss_aio(f_main, f_fork)
+            if self.loss_type == "mse":
+                loss = compute_er_loss_mse(f_main, f_fork)
+            else:  # "crossprod"
+                loss = compute_er_loss_aio(f_main, f_fork)
 
         # Update current policy
         grads = tape.gradient(loss, self.policy_net.trainable_variables)
@@ -405,7 +420,10 @@ class BasicTrainerER:
         f_main = 1.0 - self.beta * m_main / safe_chi
         f_fork = 1.0 - self.beta * m_fork / safe_chi
 
-        loss = compute_er_loss_aio(f_main, f_fork)
+        if self.loss_type == "mse":
+            loss = compute_er_loss_mse(f_main, f_fork)
+        else:  # "crossprod"
+            loss = compute_er_loss_aio(f_main, f_fork)
 
         return {"loss_ER": float(loss)}
 
@@ -442,7 +460,8 @@ class BasicTrainerBR:
         optimizer_value: tf.keras.optimizers.Optimizer,
         n_critic_steps: int,
         logit_clip: float,
-        polyak_tau: float
+        polyak_tau: float,
+        loss_type: str = "crossprod"
     ):
         """
         Initialize BR (Actor-Critic) trainer.
@@ -460,6 +479,10 @@ class BasicTrainerBR:
                 Use AnnealingConfig.logit_clip (default: DEFAULT_LOGIT_CLIP = 20.0).
             polyak_tau: Polyak averaging coefficient for target network updates.
                 Use MethodConfig.polyak_tau (default: DEFAULT_POLYAK_TAU = 0.995).
+            loss_type: Loss computation method for Bellman residual:
+                - "crossprod": AiO cross-product E[f₁·f₂], unbiased but can be negative (default)
+                - "mse": Mean Squared Error E[f²], biased but stable
+                Use MethodConfig.loss_type (default: "crossprod").
         """
         self.policy_net = policy_net
         self.value_net = value_net
@@ -471,6 +494,12 @@ class BasicTrainerBR:
         self.logit_clip = logit_clip
         self.beta = 1.0 / (1.0 + params.r_rate)
         self.polyak_tau = polyak_tau
+        self.loss_type = loss_type
+
+        # Validate loss_type
+        valid_loss_types = {"mse", "crossprod"}
+        if loss_type not in valid_loss_types:
+            raise ValueError(f"loss_type must be one of {valid_loss_types}, got '{loss_type}'")
 
         # Create target networks (frozen copies)
         # Reference: report_brief.md line 590 "Initiate target networks"
@@ -605,7 +634,7 @@ class BasicTrainerBR:
         # A. CRITIC UPDATE (Multiple steps per actor update)
         # ===================================================================
         critic_losses = []
-        mses = []
+        last_diagnostics = {}  # Store diagnostics from last critic step
 
         for critic_step in range(self.n_critic_steps):
             with tf.GradientTape() as tape_critic:
@@ -637,10 +666,12 @@ class BasicTrainerBR:
                 # Reference: report_brief.md line 609
                 V_curr = self.value_net(k, z)
 
-                # === AiO Critic Loss ===
+                # === Critic Loss ===
                 # Reference: report_brief.md line 611-612
-                # "Calculate residuals and compute AiO Loss"
-                loss_critic = compute_br_critic_loss_aio(V_curr, y1, y2)
+                if self.loss_type == "mse":
+                    loss_critic = compute_br_critic_loss_mse(V_curr, y1, y2)
+                else:  # "crossprod"
+                    loss_critic = compute_br_critic_loss_aio(V_curr, y1, y2)
 
             # Update critic (value network)
             # Reference: report_brief.md line 613
@@ -653,7 +684,8 @@ class BasicTrainerBR:
             # Compute diagnostic on last iteration
             if critic_step == self.n_critic_steps - 1:
                 diagnostics = compute_br_critic_diagnostics(V_curr, y1, y2)
-                mses.append(diagnostics["mse_proxy"])
+                # Store all diagnostics for return
+                last_diagnostics = diagnostics
 
         # Update target value network ONCE per train_step (industry standard)
         # Reference: report_brief.md line 614
@@ -702,7 +734,10 @@ class BasicTrainerBR:
         return {
             "loss_critic": float(np.mean(critic_losses)),
             "loss_actor": float(loss_actor),
-            "mse_proxy": float(np.mean(mses)) if mses else 0.0,
+            "mse_proxy": last_diagnostics.get("mse_proxy", 0.0),
+            "rel_mse": last_diagnostics.get("rel_mse", 0.0),
+            "rel_mae": last_diagnostics.get("rel_mae", 0.0),
+            "mean_value_scale": last_diagnostics.get("mean_value_scale", 0.0),
             "target_value_update": target_value_update,
             "target_policy_update": target_policy_update
         }
@@ -748,7 +783,10 @@ class BasicTrainerBR:
         y2 = e + self.beta * V_next_fork
 
         V_curr = self.value_net(k, z)
-        loss_critic = compute_br_critic_loss_aio(V_curr, y1, y2)
+        if self.loss_type == "mse":
+            loss_critic = compute_br_critic_loss_mse(V_curr, y1, y2)
+        else:  # "crossprod"
+            loss_critic = compute_br_critic_loss_aio(V_curr, y1, y2)
 
         # Actor evaluation (using current policy)
         k_next_actor = self.policy_net(k, z)
@@ -975,7 +1013,8 @@ def train_basic_er(
         params=params,
         shock_params=shock_params,
         optimizer=optimizer,
-        polyak_tau=method_config.polyak_tau
+        polyak_tau=method_config.polyak_tau,
+        loss_type=method_config.loss_type
     )
 
     # Setup validation function (for early stopping)
@@ -1099,7 +1138,8 @@ def train_basic_br(
         optimizer_value=optimizer_value,
         n_critic_steps=method_config.n_critic,
         logit_clip=anneal_config.logit_clip,
-        polyak_tau=method_config.polyak_tau
+        polyak_tau=method_config.polyak_tau,
+        loss_type=method_config.loss_type
     )
 
     # Setup validation function (for early stopping)

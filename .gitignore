@@ -34,6 +34,8 @@ checkpoints/
 *.aux
 *.log
 *.tex
+*.bib
+*.html
 *.toc
 *.out
 *.fls

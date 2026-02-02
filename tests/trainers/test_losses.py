@@ -118,32 +118,30 @@ class TestBRLoss:
         expected = ((1.0-0.8)*(1.0-0.9) + (2.0-1.8)*(2.0-1.9)) / 2
         assert np.isclose(loss.numpy(), expected)
     
-    def test_actor_loss_uses_average(self):
-        """Actor loss uses averaged continuation, not cross-product."""
+    def test_actor_loss_main_shock_only(self):
+        """Actor loss uses only main shock continuation value."""
         e = tf.constant([[1.0], [1.0]])
-        V1 = tf.constant([[2.0], [2.0]])
-        V2 = tf.constant([[3.0], [3.0]])
+        V_next = tf.constant([[2.0], [2.0]])
         beta = 0.96
-        
-        loss = compute_br_actor_loss(e, V1, V2, beta)
-        
-        # V_avg = (2+3)/2 = 2.5
-        # RHS = 1 + 0.96 * 2.5 = 3.4
-        # loss = -mean(3.4) = -3.4
-        expected = -3.4
+
+        loss = compute_br_actor_loss(e, V_next, beta)
+
+        # RHS = 1 + 0.96 * 2 = 2.92
+        # loss = -mean(2.92) = -2.92
+        expected = -2.92
         assert np.isclose(loss.numpy(), expected)
     
     def test_actor_loss_risky_includes_eta(self):
-        """Risky actor loss subtracts eta."""
+        """Risky actor loss subtracts eta and uses main shock only."""
         e = tf.constant([[1.0]])
         eta = tf.constant([[0.2]])
-        V1 = tf.constant([[2.0]])
-        V2 = tf.constant([[2.0]])
+        V_next = tf.constant([[2.0]])
         beta = 0.96
-        
-        loss = compute_br_actor_loss_risky(e, eta, V1, V2, beta)
-        
-        # RHS = (1 - 0.2) + 0.96 * 2 = 0.8 + 1.92 = 2.72
+
+        loss = compute_br_actor_loss_risky(e, eta, V_next, beta)
+
+        # payout = e - eta = 1 - 0.2 = 0.8
+        # RHS = 0.8 + 0.96 * 2 = 2.72
         # loss = -2.72
         expected = -2.72
         assert np.isclose(loss.numpy(), expected)

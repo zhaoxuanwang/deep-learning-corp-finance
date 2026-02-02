@@ -1,18 +1,17 @@
 ---
-title: "Deep Learning for Corporate Finance: Brief Report"
+title: "Deep Learning for Corporate Finance Models: Brief Report (Part I)"
+date: 2026-02-01
+bibliography: references.bib
 author: Zhaoxuan Wang
-date: 2026-01-31
+thanks: Email - [wxuan.econ@gmail.com](mailto:wxuan.econ@gmail.com) or [zxwang13@student.ubc.ca](mailto:zxwang13@student.ubc.ca). This is a report prepared for the interview with JPMorgan MLCoE.
+
 format:
   pdf:
-    documentclass: article
-    papersize: letter
-    geometry:
-      - top=25mm
-      - bottom=25mm
-      - left=25mm
-      - right=25mm
     number-sections: true
     toc: false
+    linkcolor: blue
+    link-citations: true
+    fig-pos: 'hptb'
     include-in-header:
       text: |
         \usepackage{amsmath}
@@ -21,22 +20,241 @@ format:
 
 # Introduction
 
-This report documents the implementation of deep learning methods for solving dynamic corporate finance models. The core problem is to find optimal investment and financing policies for firms facing adjustment costs, productivity shocks, and (in the extended model) risky debt with endogenous default.
+This report documents the implementation of deep learning methods for solving dynamic corporate finance models. The core problem is to find optimal investment and financing policies for firms facing adjustment costs, stochastic productivity shocks, and (in the extended model) risky debt with endogenous default and equilibrium risky interest rates [see @strebulaev_dynamic_2012, section 3].
 
-The approach uses neural networks to approximate policy and value functions, trained via three complementary methods:
+The conventional solution to this dynamic programming/optimal control problem is to discretize the state space and iterate on value function or policy function until convergence. However, this approach suffers from the curse of dimensionality and is computationally expensive. It is less accurate due to approximiation on discrete grids, and it quickly becomes intractable as the number of state variables and sample size increases. 
 
-1. **Lifetime Reward (LR)**: Maximize discounted cumulative cash flows over simulated trajectories
+In this report, I explore and apply the deep learning methods introduced in @maliar_deep_2021 to solve this problem. The approach casts economic models into trainable objectives and uses deep neural networks to parametrize policy and value functions, trained via three complementary methods:
+
+1. **Lifetime Reward (LR)**: Maximize discounted cumulative cash flows over $T$ periods
 2. **Euler Residual (ER)**: Minimize violations of the first-order optimality conditions
-3. **Bellman Residual (BR)**: Actor-critic training to satisfy the Bellman equation
+3. **Bellman Residual (BR)**: Actor-critic training to satisfy the Bellman equation and optimal policy
 
-The document covers two models of increasing complexity:
+The application covers two types of model:
 
-- **Basic Model**: Firm chooses capital investment $(k,z) \to k'$ subject to convex and fixed adjustment costs
-- **Risky Debt Model**: Firm chooses capital and borrowing $(k,b,z) \to (k',b')$ with endogenous default and risky interest rates
+- **Basic Model**: Firm chooses capital investment $(k,z) \to k'$ subject to adjustment cost
+- **Risky Debt Model**: Firm chooses capital investment and borrowing $(k,b,z) \to (k',b')$ with endogenous default decision and equilibrium risky interest rates
 
-Key implementation challenges addressed include: reproducible data generation via deterministic RNG scheduling, numerical stability through input normalization and bounded outputs, and handling discontinuities (adjustment cost thresholds, default boundaries) via temperature-annealed soft gates.
+The complete codebase and lastest report release can be found on [GitHub](https://github.com/zhaoxuanwang/deep-learning-corp-finance) and are updated frequently. Key features and extensions will be added in the next 4-8 weeks:
+
+- *February*: Introduce GMM and SMM estimation (part 2)
+- *March*: Complete all bonus questions and extensions
+- *April*: Test method on real-world data and final submission
+
+::: {.callout-tip title="Usage"}
+To reproduce results in this report and understand API usage, please run the jupyter notebook `../report/part1_demo.ipynb`
+:::
+
+## Literature Review
+In this section, I briefly review the relevant literature on deep learning for solving dynamic and structural finance/economic models. I focus on the practical side of this topic and do not aim to provide a comprehensive review of the whole field of dyanmic programming, deep learning, and corporate finance. Instead, I focus on the papers that are most relevant to this project. 
+
+During my work on this project, I have mostly used and referred to the following sources (in addition to the assigned readings) that are excellent for an overview of the fundamentals.
+
+- **Dynamic programming**: @ljungqvist_recursive_2018, [lecture notes (UBC)](https://faculty.arts.ubc.ca/pschrimpf/526/dynamicProgramming-526.pdf), [QuantEcon](https://quantecon.org/)
+- **Deep RL**: Online lectures by [Huggingface](https://huggingface.co/learn/deep-rl-course/unit0/introduction), [OpenAI](https://spinningup.openai.com/en/latest/index.html), and [Stanford CS224](https://cs224r.stanford.edu/)
+
+The basic problem is represented as a Bellman equation:
+
+$$ V (s, a) = \max_{a \sim \pi} \mathbb{E}_{s'\sim P} \left[ {r(s, a) + \beta V(s',a')} \right]$$
+
+where $s$ are states following transition rule $s' \sim P(\cdot|s,a)$, $a$ is the action taken by the agent, $r(s,a)$ is the reward function, $\beta \in (0,1)$ is the discount factor, and $V(s',a')$ is the value function for the next period. The core of the problem is to find the optimal policy mapping $\pi: (s,a) \to a'$ that maximizes the Bellman equation. 
+
+### Discrete-State Dynamic Programming
+Conventional methods as introduced in @strebulaev_dynamic_2012 to solve this problem is through **value function iterations (VFI)** and **policy function iterations (PFI)** (Howard's improvement method). In their simplest form, these methods often start by discretizing the state space into a grid of points, that is, all possible values of $(s,a)$. The VFI algorithm relies on the property that the Bellman (functional) operator is a contraction mapping with with fixed point $V^*$, thus repeatedly applying the operator to a random initial $V_0$ will lead to $V^*$. 
+
+The basic **VFI algorithm** is as follows:
+
+1. Initialize $V_0$ on the grid
+2. For $j=0,1,2,\dots$ until convergence:
+   $$V_{j+1}(s,a) = \max_{a \sim \pi} \mathbb{E}_{s'\sim P} \left[ {r(s, a) + \beta V_j(s',a')} \right]$$
+
+The pros of this method is its simple and robust, but it can be very slow over large state grids because for each iteration, we need to evaluate $V_j$ for all possible pairs of $(s,a)$.
+
+The **PFI algorithm** relies on a different structure:
+
+1. Pick any policy $\pi_j$, solve for the on-policy value function $V^{\pi_j}$ that satisfied the Bellman Equation
+2. For the given $V^{\pi_j}$, search for a better policy $\pi_{j+1}$ such that $V^{\pi_{j+1}} > V^{\pi_j}$  
+3. Repeat until the policy converged $|\pi_{j+1}-\pi_{j}|<\epsilon$
+
+The underlying idea is to first find the optimal value for an arbitrary policy, and then update on the policy to see if we can find a better one that increases the Bellman equation value. In discrete state dynamic programming (DDP), the PFI algorithm is generally prefered because it is more accurate and often converge faster than the VFI because we solved for the *exact* policy $\pi$ in step two.
+
+The common shortcomings of these two methods are that they are both computationally expensive and cannot be applied to continuous state spaces. A natural mitigation to the "curse of dimensionality" associated with fixed grids is to use a **polynomial approximation** to the value function. 
+
+::: {.callout-tip title="Codes"}
+I implemented both VFI and PFI in Tensorflow and it can be found under `src/ddp`. The `QuantEcon` library also has a `DiscreteDP` module implemented using Numpy.
+:::
+
+
+### Projection Methods
+Here I briefly introduce a variant of the project method reviewed in @ljungqvist_recursive_2018. The core idea is that instead of a step function over a discrete grid, we can parameterize and approximate the value function by a weighted sum of orthogonal polynomials. 
+
+The canonical method uses **Chebyshev polynomials**, defined on the domain $[-1, 1]$ by:
+$$T_n(x) = \cos(n \arccos x)$$
+For example, the first few polynomials are $T_0(x) = 1$, $T_1(x) = x$, and $T_2(x) = 2x^2 - 1$.
+
+Let $V(s, a)$ be the true value function we wish to find, defined over a domain of asset states $a \in [a_{min}, a_{max}]$ (holding the exogenous state $s$ fixed or treating it separately). Since Chebyshev polynomials are defined on $[-1, 1]$, we first define a linear transformation to map the economic state variable $a$ (e.g., capital) to the polynomial domain $x$:
+$$x = 2 \frac{a - a_{min}}{a_{max} - a_{min}} - 1$$
+
+The approximation of the value function at iteration $i$, denoted $V_i(s, a)$, is defined as a linear combination of $n+1$ basis functions with coefficients $\{\theta_0, \theta_1, \dots, \theta_n\}$:
+$$V_i(s, a) \approx \hat{V}(x; \mathbf{\theta}) = \theta_0 + \sum_{j=1}^{n} \theta_j T_j(x)$$
+
+Crucially, the grid points are not chosen uniformly. To minimize approximation error, the method evaluates the function at the zeros of the Chebyshev polynomial, known as Chebyshev nodes. For a grid of size $N_g$, the nodes $x_g$ in the $[-1, 1]$ domain are calculated as:
+$$x_g = \cos\left( \frac{2g - 1}{2N_g} \pi \right), \quad g = 1, \dots, N_g$$
+
+To summarize, this method maps economic states to Chebyshev nodes: $(s,a) \to x$. Then we iterate on the Bellman equation using continuous $T(x)$ as an approximation to the value function, and update the coefficients $(\theta_0, \{\theta_j\}_{j=1}^n)$ to minimize the approximation error. Finally, when the coefficients converge, we obtained the optimal mapping: $(s,a) \to x \to V(s,a; \mathbf{\theta})$ with fixed coefficients $\mathbf{\theta}$.
+
+
+#### Polynomial Approximation Algorithm
+The solution is reached by iterating on the Bellman equation using these continuous approximations.
+
+1. **Initialization**
+Choose a degree of approximation $n$, a number of grid points $m \geq n+1$, and an initial guess for the coefficients $\mathbf{\theta} = \{\theta_0, \dots, \theta_n\}$ (e.g., all zeros).
+
+1. **Maximization**
+For each node $a_k$ (corresponding to $x_k$), solve the optimization problem on the RHS of the Bellman equation using the continuous value function $\hat{V}(s', a'; \mathbf{\theta}_{old})$ from the previous iteration to find the optimal policy $a'$:
+$$\tilde{y}_k = \max_{a'} \left\{ r(s, a) + \beta \hat{V}(s', a'; \mathbf{\theta}_{old}) \right\}$$
+
+1. **Updating Coefficients**
+Once we have the new optimized values $\tilde{y}_k$ at each node $x_k$, we compute the new coefficients $\mathbf{\theta}_{new}$ to fit these values. For example, using the least squares formula for Chebyshev polynomials:
+$$\theta_j = \frac{\sum_{k=1}^m \tilde{y}_k T_j(x_k)}{\sum_{k=1}^m T_j(x_k)^2}$$
+
+1. **Convergence**
+Update the coefficients and repeat Steps 2 and 3 until the coefficients converge (i.e., $||\mathbf{\theta}_{new} - \mathbf{\theta}_{old}|| < \epsilon$).
+
+In practice, rather than iterating on the Bellman equation directly, one often approximates the policy $\pi(s,a; \theta)$ using Chebyshev polynomials:
+$$\pi(s,a; \theta) \approx \sum \theta_j T_j(s,a)$$
+
+## Deep Learning Methods
+
+### Motivation 
+Although the projection method allows for continuous approximation, it shares the critical drawback of the grid-based methods (VFI, PFI): the **curse of dimensionality**. As the number of state variables increases, the number of grid points required for accurate approximation grows exponentially, making the method computationally intractable for high-dimensional problems.
+
+For example, consider a model with three state variables $(k,b,z)$, each can take 100 possible values (grid points), then the total number of points to be evaluated is $100^3 = 10^6$, which means
+
+- VFI need to evaluate $V(k,b,z)$ and $V(k',b',z')$ for $10^6$ grids each, so the total number of points to be evaluated is $10^{12}$ for a single iteration step
+- PFI also need to evaluate $10^6$ grids and invert a matrix with $10^6 \times 10^6$ elements for a single policy improvement step
+- Projection method need to update $10^6$ coefficients for a single iteration step using Newton's method (e.g., least squares), including inverting a $10^6 \times 10^6$ matrix
+
+This relatively simple model soon becomes intractable, and this is the exact motivation for @maliar_deep_2021 to develop a gradient-based deep learning methods that is efficient for high-dimensional problems.
+
+### Core Idea
+Here I briefly introduce the general representation of the DL method by @maliar_deep_2021 and postpone the details to later sections. The core idea is to parameterize the value function and policy function using neural networks, and then use gradient descent to minimize an objective function that enforces optimality.
+
+- Parameterize value $V(s,a; \theta_V)$ and policy $\pi(s,a; \theta_{\pi})$ as functions of trainable parameters $\theta$
+- In deep neural networks, $\theta$ are the weights and biases of the neurons
+- Objective function $\mathcal{L}(\cdot; \theta)$ captures an economic optimality condition we want to enforce
+- Algorithm use gradient descent to minimize the objective function and update the parameters $\theta$
+
+Personally, I find this approach directly connected to the canonnical projection method. Specifically, the polynomial approximation $V_i(s, a) \approx \theta_0 + \sum_{j=1}^{n} \theta_j T_j(x)$ can be seen as a specific type of neural network with a single hidden layer, a linear activation function, and transformed input $T: (s,a)\to x$. 
+
+The DL method has several key advantages over the conventional methods:
+
+1. **Tractability**: Number of parameters in a neural network grows _linearly_ with the dimensionality of the state space so training remains tractable even for high-dimensional problems
+2. **Speed**: SGD-based training is typically much faster than the Newton's method (inverting huge matrices)
+3. **Precision**: Neural networks with "deep" configs (multiple hidden layers and neurons) can "learn" to approximate kinks and discontinuities while still achieve high precision (e.g., minimizing residual below $10^{-4}$)
+4. **Flexibility**: Neural networks can be easily extended to handle more complex economic models, such as models with more state action variables and complex constraints
+
+### Highlights of My Innovation
+During my implementation of @maliar_deep_2021, I found that the original design could be improved in several aspects:
+
+- AiO cross-product loss vs MSE loss
+- Ergodic set sampling v.s. "learning the corners"
+- Handling kinks and discontinuities
+- Bellman Residual method via Actor-Critic training
+- Reproducibility and comparability across methods
+
+Here I briefly summarize the key improvements/innovations I made on these points. More technical details are discussed in later sections.
+
+#### AiO estimator vs MSE loss
+
+@maliar_deep_2021 propose an All-in-One (AiO) expectation operator to compute the expectation instead of the traditional deterministic quadrature. The idea is to draw two random i.i.d. shocks $\epsilon_1, \epsilon_2$ from the distribution of $\epsilon$ and compute the sample mean:
+
+$$
+\mathbb{E}[f(\epsilon)]^2 \approx \frac{1}{N} \sum_{i=1}^N \left[ f(\epsilon_{i,1}) \cdot f(\epsilon_{i,2}) \right]
+$$
+
+This estimator is unbiased because $\mathbb{E}[f_1 \cdot f_2] = \mathbb{E}[f_1] \cdot \mathbb{E}[f_2] = \mathbb{E}[f]^2$ when $f_1, f_2$ are i.i.d. draws.
+
+However, this estimator induces unstability for the risky debt training, where $f$ include a default indicator $p_\epsilon$ that is approximated with Gumbel-Sigmoid (see details in later section). I intentially introduces a uniform random noise in Gumbel-Sigmoid to force the network to "learn" around the default boundary, but this amplifies the unstability of the AiO expectation estimator.
+
+To mitigate this risk, I also implement the standard Mean Square Error (MSE) loss as benchmark:
+
+$$
+\text{MSE}=\frac{1}{N} \sum_{i=1}^N \left[ \frac{1}{2}(f_{i,1}^2 \cdot f_{i,2}^2) \right] \to \mathbb{E}[f(\epsilon)]^2 + \text{Var}[f(\epsilon)]
+$$
+
+This is a standard loss function used in deel reinforcement learning. Although it is biased (due to the variance term), it is stable in training and the variance term is usually small with i.i.d $\epsilon$ draws and large sample size.
+
+::: {.callout-tip title="Codes"}
+My neural network trainers for ER and BR method has two options for loss functoin: `mse` and `crossprod` (AiO). I prefer `mse` for numerical stability.
+:::
+
+#### Ergodic Set Sampling
+
+@maliar_deep_2021 propose to sample from the ergodic set of the state space, which is the set of states that are visited with positive probability in the long run. The main motivation is to reduce state space and focus only on the relavant states in training (what they called "where the solution lives").
+
+Specifically, the authors propose a "continuous simulation with resampling" approach that repeat the following steps in each training iteration:
+
+- Start with random initial states $(k_0,z_0)$
+- Extract the policy $\pi: (k,z)\to k'$ from previous training
+- Simulate a full time series rollout $(k_t, z_t)$ over $T$ periods
+  - This forms the training set for LR method
+- (For ER and BR only) Randomly re-shuffle and sample transition samples $(k,z)$ from the simulated time series and take a random draw $\epsilon$  
+  - This forms the training set for ER and BR
+
+I argue that there are two critical risks with this approach: 
+
+1. "On-the-fly" data generation in training process
+2. Network never explores the "corners" that are off-policy
+
+The "On-the-fly" data generation essentially prevent us from replicating the results or evaluate performance across different training runs/methods. I address this issue by developing a specific RNG schedule that 
+
+- Seperate data generation and random draws from training
+- Enforce full reproducibility given fixed master seed (which fixed dataset)
+
+As for the "unvisited corners", some of them are irrelevant and can be ignored: for example, investment (depends on $k'$) and shocks $z$ are usually strongly correlated so there is no point to learn about the policies at corners where $z$ is high and $k'$ is low. 
+
+However, for important boundaries such as the default gate, i.e., firm defaults when continuation value $V<0$, I specifically design the network to explore and learn around the boundary $V=0$, otherwise once $V$ turn negative for the first time, firm will stay default and the network will never learn how to recover (see the risky debt section for more details).
+
+#### Kinks and Discontinuities
+@maliar_deep_2021 propose using Fischer-Burmeister (FB) function to handle the kinks in empirical risk/loss due to the $\max$ operators. Yet the FB function does not handle kinks and discontinuities in reward and value functions (@maliar_deep_2021 consider a smooth and differentiable CRRA utility as their examples). 
+
+In our corporate finance models, there are kinks (e.g., default gate) and discontinuities (e.g., fixed adjustment cost) in the rewards (cash flow). Using discrete, hard indicator functions like $\mathbb{1}\{ x < 0\}$ will kill the gradient of the component to lead to incorrect solutions. I carefully handle this issue using a temperature-annealing schedule that start with a smooth differentiable function to approximate the hard gate, and let this function converge to zero/one as the temperature goes to zero near the end of trainings (when policies and values are accurate). 
+
+
+#### Bellman Residual method with Actor-Critic
+
+In @maliar_deep_2021, the Bellman Residual (BR) method is implemented via minimizing a multi-task objective function:
+
+$$
+\mathcal{L} = w_1 \mathcal{L}_{\text{BR}} + w_2 \mathcal{L}_{\text{FOC}} + w_3 \mathcal{L}_{\text{Envelop}}
+$$
+
+where $w$ exogenous weights and the second and third term are First Order Conditions or Envelope Conditions to enforce optimality of the policy. This framework has a number of weakness:
+
+- Requires tuning hyperparameters $w$
+- Requires reward function is differentiable (for FOC or Envelop Condition)
+- If there are mistakes in hard-coded FOC and Envelop condition, the training will be wrong
+
+To be fair, @maliar_deep_2021 mentioned "direct optimization" as an alternative to the multi-task objective, but they did not provide detail guidelines on how to implement it. 
+
+I fill this gap by refining an Actor-Critic framework that implements the "direct optimization". The idea is very similar to the conventional policy function iteration method, where each training has two main steps:
+
+- Critic: Find the fixed point value function $V_\pi$ by minimize Bellman residual for a given armbitrary policy $\pi$
+- Actor: Find the fixed point policy $\pi$ by maximizing the Bellman equation given the learned value function $V_\pi$
+
+Compared with the multi-objective loss, the Actor-Critic training is robust to kinks and discontinuities, requires no hyperparameter tuning or derivation of the FOCs. This makes it flexible to extend to different models. The implemention details are described in the sections later.
+
+#### Reproducibility and Comparability
+The last refinement is to make the training results fully replicable and comparable across different methods, training runs, and configurations. This is achieved through two features:
+
+- Deteministic RNG schedule that governs data generation, Monte Carlo draws, re-shuffle and resampling (for ER and BR)
+- Use time series rollout (LR training set) to generate the training data for ER and BR 
+
+This guarantees that a single pair of master seed (e.g., `(20,26)`) will guarantee the same training/validation/test data for all methods and runs. Details of the RNG schedule is described in later sections.
 
 ## Notation
+For the remainder of the report, I define the commonly used notations:
 
 **Trainable Parameters**
 
@@ -48,7 +266,7 @@ Key implementation challenges addressed include: reproducible data generation vi
 
 - Current period variable: $x$
 - Next period variable: $x'$
-- Parameterized function: $\Gamma(\cdot; \theta)$
+- Parameterized function (Neural Networks): $\Gamma(\cdot; \theta)$
 
 **State and Action Variables**
 
@@ -67,13 +285,16 @@ The ergodic (unconditional) standard deviation is $\sigma_{\ln z} = \sigma / \sq
 
 - Basic model policy: $(k,z) \mapsto k'$
 - Risky debt policy: $(k,b,z) \mapsto (k',b')$
-- Risky debt bond price: $(k',b',z) \mapsto q = 1/(1+\tilde{r})$
+- Risky debt bond price: $(k',b',z) \mapsto q(k',b',z) = 1/(1+\tilde{r}(k',b',z))$
 
 **Training Methods**
 
 - **LR**: Lifetime Reward loss $\mathcal{L}_{\text{LR}}$
 - **ER**: Euler Residual loss $\mathcal{L}_{\text{ER}}$
 - **BR**: Bellman Residual with critic loss $\mathcal{L}^{\text{BR}}_{\text{critic}}$ and actor loss $\mathcal{L}^{\text{BR}}_{\text{actor}}$
+
+
+
 
 ***
 
@@ -91,8 +312,8 @@ $$I = k' - (1 - \delta)k$$
 Investment can be positive (expansion) or negative (disinvestment).
 
 **Operating Profit**
-$$\pi(k,z) = z \cdot k^{\theta}, \quad \theta \in (0,1)$$
-where $\theta$ is the production technology parameter (decreasing returns to scale).
+$$\pi(k,z) = z \cdot k^{\gamma}, \quad \gamma \in (0,1)$$
+where $\gamma$ is the production technology parameter (decreasing returns to scale).
 
 **Capital Adjustment Cost**
 $$\psi(I,k) = \phi_0 \cdot \frac{I^2}{2k} + \phi_1 \cdot k \cdot \mathbf{1}\{I \neq 0\}$$
@@ -118,7 +339,7 @@ The risky debt model extends the basic model by allowing firms to borrow at an e
 **State and Action**
 
 - State: $(k, b, z)$ where $b \geq 0$ is outstanding debt
-- Action: $(k', b')$ where $b' \geq 0$ is new borrowing
+- Action: $(k', b')$ where $b' \in [0, b_{\max}]$ is new borrowing
 
 **Cash Flow**
 $$e(\cdot) = (1-\tau)\pi(k,z) - \psi(I,k) - I + q \cdot b' + \frac{\tau \tilde{r} \, b'}{(1+\tilde{r})(1+r)} - b$$
@@ -187,7 +408,7 @@ The default $m = 3$ covers the mass of the ergodic distribution.
 **Capital Stock Bounds**
 
 The frictionless steady-state capital (where marginal product equals user cost) is:
-$$k^*(z) = \left(\frac{z \cdot \theta}{r + \delta}\right)^{\frac{1}{1-\theta}}$$
+$$k^*(z) = \left(\frac{z \cdot \gamma}{r + \delta}\right)^{\frac{1}{1-\gamma}}$$
 
 evaluated at the stationary mean productivity $z = e^\mu$.
 
@@ -198,9 +419,16 @@ For example, multipliers $(0.2, 3.0)$ yield a state space from 20% to 300% of st
 
 **Debt Bounds**
 
-The maximum debt is the natural borrowing limit—the maximum repayable in the best state:
-$$b_{\max} = z_{\max} \cdot k_{\max}^{\theta} + k_{\max}$$
-which equals maximum production plus full liquidation value. The lower bound is $b_{\min} = 0$.
+The maximum borrowing (debt) is capped by the collateral constraint defined as:
+$$ b' \leq (1-\tau) \pi(k', z_{\min}) + \tau \delta k' + s_{\text{liquid}} \cdot k' $$
+
+where $s_{\text{liquid}}$ is the liquidation fraction between 0 and 1. The RHS is the maximum liquidation value of the firm in the worst state $z_{\min}$. The lower bound is simply $b_{\min} = 0$.
+
+It is important to note that in section 3.6 of @strebulaev_dynamic_2012, the authors remove the collateral constraint and allow for $b'<0$ to denote cash saving. Although this is helpful for theoretical analysis, it introduces serious numerical instability in training because
+- firm can easily leverage a huge $b'$ that dominate cash flow and capital investment
+- the interest rate switch between a constant $r$ and an endogenously-determined state variable $\tilde{r}$ around default boundary $b'=0$
+
+Therefore, I restored the collateral constraint and restrict training to the borrowing case $b'\geq 0$. It is straightforward to extend the model by introducing a new state variable for cash saving with risk-free rate $r$ (or any other pricing schedule).
 
 **Validation Constraints**
 
@@ -310,7 +538,7 @@ $$\text{Obs} = (k, b, z, z'_1, z'_2)$$
 
 where $(z'_1, z'_2)$ are the main and fork next-period shocks. After flattening, the dataset is randomly shuffled to further eliminate any residual structure.
 
-![Comparison of trajectory and flattened data formats. Left: trajectory format preserves temporal structure for LR method. Right: flattened format with independent state sampling for ER/BR methods. *Example output from debug-mode training with small sample size.*](../results/part1-demo/figures/data_format_comparison.png){#fig-data-format width=90%}
+![Comparison of trajectory and flattened data formats. Left: trajectory format preserves temporal structure for LR method. Right: flattened format with independent state sampling for ER/BR methods. *Example output from debug-mode training with $T=64$.*](../results/part1-demo/figures/data_format_comparison.png){#fig-data-format width=90%}
 
 
 ## RNG Seed Schedule
@@ -424,16 +652,7 @@ $$q(k',b',z) = \Gamma_{\text{price}}(k', b', z; \theta_{\text{price}})$$
 
 ***
 
-# Training Methods
-
-## Cross-Product Estimator
-
-The ER and BR methods require minimizing squared expectations of the form $\mathbb{E}[f]^2$. A naive estimator $(\frac{1}{n}\sum_i f_i)^2$ is biased. Instead, we use two independent shock realizations $(z'_1, z'_2)$ per state to form an unbiased cross-product estimator:
-
-$$\widehat{\mathbb{E}[f]^2} = \frac{1}{n} \sum_{i=1}^{n} f_{i,1} \times f_{i,2}$$
-
-where $f_{i,1}$ and $f_{i,2}$ are residuals computed using the two independent shocks. This estimator is unbiased because $\mathbb{E}[f_1 \cdot f_2] = \mathbb{E}[f_1] \cdot \mathbb{E}[f_2] = \mathbb{E}[f]^2$ when $f_1, f_2$ are i.i.d.
-
+# Basic Model Training
 
 ## Lifetime Reward (LR) Method
 
@@ -593,7 +812,7 @@ where $\nu \in (0.99, 0.999)$ is the averaging coefficient. With $\nu = 0.995$ (
 | $k' = \Gamma_{\text{policy}}(k, z; \theta)$        | Current |    Yes    | This is what we're optimizing      |
 | $k'' = \Gamma_{\text{policy}}(k', z'; \theta^{-})$ | Target  |    No     | Stable reference for future action |
 
-: {tbl-colwidths="[35,15,15,35]"}
+: Basic Model {tbl-colwidths="[35,15,15,35]"}
 
 The residual $f(k, k', k'', z')$ has gradients only w.r.t. $k'$. If we accidentally used the current policy for $k''$, the gradient would try to adjust the policy to make $k''$ satisfy the Euler equation—but $k''$ is a future decision that should be determined by the *current* state $(k', z')$, not by backpropagation.
 
@@ -605,9 +824,19 @@ The residual $f(k, k', k'', z')$ has gradients only w.r.t. $k'$. If we accidenta
 | $k' = \Gamma_{\text{policy}}(k, z; \theta^{-}_{\text{policy}})$             | Target  |    No     | Fixed action for target         |
 | $y = e + \beta \, \Gamma_{\text{value}}(k', z'; \theta^{-}_{\text{value}})$ | Target  |    No     | Fixed label (regression target) |
 
-: {tbl-colwidths="[35,15,15,35]"}
+: Basic Model {tbl-colwidths="[35,15,15,35]"}
 
-The critic update is a regression: fit $V(k,z)$ to the target $y$. The target must be treated as a constant label (like supervised learning), otherwise the critic could "cheat" by adjusting the target rather than improving its prediction.
+| Computation                                                                       | Network | Gradient? | Rationale                            |
+| :-------------------------------------------------------------------------------- | :-----: | :-------: | :----------------------------------- |
+| $V = \Gamma_{\text{value}}(k, b, z; \theta_{\text{value}})$                       | Current |    Yes    | This is what we're fitting           |
+| $(k', b') = \Gamma_{\text{policy}}(k, b, z; \theta^{-}_{\text{policy}})$          | Target  |    No     | Fixed action for Bellman target      |
+| $q^{\text{target}} = \Gamma_{\text{price}}(k', b', z; \theta^{-}_{\text{price}})$ | Target  |    No     | Fixed price for stable cash flow $e$ |
+| $q = \Gamma_{\text{price}}(k', b', z; \theta_{\text{price}})$                     | Current |    Yes    | This is what we're fitting           |
+| $y = e(q^{\text{target}}) - \eta + \beta \, V^{-}_{\text{eff}}$                   | Target  |    No     | Fixed label (regression target)      |
+
+: Risky Debt Model {tbl-colwidths="[35,15,15,35]"}
+
+The critic update is a regression: fit $V(k,z)$ to the target $y$. The target must be treated as a constant label (like supervised learning), otherwise the critic could "cheat" by adjusting the target rather than improving its prediction. For risky debt, the price network plays a dual role: (1) the *target* price $q^{\text{target}}$ computes the cash flow $e$ for the Bellman target, ensuring stability; (2) the *current* price $q$ enters the pricing residual loss, which trains the price network to satisfy lender zero-profit.
 
 **BR Actor Update**
 
@@ -616,7 +845,7 @@ The critic update is a regression: fit $V(k,z)$ to the target $y$. The target mu
 | $k' = \Gamma_{\text{policy}}(k, z; \theta_{\text{policy}})$        | Current |    Yes    | This is what we're optimizing |
 | $V(k', z') = \Gamma_{\text{value}}(k', z'; \theta_{\text{value}})$ | Current |    No     | Frozen value landscape        |
 
-: {tbl-colwidths="[35,15,15,35]"}
+: Both Basic and Risky Debt Model {tbl-colwidths="[35,15,15,35]"}
 
 The actor optimizes policy to maximize $e(k, k', z) + \beta V(k', z')$. Gradients flow through $k'$ (to improve the action) but not through $\theta_{\text{value}}$ (the value function is held fixed during the actor step). If gradients flowed into $\theta_{\text{value}}$, the actor could artificially inflate $V$ rather than finding genuinely better actions.
 
@@ -699,14 +928,96 @@ $$N_{\text{decay}} = \frac{\log(\tau_{\min}) - \log(\tau_0)}{\log(d)}$$
 A stabilization buffer (default: 25%) allows fine-tuning at low temperature:
 $$N_{\text{anneal}} = \lceil N_{\text{decay}} \cdot (1 + \text{buffer}) \rceil$$
 
+***
 
-## Convergence and Early Stopping
+# Risky Debt Training
+
+## Method Selection
+
+The risky debt model can in principle use LR, ER, or BR methods, but practical considerations favor BR.
+
+**LR Method**: Applicable but challenging. The nested fixed-point problem (risky rate depends on value, which depends on risky rate) is implicit in the lifetime simulation. The network must simultaneously learn the policy and the equilibrium pricing, which can be unstable without the explicit critic structure.
+
+**ER Method**: Problematic. Deriving Euler equations for the risky debt model requires differentiating through the default indicator and bond pricing equilibrium. The resulting conditions are complex, and the indicator discontinuities are harder to handle without the value function providing a stable learning target.
+
+**BR Method (Recommended)**: The actor-critic structure naturally decomposes the equilibrium conditions:
+
+- Critic learns value and pricing to satisfy Bellman and zero-profit conditions
+- Actor optimizes policy given the learned value/pricing functions
+
+This decomposition handles the nested fixed-point problem without explicit iteration and provides stable learning targets for each component.
+
+
+## BR Method for Risky Debt
+
+### Pricing Loss
+
+The lender's zero-profit condition determines bond prices. Define the pricing residual:
+$$f_\ell = q \cdot b' \cdot (1+r) - \left[ p_\ell \cdot R(k', z'_\ell) + (1 - p_\ell) \cdot b' \right]$$
+
+where:
+
+- $q = \Gamma_{\text{price}}(k', b', z; \theta_{\text{price}})$ is the predicted bond price
+- $p_\ell$ is the Gumbel-Sigmoid default probability at shock $z'_\ell$
+- $R(k', z')$ is the recovery value
+
+The MSE pricing loss is defined as
+$$\mathcal{L}_{\text{MSE}}^{\text{price}} = \frac{1}{|\mathcal{B}|} \sum_{i \in \mathcal{B}} \frac{1}{2}(f_{i,1}^2 + f_{i,2}^2)$$
+
+
+
+### Critic Update
+
+The critic target incorporates limited liability via the smooth effective value:
+$$V_{\text{eff}} = (1 - p) \cdot \widetilde{V}$$
+
+where $p$ is the default probability. As $\tau \to 0$, this converges to $\max\{0, \widetilde{V}\}$.
+
+**Bellman Target**
+$$y_\ell = e(\cdot) - \eta(e) + \beta \cdot V_{\text{eff}}(\Gamma_{\text{value}}(k', b', z'_\ell; \theta^{-}_{\text{value}}))$$
+
+**Combined Critic Loss**
+$$\mathcal{L}_{\text{critic}} = \omega_1 \mathcal{L}^{\text{BR}} + \mathcal{L}^{\text{price}}$$
+
+where $\omega_1$ is exogenous weight to balance the two loss components (tuned to match scales). I set $\omega_1 \in (0.1, 0.5) $ to prioritize the zero-profit condition.
+
+### Actor Update
+
+The actor maximizes expected continuation value:
+$$\mathcal{L}^{\text{BR}}_{\text{actor}} = -\frac{1}{|\mathcal{B}|} \sum_{i \in \mathcal{B}} \left[ e(\cdot) - \eta(e) + \beta \cdot V_{\text{eff}}(\Gamma_{\text{value}}(k'_i, b'_i, z'_{i,1}; \theta_{\text{value}})) \right]$$
+
+The smooth $V_{\text{eff}}$ (rather than hard $\max$) is essential here. A hard max has zero gradient in the default region, providing no signal for the actor to adjust $(k', b')$ to exit default.
+
+### Algorithm Summary
+
+1. **Critic step** (repeat $N_{\text{critic}}$ times):
+   - Compute actions $(k', b') = \Gamma_{\text{policy}}(k, b, z; \theta^{-}_{\text{policy}})$
+   - Compute Bellman targets $y_\ell$ and pricing residuals $f_\ell$
+   - Update $(\theta_{\text{value}}, \theta_{\text{price}})$ on combined loss
+   - Polyak-update target networks
+
+2. **Actor step**:
+   - Compute actions using current policy
+   - Update $\theta_{\text{policy}}$ to minimize actor loss
+   - Polyak-update target policy
+
+3. **Annealing**: Decay temperature $\tau$ for default and other gates
+
+4. **Stopping**: Check convergence after annealing completes
+
+
+
+***
+
+# Convergence and Early Stopping
+
+Since we generally do not have closed-form solutions to benchmark against, I design the following convergence/stopping criteria to ensure that the training is sufficient and the solutions are valid.
 
 The stopping logic is hierarchical: first ensure annealing is complete, then check method-specific convergence on the validation set.
 
 ### Annealing Gatekeeper
 
-If current step $< N_{\text{anneal}}$, ignore all early stopping triggers. This ensures the soft gates have sharpened before evaluating convergence.
+If current step $< N_{\text{anneal}}$, ignore all early stopping triggers. This ensures the soft gates have sharpened before evaluating convergence. For example, failure to do so may kill the "inaction" region of investment policy due to fixed adjustment cost.
 
 ### Method-Specific Criteria
 
@@ -741,82 +1052,19 @@ A patience counter tracks consecutive checks where criteria are met:
 - Reset to zero if criteria violated
 - Stop when counter exceeds patience limit (default: 5)
 
+### Training Logs
+
+Figures @fig-loss-curves and @fig-loss-curves-risky show the example training loss curves and diagnostic metrics for 
+
+- LR, ER, and BR methods on the basic model
+- BR method for risky debt model
+
+Note that the curves are from demo run and does not represent convergened result.
+
 ![Training loss curves for LR, ER, and BR methods on the basic model. LR minimizes negative lifetime reward; ER and BR minimize squared residuals (shown in log scale). *Example output from debug-mode training; production results will differ.*](../results/part1-demo/figures/basic_loss_curves.png){#fig-loss-curves width=85%}
 
-***
+![Training loss curves for LR, ER, and BR methods on the risky debt model. LR minimizes negative lifetime reward; ER and BR minimize squared residuals (shown in log scale). *Example output from debug-mode training; production results will differ.*](../results/part1-demo/figures/risky_br_loss_curves.png){#fig-loss-curves-risky width=85%}
 
-# Risky Debt Training
-
-## Method Selection
-
-The risky debt model can in principle use LR, ER, or BR methods, but practical considerations favor BR.
-
-**LR Method**: Applicable but challenging. The nested fixed-point problem (risky rate depends on value, which depends on risky rate) is implicit in the lifetime simulation. The network must simultaneously learn the policy and the equilibrium pricing, which can be unstable without the explicit critic structure.
-
-**ER Method**: Problematic. Deriving Euler equations for the risky debt model requires differentiating through the default indicator and bond pricing equilibrium. The resulting conditions are complex, and the indicator discontinuities are harder to handle without the value function providing a stable learning target.
-
-**BR Method (Recommended)**: The actor-critic structure naturally decomposes the equilibrium conditions:
-
-- Critic learns value and pricing to satisfy Bellman and zero-profit conditions
-- Actor optimizes policy given the learned value/pricing functions
-
-This decomposition handles the nested fixed-point problem without explicit iteration and provides stable learning targets for each component.
-
-
-## BR Method for Risky Debt
-
-### Pricing Loss
-
-The lender's zero-profit condition determines bond prices. Define the pricing residual:
-$$f_\ell = q \cdot b' \cdot (1+r) - \left[ p_\ell \cdot R(k', z'_\ell) + (1 - p_\ell) \cdot b' \right]$$
-
-where:
-
-- $q = \Gamma_{\text{price}}(k', b', z; \theta_{\text{price}})$ is the predicted bond price
-- $p_\ell$ is the Gumbel-Sigmoid default probability at shock $z'_\ell$
-- $R(k', z')$ is the recovery value
-
-**Pricing Loss**
-$$\mathcal{L}^{\text{price}} = \frac{1}{|\mathcal{B}|} \sum_{i \in \mathcal{B}} f_{i,1} \times f_{i,2}$$
-
-### Critic Update
-
-The critic target incorporates limited liability via the smooth effective value:
-$$V_{\text{eff}} = (1 - p) \cdot \widetilde{V}$$
-
-where $p$ is the default probability. As $\tau \to 0$, this converges to $\max\{0, \widetilde{V}\}$.
-
-**Bellman Target**
-$$y_\ell = e(\cdot) - \eta(e) + \beta \cdot V_{\text{eff}}(\Gamma_{\text{value}}(k', b', z'_\ell; \theta^{-}_{\text{value}}))$$
-
-**Combined Critic Loss**
-$$\mathcal{L}_{\text{critic}} = \omega_1 \mathcal{L}^{\text{BR}} + \omega_2 \mathcal{L}^{\text{price}}$$
-
-where $(\omega_1, \omega_2)$ are weights to balance the two loss components (tuned to match scales).
-
-### Actor Update
-
-The actor maximizes expected continuation value:
-$$\mathcal{L}^{\text{BR}}_{\text{actor}} = -\frac{1}{|\mathcal{B}|} \sum_{i \in \mathcal{B}} \left[ e(\cdot) - \eta(e) + \beta \cdot V_{\text{eff}}(\Gamma_{\text{value}}(k'_i, b'_i, z'_{i,1}; \theta_{\text{value}})) \right]$$
-
-The smooth $V_{\text{eff}}$ (rather than hard $\max$) is essential here. A hard max has zero gradient in the default region, providing no signal for the actor to adjust $(k', b')$ to exit default.
-
-### Algorithm Summary
-
-1. **Critic step** (repeat $N_{\text{critic}}$ times):
-   - Compute actions $(k', b') = \Gamma_{\text{policy}}(k, b, z; \theta^{-}_{\text{policy}})$
-   - Compute Bellman targets $y_\ell$ and pricing residuals $f_\ell$
-   - Update $(\theta_{\text{value}}, \theta_{\text{price}})$ on combined loss
-   - Polyak-update target networks
-
-2. **Actor step**:
-   - Compute actions using current policy
-   - Update $\theta_{\text{policy}}$ to minimize actor loss
-   - Polyak-update target policy
-
-3. **Annealing**: Decay temperature $\tau$ for default and other gates
-
-4. **Stopping**: Check convergence after annealing completes
 
 ***
 
@@ -862,65 +1110,196 @@ Several design choices ensure stable training:
 3. **Configuration hashing**: Cache files include MD5 hash of configuration for invalidation
 4. **Metadata logging**: All generated datasets store their configuration for verification
 
+## Checkpointing
+
+The `src/utils/checkpointing.py` module provides save/load functionality for training results. Keras models (policy, value, price networks and their targets) are serialized as `.keras` files, while training history and configuration dataclasses are stored as JSON metadata. This allows resuming analysis without re-running expensive training. The `save_training_result()` and `load_training_result()` functions handle serialization transparently, and `save_all_results()` / `load_all_results()` support batch operations across multiple experiments with automatic index generation.
+
 ***
 
-# Solution Evaluation
+# Results and Post-training Evaluation
+
+This section reports training results (demo) and discuss strategies to verify the correcteness and effectiveness of the solutions. 
+
+::: {.callout-note title="Note on Figures"}
+The results below are from debug-mode training with small batch sizes and limited iterations. They demonstrate the methodology but not converged solutions. None of the reported runs triggered the convergence criteria. Production-quality results will be generated after full training runs.
+:::
+
+::: {.callout-note title="Demo Training Configurations"}
+I run the demo training with 2020 Macbook Pro (M1) and the following configs: Sample size = $N\times T$ with horizon $T=64$, $N=50$. Training batch size $=64$ and maximum number of iteration $=500$. Demo run takes about 45-50 minutes on my laptop. The results can be reproduced by running `src/report/part1_demo.ipynb`.
+:::
 
 ## Verification Strategies
 
-Since analytical solutions generally do not exist, verification uses three approaches:
+In principle, the convergence/stopping rule should ensures the effectiveness of the solution. In addition, I propose three post-training verification strategies to validate the correctness of the solutions.
 
-1. **Cross-method consistency**: Policies learned by LR, ER, and BR should be similar when trained on the same data
-2. **Economic sanity checks**: Policies should exhibit expected qualitative behavior
-3. **Analytical benchmark**: Special cases with closed-form solutions (e.g., no adjustment costs)
-
-## Basic Model Results
-
-For the basic model, we visualize policies along two dimensions:
-
-- $k'$ vs. $k$ at fixed $\ln z = \mu$ (capital dynamics)
-- $k'$ vs. $\ln z$ at fixed $k = k^*$ (response to productivity)
-
-All three methods should produce overlapping policies that cross the 45-degree line at approximately the same steady-state capital level. See @fig-policy-baseline, @fig-policy-smooth, and @fig-policy-fixed for policy comparisons across scenarios, and @fig-3d-basic for the 3D policy surface.
-
-## Risky Debt Model Results
-
-The risky debt model produces joint policies for capital and borrowing $(k', b')$. See @fig-risky-policy for 2D policy slices and @fig-risky-3d for 3D policy surfaces.
+1. **Analytical benchmark**: Special case with closed-form analytical solutions (e.g., basic model with no adjustment costs)
+2. **Cross-method consistency**: Policies learned by LR, ER, and BR should be highly similar (if not exactly the same) when trained on the same data
+3. **Economic sanity checks**: Policies should exhibit expected qualitative behavior (e.g., comparative statics)
 
 ## Analytical Benchmark
 
-With zero adjustment costs ($\psi = 0$), the Euler equation simplifies to:
-$$\mathbb{E}[\theta z' (k')^{\theta-1} \mid z] = r + \delta$$
+![Validation against analytical solution at baseline (no adjustment costs). Learned policies from all three methods are compared against the closed-form Euler solution. Close agreement validates the implementation. *Debug-mode results; full training will improve accuracy.*](../results/part1-demo/figures/baseline_validation.png){#fig-policy-baseline-valid width=85%}
+
+In the basic model, with zero adjustment costs ($\psi = 0$), the Euler equation simplifies to:
+$$\mathbb{E}[\gamma z' (k')^{\gamma-1} \mid z] = r + \delta$$
 
 Using properties of the lognormal distribution:
 $$\mathbb{E}[z' \mid z] = \exp\left((1-\rho)\mu + \rho \ln z + \frac{1}{2}\sigma^2\right)$$
 
 This yields the analytical policy:
-$$k'(z) = \left[\frac{\theta \exp\left((1-\rho)\mu + \rho \ln z + \frac{1}{2}\sigma^2\right)}{r + \delta}\right]^{\frac{1}{1-\theta}}$$
+$$k'(z) = \left[\frac{\gamma \exp\left((1-\rho)\mu + \rho \ln z + \frac{1}{2}\sigma^2\right)}{r + \delta}\right]^{\frac{1}{1-\gamma}}$$
 
 Key properties of this benchmark:
 
 - $k'$ is independent of current capital $k$
 - $k'$ increases in $z$ when $\rho > 0$
 
-Learned policies should match this solution in the zero-adjustment-cost case (@fig-validation).
+Learned policies should match the analytical solution in the no-adjustment-cost case (@fig-policy-baseline-valid). Note that the BR approach typically perform poorly when iteration is small because it converge relatively slower.
 
-## Figures
+### 2D Policy Slice
 
-::: {.callout-note}
-**Note on figures**: The results below are from debug-mode training with small batch sizes and limited iterations. They demonstrate the methodology but not converged solutions. Production-quality results will be generated after full training runs.
-:::
+![Policy comparison at baseline parameters (no adjustment costs). Frictionless dash line represent analytical solution](../results/part1-demo/figures/basic_policy_comparison_baseline.png){#fig-policy-baseline width=85%}
 
-![Policy comparison at baseline parameters (no adjustment costs). All three methods converge to similar policies.](../results/part1-demo/figures/basic_policy_comparison_baseline.png){#fig-policy-baseline width=85%}
+For the basic model, I visualize policies along two dimensions:
 
-![Policy comparison with convex adjustment costs ($\phi_0 > 0$). The smooth cost creates gradual adjustment toward steady state.](../results/part1-demo/figures/basic_policy_comparison_smooth_cost.png){#fig-policy-smooth width=85%}
+- $k'$ vs. $k$ at fixed $\ln z = \mu$ (capital dynamics)
+- $k'$ vs. $\ln z$ at fixed $k = k^*$ (response to productivity)
 
-![Policy comparison with fixed adjustment costs ($\phi_1 > 0$). The fixed cost creates an inaction region near the 45-degree line.](../results/part1-demo/figures/basic_policy_comparison_fixed_cost.png){#fig-policy-fixed width=85%}
+The result should also confirms that $k'$ is independent of $k$ so that the policy function is a flat line. The 45 degree line represent steady state capital $k^*$. See @fig-policy-baseline.
 
-![3D visualization of optimal capital policy $k'(k, z)$ across all three scenarios. The surface shows how policy responds jointly to current capital and productivity.](../results/part1-demo/figures/basic_3d_cross_scenario.png){#fig-3d-basic width=95%}
+![Optimal investment rate comparison at baseline parameters (no adjustment costs). Frictionless dash line represent analytical solution](../results/part1-demo/figures/basic_scenario_comparison_br.png){#fig-invest-baseline width=85%}
 
-![Risky debt BR policy: optimal capital $k'$ and borrowing $b'$ as functions of current state. Left panels show response to capital; right panels show response to productivity.](../results/part1-demo/figures/risky_br_policy.png){#fig-risky-policy width=90%}
+A more economically meaningful plot is to compute the implied investment rate $\frac{I}{k} = \frac{k' - (1-\delta)k}{k}$ following @strebulaev_dynamic_2012. This measure is unit-free and is comparable across methods/configs. See @fig-invest-baseline.
+
+One feature we should expect is that the baseline (frictionless) investment rate should be **smoothly** decreasing in $k$ and increasing with productivity shocks $\log z$. In contrast, non-zero smooth (convex) and fixed adjustment cost will compress the investment rate and induce potential inaction regions. see @fig-invest-baseline
+
+
+
+## Basic Model Results
+
+![3D visualization of optimal capital policy $k'(k, z)$ across all three scenarios under the basic model. The surface shows how policy responds jointly to current capital and productivity.](../results/part1-demo/figures/basic_3d_cross_scenario.png){#fig-policy3d-baseline width=85%}
+
+The cleanest way to visualize the result is probably to plot the 3D policy surfaces that maps $(k, z)$ to $k'$. This figure also highlights how adjustment cost affects the optimal investment policies. See @fig-policy3d-baseline.
+
+- Baseline frictionless: smooth surface increasing with both states
+- Smooth/convex adjustment cost: "flatten" surface because investments are costly
+- Fixed adjustmetn cost: could trigger inaction regions because firm only investment when return pass a fixed threshold
+
+
+## Risky Debt Model Results
 
 ![3D policy surfaces for the risky debt model showing $k'(k, b, z)$ and $b'(k, b, z)$ at fixed productivity levels.](../results/part1-demo/figures/risky_3d_policies.png){#fig-risky-3d width=95%}
 
-![Validation against analytical solution at baseline (no adjustment costs). Learned policies from all three methods are compared against the closed-form Euler solution. Close agreement validates the implementation. *Debug-mode results; full training will improve accuracy.*](../results/part1-demo/figures/baseline_validation.png){#fig-validation width=85%}
+The risky debt model produces joint policies for capital and borrowing that maps current period $(k,b,z)$ to $(k',b')$.
+
+Start with a clean 3D plot in @fig-risky-3d. Compared to the basic model, I specified non-negative adjustment costs and costly external financing (equity injection). Thus the results represent a frictional benchmark.
+
+Unlike the basic model, the optimal policies in the risky debt model are in 4D space, so I need to fix one of the current state. On the left panel, I plot $k'$ against $(k,z)$ fixing current debt $b$ at its steady state level. On the right panel, I plot $b'$ against $(k,z)$ fixing current capital $k$ at its steady state level.
+
+![Risky debt BR policy: optimal capital $k'$ and borrowing $b'$ as functions of current state. Left panels show response to capital; right panels show response to productivity.](../results/part1-demo/figures/risky_br_policy.png){#fig-risky-policy width=90%}
+
+If we'd like to focus on comparative statics, the @fig-risky-policy plots the 2D slices of optimal policies against current state variables fixing the other state variables at their steady state levels.
+
+# Test Suite
+
+I implement a comprehensive test suite to validate the correctness of economic primitives, network architectures, training algorithms, and integration across components. This section describes the testing methodology and coverage.
+
+## Unit Tests
+
+Unit tests verify individual functions and modules in isolation.
+
+**Economic Primitives** (`tests/economy/`)
+
+Tests validate parameter dataclasses, state space bounds, and economic logic:
+
+- `test_parameters.py`: Verifies `EconomicParams` and `ShockParams` validation (e.g., $\rho \in [-1,1]$, $\delta > 0$) and TensorFlow tensor conversion
+- `test_natural_bounds.py`: Tests ergodic log-$z$ bounds computation from AR(1) parameters, steady-state capital $k^*$, and collateral-constrained debt bounds
+- `test_logic.py`: Validates production function, adjustment costs, cash flow, Euler equation components ($\chi$, $m$, residual), recovery values, and pricing residuals. Critically, tests verify gradient flow through economic functions for differentiability
+
+**Loss Functions** (`tests/trainers/test_losses.py`)
+
+Each loss function is tested against manual calculations:
+
+- LR loss: $\mathcal{L}^{\text{LR}} = -\frac{1}{N}\sum_i \sum_t \beta^t e_t$ verified with known discount sequences
+- ER AiO loss: $\text{mean}(f_1 \cdot f_2)$ tested with explicit residual pairs
+- BR critic loss: Cross-product $(V - y_1)(V - y_2)$ validated with hand-computed deltas
+- Price loss: Zero-profit residual formula verified component-by-component
+
+**Gradient Flow** (`tests/trainers/test_gradient_flow.py`)
+
+These tests enforce the gradient blocking rules from Section 5.5:
+
+1. *Critic block isolation*: Verifies `tf.stop_gradient` on policy outputs prevents $\nabla_{\theta_{\text{policy}}} \mathcal{L}_{\text{critic}} = 0$
+2. *Actor gradient existence*: Confirms policy receives gradients through value network in actor update
+3. *Target detachment*: Validates RHS continuation term has no gradient (treated as constant label)
+4. *Limited liability*: Tests ReLU subgradient ($\nabla = 1$ for $\widetilde{V} > 0$, $\nabla = 0$ for $\widetilde{V} < 0$)
+
+These tests prevent subtle bugs where networks "cheat" by manipulating targets instead of improving predictions.
+
+**Data Generation** (`tests/economy/test_data_generator.py`, `test_rng.py`)
+
+Reproducibility tests verify:
+
+- Identical master seeds produce identical train/validation/test data across runs
+- Disjoint RNG streams ensure no data leakage between splits
+- Trajectory format shapes $(N, T+1)$ and flattened format shapes $(N \times T,)$ are correct
+- AR(1) rollout correctness: $z_{t+1} = \exp((1-\rho)\mu + \rho \ln z_t + \sigma \varepsilon_{t+1})$
+
+**Network Architectures** (`tests/networks/test_networks.py`)
+
+Tests verify:
+
+- Output bounds: Policy outputs in $[k_{\min}, k_{\max}]$, price outputs in $(0, 1/(1+r)]$
+- Input normalization: States mapped to $[0,1]$ internally
+- Shape consistency across batch dimensions
+- Weight initialization (target networks start identical to current networks)
+
+## Integration Tests
+
+Integration tests verify end-to-end behavior of complete training pipelines.
+
+**Trainer Integration** (`tests/trainers/test_br_trainers.py`, `test_er_trainer.py`, `test_risky_br_trainers.py`)
+
+These tests simulate complete training loops:
+
+- Multiple training steps execute without numerical instability (NaN/Inf)
+- Polyak averaging updates all target networks at configured rate $\nu$
+- `n_critic_steps` parameter controls critic-to-actor update ratio
+- TensorFlow Dataset pipelines integrate correctly with trainer APIs
+- Annealing schedule decreases temperature across iterations
+
+**DDP Solver Validation** (`tests/ddp/test_ddp_debt.py`)
+
+The discrete-state DDP solver provides ground truth for neural network validation:
+
+- *Geometric series test*: With constant reward $R$, VFI must converge to $V^* = R/(1-\beta)$
+- *Bellman operator tests*: Discounting, max optimization, limited liability, and probability mixing verified independently
+- *Equilibrium pricing*: Solvent firms receive risk-free rate; defaulting firms receive recovery-adjusted prices
+
+**Cross-Method Consistency** (`tests/trainers/test_basic_with_debt_data.py`)
+
+Tests verify that Basic model trainers correctly ignore the debt dimension when data includes $b$, enabling a shared data pipeline for both Basic and Risky Debt models.
+
+## Test Coverage Summary
+
+| Module   | Unit Tests | Integration | Key Invariants                                |
+| :------- | :--------: | :---------: | :-------------------------------------------- |
+| Economy  |  6 files   |      —      | Parameter validation, bounds, gradients       |
+| Networks |   1 file   |      —      | Output bounds, normalization, shapes          |
+| Trainers |  7 files   |   4 files   | Loss formulas, gradient flow, target networks |
+| DDP      |  4 files   |   2 files   | VFI convergence, equilibrium pricing          |
+| Utils    |   1 file   |      —      | Annealing decay, indicator functions          |
+
+The test suite contains approximately 260 individual tests. All tests use `pytest` with deterministic seeds for reproducibility.
+
+# References
+
+::: {#refs}
+:::
+
+
+
+
+
+
+
