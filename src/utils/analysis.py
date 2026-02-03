@@ -658,4 +658,59 @@ def get_steady_state_policy(
             'b_bounds': None,
             'n_grid': n_grid,
         }
+
+
+# =============================================================================
+# TRAINING SUMMARY
+# =============================================================================
+
+def print_training_summary(
+    results: Dict[str, Any],
+    model_type: str = "basic"
+) -> None:
+    """
+    Print a clean summary table of training results.
+
+    For basic model, expects results structured as:
+        {'scenario_name': {'lr': {...}, 'er': {...}, 'br': {...}}, ...}
+
+    For risky model, expects results structured as:
+        {'scenario_name': {'history': {...}, ...}, ...}
+
+    Args:
+        results: Dict of training results
+        model_type: "basic" or "risky"
+    """
+    print("\n" + "=" * 70)
+    print(f"TRAINING SUMMARY ({model_type.upper()} MODEL)")
+    print("=" * 70)
+
+    if model_type == "basic":
+        # Header
+        print(f"{'Scenario':<20} {'LR Loss':>12} {'ER Loss':>12} {'BR Actor':>12} {'BR RelMSE':>12}")
+        print("-" * 70)
+
+        for scenario_name, scenario_results in results.items():
+            lr_loss = scenario_results['lr']['history']['loss_LR'][-1]
+            er_loss = scenario_results['er']['history']['loss_ER'][-1]
+            br_actor = scenario_results['br']['history']['loss_actor'][-1]
+            br_rel_mse = scenario_results['br']['history'].get('rel_mse', [0])[-1]
+
+            print(f"{scenario_name:<20} {lr_loss:>12.4f} {er_loss:>12.6f} {br_actor:>12.4f} {br_rel_mse:>12.6f}")
+
+    elif model_type == "risky":
+        # Header
+        print(f"{'Scenario':<20} {'Actor':>12} {'Price':>12} {'RelMSE':>12} {'ValueScale':>12}")
+        print("-" * 70)
+
+        for scenario_name, result in results.items():
+            history = result['history']
+            actor = history['loss_actor'][-1]
+            price = history['loss_price'][-1]
+            rel_mse = history.get('rel_mse', [0])[-1]
+            scale = history.get('mean_value_scale', [0])[-1]
+
+            print(f"{scenario_name:<20} {actor:>12.4f} {price:>12.6f} {rel_mse:>12.6f} {scale:>12.2f}")
+
+    print("=" * 70 + "\n")
         

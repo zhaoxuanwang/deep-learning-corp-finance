@@ -219,9 +219,16 @@ def execute_training_loop(
                      if len(loss_keys) == 1:
                          loss_str = f"{loss_keys[0]}={metrics[loss_keys[0]]:.4f}"
                      else:
-                         # Multiple losses: show all with abbreviated names
-                         # Remove 'loss_' prefix for cleaner display
-                         loss_parts = [f"{k.replace('loss_', '')}={metrics[k]:.4f}" for k in loss_keys]
+                         # Multiple losses: show key metrics with abbreviated names
+                         # For BR methods: show rel_mse (scale-invariant) instead of loss_critic
+                         # which naturally increases as value scale grows
+                         loss_parts = []
+                         for k in loss_keys:
+                             if k == "loss_critic" and "rel_mse" in metrics:
+                                 # Show rel_mse instead of absolute critic loss
+                                 loss_parts.append(f"rel_mse={metrics['rel_mse']:.6f}")
+                             else:
+                                 loss_parts.append(f"{k.replace('loss_', '')}={metrics[k]:.4f}")
                          loss_str = " ".join(loss_parts)
                  else:
                      loss_str = ""
