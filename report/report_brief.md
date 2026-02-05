@@ -538,7 +538,7 @@ $$\text{Obs} = (k, b, z, z'_1, z'_2)$$
 
 where $(z'_1, z'_2)$ are the main and fork next-period shocks. After flattening, the dataset is randomly shuffled to further eliminate any residual structure.
 
-![Comparison of trajectory and flattened data formats. Left: trajectory format preserves temporal structure for LR method. Right: flattened format with independent state sampling for ER/BR methods. *Example output from debug-mode training with $T=64$.*](../results/part1-demo/figures/data_format_comparison.png){#fig-data-format width=90%}
+![Comparison of trajectory and flattened data formats. Left: trajectory format preserves temporal structure for LR method. Right: flattened format with independent state sampling for ER/BR methods. *Example output from debug-mode training with $T=64$.*](../results/latest/figures/data_format_comparison.png){#fig-data-format width=90%}
 
 
 ## RNG Seed Schedule
@@ -1061,9 +1061,9 @@ Figures @fig-loss-curves and @fig-loss-curves-risky show the example training lo
 
 Note that the curves are from demo run and does not represent convergened result.
 
-![Training loss curves for LR, ER, and BR methods on the basic model. LR minimizes negative lifetime reward; ER and BR minimize squared residuals (shown in log scale). *Example output from debug-mode training; production results will differ.*](../results/part1-demo/figures/basic_loss_curves.png){#fig-loss-curves width=85%}
+![Training loss curves for LR, ER, and BR methods on the basic model. LR minimizes negative lifetime reward; ER and BR minimize squared residuals (shown in log scale). *Example output from debug-mode training; production results will differ.*](../results/latest/figures/basic_loss_curves.png){#fig-loss-curves width=85%}
 
-![Training loss curves for LR, ER, and BR methods on the risky debt model. LR minimizes negative lifetime reward; ER and BR minimize squared residuals (shown in log scale). *Example output from debug-mode training; production results will differ.*](../results/part1-demo/figures/risky_br_loss_curves.png){#fig-loss-curves-risky width=85%}
+![Training loss curves for LR, ER, and BR methods on the risky debt model. LR minimizes negative lifetime reward; ER and BR minimize squared residuals (shown in log scale). *Example output from debug-mode training; production results will differ.*](../results/latest/figures/risky_br_loss_curves.png){#fig-loss-curves-risky width=85%}
 
 
 ***
@@ -1138,7 +1138,7 @@ In principle, the convergence/stopping rule should ensures the effectiveness of 
 
 ## Analytical Benchmark
 
-![Validation against analytical solution at baseline (no adjustment costs). Learned policies from all three methods are compared against the closed-form Euler solution. Close agreement validates the implementation. *Debug-mode results; full training will improve accuracy.*](../results/part1-demo/figures/baseline_validation.png){#fig-policy-baseline-valid width=85%}
+![Validation against analytical solution at baseline (no adjustment costs). Learned policies from all three methods are compared against the closed-form Euler solution. Close agreement validates the implementation. *Debug-mode results; full training will improve accuracy.*](../results/latest/figures/baseline_validation.png){#fig-policy-baseline-valid width=85%}
 
 In the basic model, with zero adjustment costs ($\psi = 0$), the Euler equation simplifies to:
 $$\mathbb{E}[\gamma z' (k')^{\gamma-1} \mid z] = r + \delta$$
@@ -1158,7 +1158,7 @@ Learned policies should match the analytical solution in the no-adjustment-cost 
 
 ### 2D Policy Slice
 
-![Policy comparison at baseline parameters (no adjustment costs). Frictionless dash line represent analytical solution](../results/part1-demo/figures/basic_policy_comparison_baseline.png){#fig-policy-baseline width=85%}
+![Policy comparison at baseline parameters (no adjustment costs). Frictionless dash line represent analytical solution](../results/latest/figures/basic_policy_comparison_baseline.png){#fig-policy-baseline width=85%}
 
 For the basic model, I visualize policies along two dimensions:
 
@@ -1167,7 +1167,7 @@ For the basic model, I visualize policies along two dimensions:
 
 The result should also confirms that $k'$ is independent of $k$ so that the policy function is a flat line. The 45 degree line represent steady state capital $k^*$. See @fig-policy-baseline.
 
-![Optimal investment rate comparison at baseline parameters (no adjustment costs). Frictionless dash line represent analytical solution](../results/part1-demo/figures/basic_scenario_comparison_br.png){#fig-invest-baseline width=85%}
+![Optimal investment rate comparison at baseline parameters (no adjustment costs). Frictionless dash line represent analytical solution](../results/latest/figures/basic_scenario_comparison_br.png){#fig-invest-baseline width=85%}
 
 A more economically meaningful plot is to compute the implied investment rate $\frac{I}{k} = \frac{k' - (1-\delta)k}{k}$ following @strebulaev_dynamic_2012. This measure is unit-free and is comparable across methods/configs. See @fig-invest-baseline.
 
@@ -1177,7 +1177,7 @@ One feature we should expect is that the baseline (frictionless) investment rate
 
 ## Basic Model Results
 
-![3D visualization of optimal capital policy $k'(k, z)$ across all three scenarios under the basic model. The surface shows how policy responds jointly to current capital and productivity.](../results/part1-demo/figures/basic_3d_cross_scenario.png){#fig-policy3d-baseline width=85%}
+![3D visualization of optimal capital policy $k'(k, z)$ across all three scenarios under the basic model. The surface shows how policy responds jointly to current capital and productivity.](../results/latest/figures/basic_3d_cross_scenario.png){#fig-policy3d-baseline width=85%}
 
 The cleanest way to visualize the result is probably to plot the 3D policy surfaces that maps $(k, z)$ to $k'$. This figure also highlights how adjustment cost affects the optimal investment policies. See @fig-policy3d-baseline.
 
@@ -1188,7 +1188,7 @@ The cleanest way to visualize the result is probably to plot the 3D policy surfa
 
 ## Risky Debt Model Results
 
-![3D policy surfaces for the risky debt model showing $k'(k, b, z)$ and $b'(k, b, z)$ at fixed productivity levels.](../results/part1-demo/figures/risky_3d_policies.png){#fig-risky-3d width=95%}
+![3D policy surfaces for the risky debt model showing $k'(k, b, z)$ and $b'(k, b, z)$ at fixed productivity levels.](../results/latest/figures/risky_3d_policies.png){#fig-risky-3d width=95%}
 
 The risky debt model produces joint policies for capital and borrowing that maps current period $(k,b,z)$ to $(k',b')$.
 
@@ -1196,7 +1196,7 @@ Start with a clean 3D plot in @fig-risky-3d. Compared to the basic model, I spec
 
 Unlike the basic model, the optimal policies in the risky debt model are in 4D space, so I need to fix one of the current state. On the left panel, I plot $k'$ against $(k,z)$ fixing current debt $b$ at its steady state level. On the right panel, I plot $b'$ against $(k,z)$ fixing current capital $k$ at its steady state level.
 
-![Risky debt BR policy: optimal capital $k'$ and borrowing $b'$ as functions of current state. Left panels show response to capital; right panels show response to productivity.](../results/part1-demo/figures/risky_br_policy.png){#fig-risky-policy width=90%}
+![Risky debt BR policy: optimal capital $k'$ and borrowing $b'$ as functions of current state. Left panels show response to capital; right panels show response to productivity.](../results/latest/figures/risky_br_policy.png){#fig-risky-policy width=90%}
 
 If we'd like to focus on comparative statics, the @fig-risky-policy plots the 2D slices of optimal policies against current state variables fixing the other state variables at their steady state levels.
 

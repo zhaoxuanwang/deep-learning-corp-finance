@@ -1022,3 +1022,287 @@ def plot_scenario_comparison_panels(
 
     plt.tight_layout()
     return fig
+
+
+# =============================================================================
+# LOSS CURVE PLOTTING
+# =============================================================================
+
+def plot_basic_loss_curves(
+    result_lr: Dict,
+    result_er: Dict,
+    result_br: Dict,
+    scenario_name: str = "scenario",
+    save_path: Optional[str] = None,
+    figsize: Tuple[int, int] = (16, 8)
+) -> plt.Figure:
+    """
+    Plot loss curves for all three basic model training methods.
+
+    Creates a 2x3 panel figure:
+        Row 1: LR loss, ER loss, BR Actor loss
+        Row 2: LR (log scale), ER (log scale), BR Critic (rel_mse)
+
+    Args:
+        result_lr: Training result dict from LR method with 'history' key
+        result_er: Training result dict from ER method with 'history' key
+        result_br: Training result dict from BR method with 'history' key
+        scenario_name: Name for figure title and filename
+        save_path: If provided, save figure to this path
+        figsize: Figure size (width, height)
+
+    Returns:
+        matplotlib Figure object
+    """
+    fig, axes = plt.subplots(2, 3, figsize=figsize)
+
+    # Extract iteration arrays
+    iter_lr = result_lr['history'].get('iteration', list(range(len(result_lr['history']['loss_LR']))))
+    iter_er = result_er['history'].get('iteration', list(range(len(result_er['history']['loss_ER']))))
+    iter_br = result_br['history'].get('iteration', list(range(len(result_br['history']['loss_actor']))))
+
+    # Row 1: Primary loss curves
+
+    # LR Loss (more negative = better)
+    axes[0, 0].plot(iter_lr, result_lr['history']['loss_LR'],
+                    color='blue', linewidth=2, label='LR Loss')
+    axes[0, 0].set_title('LR: Lifetime Reward', fontsize=11, fontweight='bold')
+    axes[0, 0].set_xlabel('Iteration')
+    axes[0, 0].set_ylabel('Loss (more negative = better)')
+    axes[0, 0].grid(True, alpha=0.3)
+    axes[0, 0].legend()
+
+    # ER Loss (should approach 0)
+    axes[0, 1].plot(iter_er, result_er['history']['loss_ER'],
+                    color='orange', linewidth=2, label='ER Loss')
+    axes[0, 1].set_title('ER: Euler Residual', fontsize=11, fontweight='bold')
+    axes[0, 1].set_xlabel('Iteration')
+    axes[0, 1].set_ylabel('Loss (→ 0)')
+    axes[0, 1].grid(True, alpha=0.3)
+    axes[0, 1].legend()
+
+    # BR Actor Loss (more negative = better)
+    axes[0, 2].plot(iter_br, result_br['history']['loss_actor'],
+                    color='green', linewidth=2, label='Actor Loss')
+    axes[0, 2].set_title('BR: Actor Loss', fontsize=11, fontweight='bold')
+    axes[0, 2].set_xlabel('Iteration')
+    axes[0, 2].set_ylabel('Loss (more negative = better)')
+    axes[0, 2].grid(True, alpha=0.3)
+    axes[0, 2].legend()
+
+    # Row 2: Log scale and relative metrics
+
+    # LR Loss (log scale of absolute value)
+    lr_loss = np.array(result_lr['history']['loss_LR'])
+    axes[1, 0].plot(iter_lr, -lr_loss, color='blue', linewidth=2, label='-LR Loss')
+    axes[1, 0].set_yscale('log')
+    axes[1, 0].set_title('LR: -Loss (log scale)', fontsize=11, fontweight='bold')
+    axes[1, 0].set_xlabel('Iteration')
+    axes[1, 0].set_ylabel('-Loss (log scale)')
+    axes[1, 0].grid(True, alpha=0.3)
+    axes[1, 0].legend()
+
+    # ER Loss (log scale)
+    er_loss = np.array(result_er['history']['loss_ER'])
+    # Handle potential negative values from cross-product
+    er_loss_plot = np.maximum(np.abs(er_loss), 1e-10)
+    axes[1, 1].plot(iter_er, er_loss_plot, color='orange', linewidth=2, label='|ER Loss|')
+    axes[1, 1].set_yscale('log')
+    axes[1, 1].set_title('ER: |Loss| (log scale)', fontsize=11, fontweight='bold')
+    axes[1, 1].set_xlabel('Iteration')
+    axes[1, 1].set_ylabel('|Loss| (log scale)')
+    axes[1, 1].grid(True, alpha=0.3)
+    axes[1, 1].legend()
+
+    # BR Critic: Relative MSE (should decrease)
+    if 'rel_mse' in result_br['history']:
+        axes[1, 2].plot(iter_br, result_br['history']['rel_mse'],
+                        color='red', linewidth=2, label='Relative MSE')
+        axes[1, 2].set_title('BR: Critic Rel MSE (should ↓)', fontsize=11, fontweight='bold')
+        axes[1, 2].set_ylabel('Relative MSE')
+    else:
+        axes[1, 2].plot(iter_br, result_br['history']['loss_critic'],
+                        color='red', linewidth=2, label='Critic Loss')
+        axes[1, 2].set_title('BR: Critic Loss', fontsize=11, fontweight='bold')
+        axes[1, 2].set_ylabel('Loss')
+    axes[1, 2].set_xlabel('Iteration')
+    axes[1, 2].grid(True, alpha=0.3)
+    axes[1, 2].legend()
+
+    fig.suptitle(f'Basic Model Loss Curves: {scenario_name}',
+                 fontsize=14, fontweight='bold', y=1.02)
+    plt.tight_layout()
+
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+
+    return fig
+
+
+def plot_risky_loss_curves(
+    result_risky: Dict,
+    scenario_name: str = "baseline",
+    save_path: Optional[str] = None,
+    figsize: Tuple[int, int] = (12, 9)
+) -> Tuple[plt.Figure, Dict[str, float]]:
+    """
+    Plot loss curves for risky debt BR training.
+
+    Creates a 2x2 panel figure:
+        (0,0): Critic Relative MSE (should decrease)
+        (0,1): Actor Loss (more negative = better)
+        (1,0): Price Loss (should decrease)
+        (1,1): Value Scale Growth (context)
+
+    Args:
+        result_risky: Training result dict with 'history' key
+        scenario_name: Name for figure title
+        save_path: If provided, save figure to this path
+        figsize: Figure size (width, height)
+
+    Returns:
+        Tuple of (Figure, summary_dict) where summary_dict contains final metrics
+    """
+    fig, axes = plt.subplots(2, 2, figsize=figsize)
+
+    history = result_risky['history']
+    iter_risky = history.get('iteration', list(range(len(history['loss_actor']))))
+
+    # 1.1 Critic Loss - Relative MSE (should decrease)
+    if 'rel_mse' in history:
+        axes[0, 0].plot(iter_risky, history['rel_mse'],
+                        color='red', linewidth=2, label='Relative MSE')
+        axes[0, 0].set_title('Critic: Relative MSE (should ↓)', fontsize=11, fontweight='bold')
+        axes[0, 0].set_ylabel('Relative MSE')
+    else:
+        axes[0, 0].plot(iter_risky, history['loss_critic'],
+                        color='red', linewidth=2, label='Critic Loss')
+        axes[0, 0].set_title('Critic Loss', fontsize=11, fontweight='bold')
+        axes[0, 0].set_ylabel('Loss')
+    axes[0, 0].set_xlabel('Iteration')
+    axes[0, 0].grid(True, alpha=0.3)
+    axes[0, 0].legend()
+
+    # 1.2 Actor Loss (should become more negative)
+    axes[0, 1].plot(iter_risky, history['loss_actor'],
+                    color='green', linewidth=2, label='Actor Loss')
+    axes[0, 1].set_title('Actor Loss (more negative = better)', fontsize=11, fontweight='bold')
+    axes[0, 1].set_xlabel('Iteration')
+    axes[0, 1].set_ylabel('Loss')
+    axes[0, 1].grid(True, alpha=0.3)
+    axes[0, 1].legend()
+
+    # 2.1 Price Loss (should decrease)
+    axes[1, 0].plot(iter_risky, history['loss_price'],
+                    color='purple', linewidth=2, label='Price Loss')
+    axes[1, 0].set_title('Price Loss (Bond Pricing Residual)', fontsize=11, fontweight='bold')
+    axes[1, 0].set_xlabel('Iteration')
+    axes[1, 0].set_ylabel('Loss')
+    axes[1, 0].grid(True, alpha=0.3)
+    axes[1, 0].legend()
+
+    # 2.2 Value Scale Growth (context for MSE interpretation)
+    if 'mean_value_scale' in history:
+        axes[1, 1].plot(iter_risky, history['mean_value_scale'],
+                        color='blue', linewidth=2, label='Mean |V|')
+        axes[1, 1].set_title('Value Scale Growth', fontsize=11, fontweight='bold')
+        axes[1, 1].set_xlabel('Iteration')
+        axes[1, 1].set_ylabel('Mean |V|')
+        axes[1, 1].grid(True, alpha=0.3)
+        axes[1, 1].legend()
+    else:
+        axes[1, 1].text(0.5, 0.5, 'Value scale not available',
+                        ha='center', va='center', fontsize=12, color='gray',
+                        transform=axes[1, 1].transAxes)
+        axes[1, 1].set_title('Value Scale')
+
+    fig.suptitle(f'Risky Debt BR Loss Curves: {scenario_name}',
+                 fontsize=14, fontweight='bold', y=1.02)
+    plt.tight_layout()
+
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+
+    # Compute summary metrics
+    summary = {
+        'rel_mse': history.get('rel_mse', [0])[-1],
+        'loss_actor': history['loss_actor'][-1],
+        'loss_price': history['loss_price'][-1],
+        'mean_value_scale': history.get('mean_value_scale', [0])[-1],
+    }
+
+    return fig, summary
+
+
+def plot_baseline_validation(
+    policies: Dict[str, callable],
+    analytical_fn: callable,
+    z_vals: np.ndarray,
+    k_bounds: Tuple[float, float],
+    save_path: Optional[str] = None,
+    figsize: Tuple[int, int] = (10, 6)
+) -> plt.Figure:
+    """
+    Plot learned policies against analytical baseline solution.
+
+    Validates that LR, ER, BR methods converge to the same analytical solution
+    in the frictionless (no adjustment cost) case.
+
+    Args:
+        policies: Dict mapping method names ('lr', 'er', 'br') to policy networks
+                  Each network should accept (k, z) and return k'
+        analytical_fn: Function that computes analytical k'(z) given z values
+        z_vals: Array of z values to evaluate
+        k_bounds: (k_min, k_max) for fixed k evaluation point
+        save_path: If provided, save figure to this path
+        figsize: Figure size
+
+    Returns:
+        matplotlib Figure object
+    """
+    import tensorflow as tf
+
+    fig, ax = plt.subplots(1, 1, figsize=figsize)
+
+    # Fixed k at midpoint
+    k_fixed = (k_bounds[0] + k_bounds[1]) / 2
+
+    # Compute analytical solution
+    k_analytical = analytical_fn(z_vals)
+    ax.plot(np.log(z_vals), k_analytical, 'k--', linewidth=2.5,
+            label='Analytical (frictionless)', zorder=10)
+
+    # Color map for methods
+    colors = {'lr': 'blue', 'er': 'orange', 'br': 'green'}
+    labels = {'lr': 'LR Method', 'er': 'ER Method', 'br': 'BR Method'}
+
+    # Evaluate each policy
+    for method_name, policy_net in policies.items():
+        if policy_net is None:
+            continue
+
+        # Prepare inputs
+        k_input = tf.constant([[k_fixed]] * len(z_vals), dtype=tf.float32)
+        z_input = tf.constant(z_vals.reshape(-1, 1), dtype=tf.float32)
+
+        # Get policy output
+        k_next = policy_net(k_input, z_input).numpy().flatten()
+
+        color = colors.get(method_name, 'gray')
+        label = labels.get(method_name, method_name.upper())
+        ax.plot(np.log(z_vals), k_next, color=color, linewidth=2,
+                label=label, alpha=0.8)
+
+    ax.set_xlabel('log(z)', fontsize=12)
+    ax.set_ylabel("k' (next-period capital)", fontsize=12)
+    ax.set_title('Policy Validation: Learned vs Analytical (Frictionless)',
+                 fontsize=13, fontweight='bold')
+    ax.legend(loc='best', fontsize=10)
+    ax.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+
+    return fig
