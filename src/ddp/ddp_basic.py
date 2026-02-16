@@ -1,24 +1,31 @@
 """
-ddp_investment.py
+Offline basic-model DDP solver.
 
-Implements a Discrete Dynamic Programming (DDP) solver using TensorFlow.
-This approach leverages GPU acceleration for Value Function Iteration (VFI)
-and Policy Function Iteration (PFI).
+Implements a discrete dynamic programming solver for the basic investment
+model using TensorFlow on a fixed, pre-generated dataset.
+
+Transition probabilities are estimated from observed (z, z_next_main) samples.
+No internal shock simulation is performed.
 """
 
-from typing import Tuple
+from typing import Any, Callable, Dict, Literal, Optional, Tuple
 
 import tensorflow as tf
 
-from src.economy.parameters import EconomicParams, ShockParams, convert_to_tf
-from src.ddp.ddp_config import DDPGridConfig, initialize_markov_process
+from src.economy.data import DatasetBundle
+from src.economy.parameters import EconomicParams, convert_to_tf
+from src.ddp.ddp_config import (
+    DDPGridConfig,
+    estimate_transition_matrix_from_dataset,
+    extract_bounds_from_metadata,
+    initialize_markov_process,
+)
 from src.economy import logic
-from typing import Optional
 
 
-class InvestmentModelDDP:
+class BasicModelDDP:
     """
-    Solves the firm optimal investment problem in dynamic models
+    Solves the basic firm investment problem in dynamic models
     using Discrete Dynamic Programming (DDP)
     accelerated by TensorFlow.
 
@@ -36,26 +43,57 @@ class InvestmentModelDDP:
 
     def __init__(
         self, 
-        params: EconomicParams, 
-        shock_params: ShockParams,
-        grid_config: Optional[DDPGridConfig] = None
+        params: EconomicParams,
+        shock_params: Optional[Any] = None,
+        grid_config: Optional[DDPGridConfig] = None,
+        *,
+        dataset: Optional[Dict[str, tf.Tensor]] = None,
+        dataset_metadata: Optional[Dict[str, Any]] = None,
+        delta: Optional[float] = None,
+        reward_fn: Optional[Callable[..., tf.Tensor]] = None,
     ):
         """
-        Initializes the model, generates grids, and precomputes rewards.
+        Initialize offline DDP components from a fixed dataset.
 
         Args:
-            params (EconomicParams): The economic parameters.
-            shock_params (ShockParams): The shock parameters.
-            grid_config (DDPGridConfig): Grid settings (uses defaults if None).
+            params: Economic parameters used by the default reward function.
+            dataset: Flattened dataset containing at least 'z' and 'z_next_main'.
+            dataset_metadata: Metadata dictionary containing canonical bounds.
+            grid_config: Numerical grid settings.
+            delta: Optional depreciation override for grid construction.
+            reward_fn: Optional custom reward function. Signature:
+                reward_fn(k_curr, k_next, z_curr, params, temperature, logit_clip)
         """
         self.params = params
         self.shock_params = shock_params
         self.grid_config = grid_config or DDPGridConfig()
         self.beta = tf.constant(1 / (1 + params.r_rate), dtype=tf.float32)
+        self.reward_fn = reward_fn or logic.compute_cash_flow_basic
 
-        # Generate grids using grid_config
-        z_grid_np, prob_matrix_np = initialize_markov_process(shock_params, self.grid_config.z_size)
-        k_grid_np = self.grid_config.generate_capital_grid(params)
+        if dataset is not None and dataset_metadata is not None:
+            self.dataset = dataset
+            self.dataset_metadata = dataset_metadata
+            bounds = extract_bounds_from_metadata(dataset_metadata)
+            delta_val = float(params.delta if delta is None else delta)
+
+            # Build grids and data-estimated Markov transition.
+            k_grid_np, _, _ = self.grid_config.generate_grids(bounds, delta=delta_val)
+            z_grid_np, prob_matrix_np = estimate_transition_matrix_from_dataset(
+                dataset,
+                bounds,
+                z_size=self.grid_config.z_size,
+            )
+        else:
+            # Backward-compatible legacy path.
+            if shock_params is None:
+                raise ValueError(
+                    "Offline path requires dataset + dataset_metadata. "
+                    "Legacy path requires shock_params."
+                )
+            z_grid_np, prob_matrix_np = initialize_markov_process(shock_params, self.grid_config.z_size)
+            k_grid_np = self.grid_config.generate_capital_grid(params)
+            self.dataset = None
+            self.dataset_metadata = None
 
         # Convert to TensorFlow Constants
         self.z_grid, self.prob_matrix, self.k_grid = convert_to_tf(
@@ -68,6 +106,28 @@ class InvestmentModelDDP:
 
         # Precompute the Reward Matrix
         self.reward_matrix = self._compute_reward_matrix()
+
+    @classmethod
+    def from_dataset_bundle(
+        cls,
+        params: EconomicParams,
+        bundle: DatasetBundle,
+        *,
+        grid_config: Optional[DDPGridConfig] = None,
+        delta: Optional[float] = None,
+        reward_fn: Optional[Callable[..., tf.Tensor]] = None,
+    ) -> "BasicModelDDP":
+        """
+        Convenience constructor for metadata-first offline workflows.
+        """
+        return cls(
+            params,
+            dataset=bundle.data,
+            dataset_metadata=bundle.metadata,
+            grid_config=grid_config,
+            delta=delta,
+            reward_fn=reward_fn,
+        )
 
     def _compute_reward_matrix(self) -> tf.Tensor:
         """
@@ -98,10 +158,9 @@ class InvestmentModelDDP:
         # k_next_mesh: (1, 1, nk) -> Next K
         # z_mesh: (nz, 1, 1) -> Current Z
         
-        # We can directly use the compute_cash_flow_basic function which wraps
-        # Profit - I - Costs
-        # Note: Use small temperature for near-hard gates in discrete DP
-        net_cash_flow = logic.compute_cash_flow_basic(
+        # Use configurable reward primitive (defaults to basic cash flow).
+        # Small temperature keeps soft gates near discrete behavior.
+        net_cash_flow = self.reward_fn(
             k_mesh, k_next_mesh, z_mesh, self.params,
             temperature=1e-6,  # Near-hard gate for discrete DP
             logit_clip=20.0
@@ -189,7 +248,7 @@ class InvestmentModelDDP:
 
         return value
 
-    def solve_invest_vfi(
+    def solve_basic_vfi(
         self, tol: float = 1e-6, max_iter: int = 1000
     ) -> Tuple[tf.Tensor, tf.Tensor]:
         """
@@ -214,7 +273,7 @@ class InvestmentModelDDP:
 
         while error > tol and i < max_iter:
             v_next, policy_idx = self.bellman_step(v_current)
-            error = tf.reduce_max(tf.abs(v_next - v_current))
+            error = float(tf.reduce_max(tf.abs(v_next - v_current)).numpy())
             v_current = v_next
             i += 1
 
@@ -230,7 +289,7 @@ class InvestmentModelDDP:
         policy_k = tf.gather(self.k_grid, policy_idx)
         return v_current, policy_k
 
-    def solve_invest_pfi(
+    def solve_basic_pfi(
         self, max_iter: int = 100, eval_steps: int = 200
     ) -> Tuple[tf.Tensor, tf.Tensor]:
         """
@@ -264,7 +323,7 @@ class InvestmentModelDDP:
             new_policy_idx = tf.cast(new_policy_idx, tf.int32)
 
             # C. Check Stability (Has the policy changed?)
-            diff = tf.reduce_sum(tf.abs(new_policy_idx - policy_idx))
+            diff = int(tf.reduce_sum(tf.abs(new_policy_idx - policy_idx)).numpy())
 
             if diff == 0:
                 policy_stable = True
@@ -277,3 +336,17 @@ class InvestmentModelDDP:
         # Map indices to actual capital values
         policy_k = tf.gather(self.k_grid, policy_idx)
         return v_current, policy_k
+
+    def solve_basic(
+        self,
+        method: Literal["vfi", "pfi"] = "vfi",
+        **kwargs,
+    ) -> Tuple[tf.Tensor, tf.Tensor]:
+        """
+        Unified dispatcher for basic-model DDP solve method.
+        """
+        if method == "vfi":
+            return self.solve_basic_vfi(**kwargs)
+        if method == "pfi":
+            return self.solve_basic_pfi(**kwargs)
+        raise ValueError(f"Unknown method '{method}'. Supported: 'vfi', 'pfi'.")

@@ -28,9 +28,9 @@ In this report, I explore and apply the deep learning methods introduced in @mal
 
 1. **Lifetime Reward (LR)**: Maximize discounted cumulative cash flows over $T$ periods
 2. **Euler Residual (ER)**: Minimize violations of the first-order optimality conditions
-3. **Bellman Residual (BR)**: Actor-critic training to satisfy the Bellman equation and optimal policy
+3. **Bellman Residual (BR)**: Jointly minimize Bellman equation residuals and search for the optimal policies that maximize firm value
 
-The application covers two types of model:
+The application covers two versions of the canonical corporate finance model:
 
 - **Basic Model**: Firm chooses capital investment $(k,z) \to k'$ subject to adjustment cost
 - **Risky Debt Model**: Firm chooses capital investment and borrowing $(k,b,z) \to (k',b')$ with endogenous default decision and equilibrium risky interest rates
@@ -42,7 +42,7 @@ The complete codebase and lastest report release can be found on [GitHub](https:
 - *April*: Test method on real-world data and final submission
 
 ::: {.callout-tip title="Usage"}
-To reproduce results in this report and understand API usage, please run the jupyter notebook `../report/part1_demo.ipynb`
+To reproduce results in this report and understand API usage, please run the jupyter notebook `../report/01_part1_training.ipynb`
 :::
 
 ## Literature Review
@@ -115,7 +115,7 @@ For each node $a_k$ (corresponding to $x_k$), solve the optimization problem on 
 $$\tilde{y}_k = \max_{a'} \left\{ r(s, a) + \beta \hat{V}(s', a'; \mathbf{\theta}_{old}) \right\}$$
 
 1. **Updating Coefficients**
-Once we have the new optimized values $\tilde{y}_k$ at each node $x_k$, we compute the new coefficients $\mathbf{\theta}_{new}$ to fit these values. For example, using the least squares formula for Chebyshev polynomials:
+Once we have the new optimized values $\tilde{y}_k$ at each node $x_k$, we compute the new coefficients $\mathbf{\theta}_{new}$ to fit these values. For example, using the least squares (regression) formula for Chebyshev polynomials:
 $$\theta_j = \frac{\sum_{k=1}^m \tilde{y}_k T_j(x_k)}{\sum_{k=1}^m T_j(x_k)^2}$$
 
 1. **Convergence**
@@ -138,20 +138,32 @@ For example, consider a model with three state variables $(k,b,z)$, each can tak
 This relatively simple model soon becomes intractable, and this is the exact motivation for @maliar_deep_2021 to develop a gradient-based deep learning methods that is efficient for high-dimensional problems.
 
 ### Core Idea
-Here I briefly introduce the general representation of the DL method by @maliar_deep_2021 and postpone the details to later sections. The core idea is to parameterize the value function and policy function using neural networks, and then use gradient descent to minimize an objective function that enforces optimality.
+Here I briefly introduce the general representation of the DL method by @maliar_deep_2021 and postpone the details to later sections. The core idea is to parameterize and approximate the value function and policy function using deep neural networks (DNN), and then use gradient descent to minimize an objective function that enforces optimality.
 
 - Parameterize value $V(s,a; \theta_V)$ and policy $\pi(s,a; \theta_{\pi})$ as functions of trainable parameters $\theta$
 - In deep neural networks, $\theta$ are the weights and biases of the neurons
 - Objective function $\mathcal{L}(\cdot; \theta)$ captures an economic optimality condition we want to enforce
 - Algorithm use gradient descent to minimize the objective function and update the parameters $\theta$
 
-Personally, I find this approach directly connected to the canonnical projection method. Specifically, the polynomial approximation $V_i(s, a) \approx \theta_0 + \sum_{j=1}^{n} \theta_j T_j(x)$ can be seen as a specific type of neural network with a single hidden layer, a linear activation function, and transformed input $T: (s,a)\to x$. 
+In my view, I find this approach directly connected to the canonnical projection method. Specifically, the polynomial approximation $V_i(s, a) \approx \theta_0 + \sum_{j=1}^{n} \theta_j T_j(x)$ can be seen as a specific type of neural network with a single hidden layer, a linear activation function, and transformed input $T: (s,a)\to x$. 
 
-The DL method has several key advantages over the conventional methods:
+Conceptually, the DNN-based methods introduced by @maliar_deep_2021 are closely related to many modern Deep Reinforcement Learning (DRL) methods because they both work the Bellman equation and aim to solve for the optimal policies. Both methods use Stochastic Gradient Descent (SGD) to update the DNN parameters. However, their implementations are also fundamentally different in several aspects. 
 
-1. **Tractability**: Number of parameters in a neural network grows _linearly_ with the dimensionality of the state space so training remains tractable even for high-dimensional problems
-2. **Speed**: SGD-based training is typically much faster than the Newton's method (inverting huge matrices)
-3. **Precision**: Neural networks with "deep" configs (multiple hidden layers and neurons) can "learn" to approximate kinks and discontinuities while still achieve high precision (e.g., minimizing residual below $10^{-4}$)
+The table below summarizes the key differences across three methods.
+
+| Methods: | Value/Policy Function Iterations | Projection Methods | Maliar's Method | Standard DRL | 
+|:---|:---:|:---:|:---:|:---:|
+| **Algorithm** | Fixed Point Iterations | Fixed Point Iterations | Non-linear regression | Direct Optimization |
+| **Value/Policy Approximation** | None | Polynomial | Neural Networks | Neural Networks
+| **Environment** | Model-based | Model-based | Model-based | Model-free |
+| **Solver** | Grid Search / Root-finding | Regression | Gradient Descent | Gradient Descent 
+| **Dimensionality** | Small | Small | Large | Large
+
+Compared with the conventional methods, @marliar_deep_2021 method has several advantages:
+
+1. **High-Dimensional Problems**: Number of parameters in a neural network grows _linearly_ with the dimensionality of the state space so training remains tractable even in high-dimensional spaces where VFI/PFI is infeasible.
+2. **Speed of Convergence**: SGD-based training is typically faster than grid search (VFI) or root-finding (matrix inversion in PFI)
+3. **Precision**: Neural networks learn the value and policy functions in continuous state space 
 4. **Flexibility**: Neural networks can be easily extended to handle more complex economic models, such as models with more state action variables and complex constraints
 
 ### Highlights of My Innovation
@@ -165,29 +177,47 @@ During my implementation of @maliar_deep_2021, I found that the original design 
 
 Here I briefly summarize the key improvements/innovations I made on these points. More technical details are discussed in later sections.
 
-#### AiO estimator vs MSE loss
+#### Issues of the AiO Estimator
 
-@maliar_deep_2021 propose an All-in-One (AiO) expectation operator to compute the expectation instead of the traditional deterministic quadrature. The idea is to draw two random i.i.d. shocks $\epsilon_1, \epsilon_2$ from the distribution of $\epsilon$ and compute the sample mean:
+The fundamental problem in training to find $\theta$ that minimizes an objective (loss) consisting of a *squared expectation* of random shock (residual):
+$$
+\mathbb{E}_{\epsilon} [f(\epsilon,\theta)]^2
+$$
+where $f$ is Bellman equation residual or Euler equation residual.
+What matters in training is whether the gradient is unbiased. The true gradient is $2 \mathbb{E}[f] \mathbb{E}[\nabla_{\theta} f]$.  
+
+The standard Mean Square Error (MSE) estimator is biased:
+$$
+\text{MSE}=\frac{1}{N} \sum_{i=1}^N (f_{i,1})^2 \to \mathbb{E}[f(\epsilon)]^2 + \text{Var}[f(\epsilon)]
+$$
+where the bias is exactly the variance of $f(\epsilon_{i,1})$. The gradient of MSE is $2 f \nabla_\theta f$ and it is biased (taking expectation)
+$$
+\mathbb{E}[2 f \nabla_\theta f​]= 2 \mathbb{E}[f​]\mathbb{E}[\nabla_\theta f] + 2 \text{Cov}(f,\nabla_\theta f)
+$$
+where the gradient bias is $\text{Cov}(f,\nabla_\theta f)\neq 0$ because they depends on the same realization of $\epsilon$. Thus, standard MSE will lead to incorrect solution in gradient-based training.
+
+
+@maliar_deep_2021 propose an All-in-One (AiO) expectation operator to compute the expectation. 
+The idea is to draw two random i.i.d. shocks $\epsilon_1, \epsilon_2$ from the distribution of $\epsilon$ and compute the sample mean:
 
 $$
 \mathbb{E}[f(\epsilon)]^2 \approx \frac{1}{N} \sum_{i=1}^N \left[ f(\epsilon_{i,1}) \cdot f(\epsilon_{i,2}) \right]
 $$
 
-This estimator is unbiased because $\mathbb{E}[f_1 \cdot f_2] = \mathbb{E}[f_1] \cdot \mathbb{E}[f_2] = \mathbb{E}[f]^2$ when $f_1, f_2$ are i.i.d. draws.
-
-However, this estimator induces unstability for the risky debt training, where $f$ include a default indicator $p_\epsilon$ that is approximated with Gumbel-Sigmoid (see details in later section). I intentially introduces a uniform random noise in Gumbel-Sigmoid to force the network to "learn" around the default boundary, but this amplifies the unstability of the AiO expectation estimator.
-
-To mitigate this risk, I also implement the standard Mean Square Error (MSE) loss as benchmark:
-
+This estimator is unbiased because $\mathbb{E}[f_1 \cdot f_2] = \mathbb{E}[f_1] \cdot \mathbb{E}[f_2] = \mathbb{E}[f]^2$ when $f_1, f_2$ are i.i.d. draws. The gradient of this AiO estimator is unbiased given that $f_1$ and $f_2$ are i.i.d: 
 $$
-\text{MSE}=\frac{1}{N} \sum_{i=1}^N \left[ \frac{1}{2}(f_{i,1}^2 \cdot f_{i,2}^2) \right] \to \mathbb{E}[f(\epsilon)]^2 + \text{Var}[f(\epsilon)]
+\mathbb{E}[f_2 \nabla_\theta ​f_1 + f_1 \nabla_\theta ​f_2]​ = \mathbb{E}[f_2] \mathbb{E}[\nabla_\theta ​f_1] + \mathbb{E}[f_1] \mathbb{E}[\nabla_\theta ​f_2] = 2 \mathbb{E}[f] \mathbb{E}[\nabla_{\theta} f]
 $$
 
-This is a standard loss function used in deel reinforcement learning. Although it is biased (due to the variance term), it is stable in training and the variance term is usually small with i.i.d $\epsilon$ draws and large sample size.
+However, although the AiO estimator is unbiased, a critical issue in practice is when $f_1 > 0$ and $f_2 < 0$ (or vice versa), the product is
+negative. This happens frequently when residuals oscillate around zero during training. In practice, I find that using this AiO estimator make the training very unstable and slow to convergence. 
+
+This estimator is particularly problemtic for the risky debt training, where $f$ include a default indicator $p_\epsilon$ that is approximated with Gumbel-Sigmoid (see details in later section). I intentially introduces a uniform random noise in Gumbel-Sigmoid to force the network to "learn" around the default boundary, but this amplifies the unstability of the AiO expectation estimator because it more frenquently oscillate around the default bound (when value is zero). 
 
 ::: {.callout-tip title="Codes"}
-My neural network trainers for ER and BR method has two options for loss functoin: `mse` and `crossprod` (AiO). I prefer `mse` for numerical stability.
+My neural network trainers for ER and BR method build two options for loss function: `mse` and `crossprod` (AiO). I prefer `crossprod` for ER, LR, and BR-regression methods, and `mse` for BR-actor-critic methods.
 :::
+
 
 #### Ergodic Set Sampling
 
@@ -227,18 +257,18 @@ In our corporate finance models, there are kinks (e.g., default gate) and discon
 In @maliar_deep_2021, the Bellman Residual (BR) method is implemented via minimizing a multi-task objective function:
 
 $$
-\mathcal{L} = w_1 \mathcal{L}_{\text{BR}} + w_2 \mathcal{L}_{\text{FOC}} + w_3 \mathcal{L}_{\text{Envelop}}
+\mathcal{L} = \mathcal{L}_{\text{BR}} + w_1 \mathcal{L}_{\text{FOC}} + w_2 \mathcal{L}_{\text{Envelop}}
 $$
 
 where $w$ exogenous weights and the second and third term are First Order Conditions or Envelope Conditions to enforce optimality of the policy. This framework has a number of weakness:
 
 - Requires tuning hyperparameters $w$
-- Requires reward function is differentiable (for FOC or Envelop Condition)
-- If there are mistakes in hard-coded FOC and Envelop condition, the training will be wrong
+- Requires reward function is convex and differentiable (for FOC or Envelop Condition)
+- Not feasible for more complex models (e.g., risky debt) where there is no closed-form analytical representation of FOC or Envelop condition.
 
 To be fair, @maliar_deep_2021 mentioned "direct optimization" as an alternative to the multi-task objective, but they did not provide detail guidelines on how to implement it. 
 
-I fill this gap by refining an Actor-Critic framework that implements the "direct optimization". The idea is very similar to the conventional policy function iteration method, where each training has two main steps:
+I fill this gap by refining an Actor-Critic framework that implements the "direct optimization". The algorithm is closely related to the modern DRL algorithms like DDPG and TD3, where each training has two main steps:
 
 - Critic: Find the fixed point value function $V_\pi$ by minimize Bellman residual for a given armbitrary policy $\pi$
 - Actor: Find the fixed point policy $\pi$ by maximizing the Bellman equation given the learned value function $V_\pi$
@@ -704,12 +734,16 @@ where $I' = k'' - (1-\delta)k'$.
 **Unit-Free Residual**
 
 Dividing by the LHS gives a unit-free residual:
-$$f = 1 - \beta \cdot \frac{m(k', k'', z')}{1 + \psi_I(I, k)}$$
+$$f_\ell = 1 - \beta \cdot \frac{m(k', k''_\ell, z'_{\ell})}{1 + \psi_I(I, k)}, \quad \ell=1,2$$
 
-At the optimum, $\mathbb{E}[f] = 0$.
+At the optimum, $\mathbb{E}[f_\ell]^2 = 0$.
 
-**Empirical Loss (Cross-Product)**
+**Empirical Loss: AiO Cross-Product**
+
+I also built the AiO estimator proposed in @maliar_deep_2021 that uses both the main and the forked shocks ($\ell=1,2$):
 $$\mathcal{L}^{\text{ER}} = \frac{1}{|\mathcal{B}|} \sum_{i \in \mathcal{B}} f_{i,1} \times f_{i,2}$$
+
+
 
 **Target Network for Stability**
 
@@ -727,7 +761,75 @@ The target is updated via Polyak averaging: $\theta^{-} \leftarrow \nu \theta^{-
 5. Update $\theta$ and Polyak-update $\theta^{-}$
 
 
-## Bellman Residual (BR) Method
+## Bellman Residual (BR) Method: Non-linear Regression
+I implement two versions of the BR method introduced in @maliar_deep_2021. They differs in their handling of the $\max$ operator inside the Bellman equation. Recall that the expected squared Bellmen equation residual is given by:
+
+$$ \mathbb{E}_{(k,z)}\left[ V(k,z) - \max_{k'} \left\{e(k,k',z) + \beta \mathbb{E}_{z'} \left[ V(k',z') \right] \right\} \right]^2 $$
+
+One way to solve for the inner $\max_{k'}$ is through direct optimization (maximization). This is implemented in the next section via an Actor-Critic algorithm.
+
+Another way suggested by @maliar_deep_2021 to is to enforce either the first order condition or the envelop condition. 
+
+### Optimality Constraint #1: First Order Condition (FOC)
+The first order condition w.r.t. the policy $k'$ is
+$$
+\frac{\partial e(k,k',z)}{\partial k'} + \beta \mathbb{E}_{z'}\left[ \frac{\partial V(k',z')}{\partial k'} \right] = 0
+$$
+
+Empirically, the FOC residual is
+$$
+f^{\text{FOC}}_{i,\ell} \equiv \frac{\partial e(k_i,k'_i,z_i)}{\partial k'} + \beta \cdot \frac{\partial V(k'_i,z'_{i,\ell})}{\partial k'}, \quad \ell=1,2
+$$
+and I construct the loss using the AiO estimator.
+
+**FOC Residual: AiO Cross-Product**
+using main v.s. forked simulated shock $\{z_{i,\ell}\}_{\ell=1,2}$: 
+
+$$
+\mathcal{L}_{\text{FOC}} \equiv \frac{1}{|\mathcal{B}|}\sum_{i\in \mathcal{B}} \left( f^{\text{FOC}}_{i,1} \times f^{\text{FOC}}_{i,2} \right).
+$$
+
+### Optimality Constraint #2: Envelop Condition
+Another optimality constraint is the envelop condition (w.r.t to current capital). Note that the envelop condition does not contain expectation w.r.t. next period shocks, so that we can directly take the square:
+$$
+\mathcal{L}_{\text{Env}} \equiv \frac{1}{|\mathcal{B}|}\sum_{i\in \mathcal{B}} \left[ \frac{\partial e(k_i,k'_i,z_i)}{\partial k} - \frac{\partial V(k_i,z_i)}{\partial k} \right]^2
+$$
+The policy $k'$ is optimal (i.e., maximize the Bellman equation RHS) only if $\mathcal{L}_{\text{FOC}}=0$ and/or $\mathcal{L}_{\text{Env}}=0$. Thus, we can remove the $\max$ operator inside the Bellman residual.
+
+### Bellman Residual and Loss
+Empirically, the loss function combines both the Bellman residual and one of the optimality condition. Define the in-sample residual as 
+$$
+f_{i,\ell} = V(k_i,z_i;\theta)-e(k_i,k'_i,z)-\beta V(k'_i,z'_{i,\ell}), \quad \ell=1,2
+$$
+
+The Bellman residual loss is constructed using the AiO estimator:
+
+**Bellman Residual: AiO Estimator**
+$$
+\mathcal{L}_{\text{BR}} = \frac{1}{|\mathcal{B}|}\sum_{i\in \mathcal{B}} \left( f_{i,1} \times f_{i,2} \right)
+$$
+
+
+Finally, the algorithm train the neural networks to update $\theta$ that minimizes the combined loss over batch $\mathcal{B}$:
+$$
+\min_{\theta} \mathcal{L}_{\text{BR-Reg}} = \mathcal{L}_{\text{BR}} + w_1 \mathcal{L}_{\text{FOC}} + w_2\mathcal{L}_{\text{Env}}
+$$
+where $w_1$ and $w_2$ are exogenous relative weights (hyperparameters) to be tuned. One caveat from @maliar_deep_2021 is that the BR loss is measured in levels while the FOC and Envelop condition is measured as slope, so that $w$ need to be chosen carefully for rescaling.
+
+An important insight is that this is essentially a **non-linear regression** problem where we fit function approximators (Neural Networks) to satisfy a set of non-linear constraints. Because neural networks are highly non-linear. There is no matrix algebra formula to jump directly to the optimal paramaters $\theta$. We must use Stochastic Gradient Descent (SGD) to incrementally slide down the error surface over iterations.
+
+**Algorithm**
+
+1. Load flattened batch $\mathcal{B}$ consisting of $(k, z, z'_1, z'_2)$
+2. Run policy net to compute $k' = \Gamma_{\text{policy}}(k, z; \theta)$
+3. Run value net to compute $V'_\ell \equiv V(k',z'_\ell) = \Gamma_{\text{value}} ( k' ,z'_\ell)$
+4. Compute Bellman residual $\mathcal{L}_{\text{BR}}$
+5. Compute $\mathcal{L}_{\text{FOC}}$ and $\mathcal{L}_{\text{Env}}$ using closed-form FOC and Envelop condition formulas
+6. Fit the combined loss $\mathcal{L}_{\text{BR-Reg}}$ with exogenous weight $w_1, w_2$ on training batch $\mathcal{B}$
+7. Update $\theta$, load a new batch, and repeat
+
+
+## Bellman Residual (BR) Method: Actor-Critic
 
 The BR method uses actor-critic training to satisfy the Bellman equation.
 
@@ -743,7 +845,22 @@ where actions come from the target policy $k' = \Gamma_{\text{policy}}(k, z; \th
 
 The target is detached from the gradient (treated as a constant label).
 
-**Critic Loss**
+**Critic Loss Option #1: MSE**
+$$\mathcal{L}^{\text{BR}}_{\text{critic}} = \frac{1}{|\mathcal{B}|} \sum_{i \in \mathcal{B}} (V_i - y_{i,1})^2$$
+
+The MSE loss is biased as discussed earlier:
+$$\mathcal{L}^{\text{BR}}_{\text{critic}} \to \mathbb{E}(V - y)^2 = \underbrace{ \mathbb{E}_{(k,z)}\left[V-\mathbb{E}_{\epsilon}y\right]^2}_{\text{True Objective } \mathcal{L^*}}
++\underbrace{\text{Var}[y]}_{\text{Bias}}$$
+
+Crucially, what really matters it the unbiasedness of gradient:
+$$
+∇_θ \mathcal{L}^{\text{BR}}_{\text{critic}}​ = ∇_θ​\mathbb{E}(V−\mathbb{E}_\epsilon y​)^2+∇_θ \text{Var}[y]​=∇_θ \mathcal{L^*} + 0
+$$
+where because we use target network for $y$, its gradient is zero ($\theta$ is frozen) so that the MSE gradient in actor-critic is *unbiased*.
+
+**Critic Loss Option #2: AiO**
+
+For benchmarking, I also construct the AiO estimator as below, but the MSE is preferred because AiO is unstable when it often oscillates around zero.
 $$\mathcal{L}^{\text{BR}}_{\text{critic}} = \frac{1}{|\mathcal{B}|} \sum_{i \in \mathcal{B}} (V_i - y_{i,1})(V_i - y_{i,2})$$
 
 where $V_i = \Gamma_{\text{value}}(k_i, z_i; \theta_{\text{value}})$.
@@ -892,22 +1009,18 @@ Several model components involve discontinuous indicator functions that have zer
 2. **External financing cost**: $\mathbf{1}\{e < 0\}$ triggers for negative cash flow
 3. **Default indicator**: $\mathbf{1}\{\widetilde{V} < 0\}$ triggers when continuation value is negative
 
-### Sigmoid Smoothing with Annealing
+### Sigmoid Smoothing
+In practice, I implement the following soft gate for discontinuities in the basic and risky debt model.
 
-Replace hard indicators with temperature-controlled sigmoids that:
-
-- Provide gradient signal during early training (high temperature)
-- Converge to true indicators as temperature decreases
-
-**Adjustment Cost Gate**
+**Adjustment Cost Gate (Deterministic Sigmoid)**
 $$\sigma\left(\frac{|I/k| - \epsilon}{\tau}\right) \to \mathbf{1}\{|I/k| > \epsilon\} \quad \text{as } \tau \to 0$$
 
 Normalizing by $k$ prevents saturation for large investments.
 
-**External Financing Gate**
+**External Financing Gate (Deterministic Sigmoid)**
 $$\sigma\left(-\frac{e/k + \epsilon}{\tau}\right) \to \mathbf{1}\{e/k < -\epsilon\} \quad \text{as } \tau \to 0$$
 
-**Default Gate (Gumbel-Sigmoid)**
+**Default Gate (Gumbel-Sigmoid With Random Noise)**
 
 The default boundary requires exploration of both solvent and default regions. A deterministic sigmoid risks getting stuck (e.g., learning "never default"). The Gumbel-Sigmoid adds stochastic exploration:
 
@@ -927,6 +1040,66 @@ $$N_{\text{decay}} = \frac{\log(\tau_{\min}) - \log(\tau_0)}{\log(d)}$$
 
 A stabilization buffer (default: 25%) allows fine-tuning at low temperature:
 $$N_{\text{anneal}} = \lceil N_{\text{decay}} \cdot (1 + \text{buffer}) \rceil$$
+
+## Handling Non-Smoothness: Fischer-Burmeister vs. Smooth Gates
+
+Neural network solutions of dynamic programming problems face two distinct sources of non-differentiability, each requiring a different tool.
+
+### Two Problems, Two Tools
+
+**Problem A: Inequality constraints on actions.** When the Bellman equation includes occasionally binding constraints (e.g., borrowing limit $c \leq w$, non-negativity $k' \geq 0$), the optimality conditions take the Kuhn-Tucker complementarity form:
+$$A \geq 0, \quad H \geq 0, \quad AH = 0$$
+where $A$ is the constraint slack and $H$ the associated multiplier. This is equivalent to $\min(A, H) = 0$, which has a kink at $A = H$. @maliar_deep_2021 proposes using **Fischer-Burmeister (FB) function** to replace this with a smooth equality:
+$$\text{FB}(a, h) = a + h - \sqrt{a^2 + h^2} = 0$$
+
+FB is needed if and only if (i) occasionally binding inequality constraints exist, **and** (ii) the solution method explicitly writes the KT conditions into the loss (e.g., Euler residual or BR-FOC methods). If there are no inequality constraints, the Euler/FOC is a standard smooth equality and FB is irrelevant. If constraints exist but are handled by architecture (bounded network outputs) or direct optimization (actor-critic), the KT conditions never appear and FB is again unnecessary.
+
+**Problem B: Indicator functions in the reward or value.** The reward may contain discontinuous jumps — fixed adjustment cost $\phi_1 k \cdot \mathbf{1}\{I \neq 0\}$, external financing cost $\eta(e) \cdot \mathbf{1}\{e < 0\}$, or limited liability $\max\{0, \widetilde{V}\} = \widetilde{V} \cdot \mathbf{1}\{\widetilde{V} > 0\}$. These indicators have zero gradient almost everywhere, blocking the learning signal for the policy network. I implement **Sigmoid smoothing with temperature annealing** that replaces each indicator with a differentiable gate that converges to the hard indicator as $\tau \to 0$:
+$$\sigma\!\left(\frac{|I/k| - \epsilon}{\tau}\right) \;\to\; \mathbf{1}\{|I/k| > \epsilon\} \quad \text{as } \tau \to 0$$
+
+These two problems are independent: FB addresses the kink in optimality conditions (Problem A); smooth gates address the discontinuity in rewards (Problem B). Neither tool solves the other's problem.
+
+
+### Why FB Cannot Handle Reward Discontinuities
+
+FB operates on KT complementarity conditions — it smooths the relationship between constraint slack and multiplier. It does not touch the reward function. To see why this matters, consider the actor gradient in our basic model. The cash flow is:
+$$e(k,k',z) = \pi(k,z) - \phi_0 \frac{I^2}{2k} - \phi_1 k \cdot \mathbf{1}\{I \neq 0\} - I$$
+
+The actor gradient passes through $\partial e / \partial k'$:
+$$\frac{\partial e}{\partial k'} = -\phi_0 \frac{I}{k} - 1 - \phi_1 k \cdot \underbrace{\frac{\partial}{\partial k'}\mathbf{1}\{I \neq 0\}}_{= 0 \text{ (a.e.)}}$$
+
+The fixed cost $\phi_1 k$ is invisible to the gradient. The optimizer behaves as if $\phi_1 = 0$ during backpropagation. This is a reward-level discontinuity (Problem B), and FB — which operates on optimality conditions (Problem A) — cannot fix it.
+
+One might consider applying FB to the $\max\{0, \widetilde{V}\}$ limited liability operator by rewriting it as a complementarity. But even then, FB has undefined gradients at the exact boundary $\widetilde{V} = 0$:
+$$\frac{\partial\,\text{FB}}{\partial \lambda_0}\bigg|_{\lambda_0 = \lambda_1 = 0} = 1 - \frac{0}{\sqrt{0}} \quad \text{(undefined)}$$
+
+More fundamentally, the limited liability is not a KT complementarity — it is an indicator inside the value function, $\max(0, x) = x \cdot \mathbf{1}\{x > 0\}$, which is exactly Problem B. Smoothing the indicator directly (via Gumbel-Sigmoid) is the correct approach, not converting it to a complementarity.
+
+
+### Why My Implementation Does Not Need FB
+
+In our BR Actor-Critic framework, neither condition for FB is met:
+
+1. **No occasionally binding inequality constraints.** The action bounds ($k' \in [k_{\min}, k_{\max}]$, $b' \in [0, b_{\max}]$) are enforced by sigmoid output activations in the policy network, not by inequality constraints with multipliers. There are no KT conditions to smooth.
+
+2. **Direct optimization, not KT conditions.** The actor maximizes the RHS of the Bellman equation via gradient ascent. The critic fits $V$ to Bellman targets. Neither loss involves complementarity conditions.
+
+Meanwhile, all reward-level discontinuities (Problem B) are handled by smooth gates:
+
+| Non-smoothness | Tool | Mechanism |
+|:---|:---|:---|
+| $\mathbf{1}\{I \neq 0\}$ fixed adjustment cost | Deterministic sigmoid + anneal | Smooth gate on $\|I/k\|$; gradient reflects $\phi_1$ |
+| $\mathbf{1}\{e < 0\}$ external financing cost | Deterministic sigmoid + anneal | Smooth gate on $e/k$ |
+| $\max\{0, \widetilde{V}\}$ limited liability | Gumbel-Sigmoid + anneal | $V_{\text{eff}} = (1-p)\widetilde{V} \to \max\{0,\widetilde{V}\}$ |
+| $\max(V^0, V^1)$ invest vs. inaction | Sigmoid gate on $\|I/k\|$ | Branch selection implicit in soft gate |
+
+The $\max\{0,\widetilde{V}\}$ case deserves emphasis: the identity $\max(0,x) = x \cdot \mathbf{1}\{x > 0\}$ means that smoothing the indicator automatically smooths the max. The Gumbel-Sigmoid replaces $\mathbf{1}\{\widetilde{V} > 0\}$ with $(1-p)$, so $V_{\text{eff}} = (1-p)\widetilde{V}$ is a fully differentiable replacement for limited liability. No separate treatment of the $\max$ operator is needed.
+
+The default gate additionally uses stochastic noise (Gumbel-Sigmoid rather than deterministic sigmoid) because default is an absorbing state: once $\widetilde{V} < 0$, the firm defaults permanently, and the network receives no gradient from the continuation region. The logistic noise forces exploration of both sides of the default boundary. The other gates do not need noise because inaction and negative cash flow are not absorbing — the firm can freely invest or generate positive cash flow in subsequent periods.
+
+In summary, the actor-critic framework eliminates FB by avoiding KT conditions entirely, and the smooth gates handle all reward-level and value-level discontinuities. This is one practical advantage of the actor-critic approach over the multi-task BR formulation in @maliar_deep_2021, which requires FB, weight tuning, and an auxiliary multiplier network.
+
+
 
 ***
 
@@ -961,20 +1134,27 @@ where:
 - $p_\ell$ is the Gumbel-Sigmoid default probability at shock $z'_\ell$
 - $R(k', z')$ is the recovery value
 
-The MSE pricing loss is defined as
-$$\mathcal{L}_{\text{MSE}}^{\text{price}} = \frac{1}{|\mathcal{B}|} \sum_{i \in \mathcal{B}} \frac{1}{2}(f_{i,1}^2 + f_{i,2}^2)$$
+The pricing loss is computed using either the AiO estimator:
+$$\mathcal{L}^{\text{price}}_{\text{AiO}} = \frac{1}{|\mathcal{B}|} \sum_{i \in \mathcal{B}} (f_{i,1} \times f_{i,2})$$
 
-
+I also construct the MSE estimator as fallback:
+$$\mathcal{L}^{\text{price}}_{\text{MSE}} = \frac{1}{|\mathcal{B}|} \sum_{i \in \mathcal{B}} \left( f_{i,1} \right)^2$$
 
 ### Critic Update
+Recall the continuous value network is $$\widetilde{V}(k,b,z;\theta) = \Gamma_{\text{value}}(k, b, z; \theta_{\text{value}})$$
 
 The critic target incorporates limited liability via the smooth effective value:
-$$V_{\text{eff}} = (1 - p) \cdot \widetilde{V}$$
+$$V^{\text{eff}}(\theta) = (1 - p) \cdot \widetilde{V}(\theta) $$
 
 where $p$ is the default probability. As $\tau \to 0$, this converges to $\max\{0, \widetilde{V}\}$.
 
 **Bellman Target**
-$$y_\ell = e(\cdot) - \eta(e) + \beta \cdot V_{\text{eff}}(\Gamma_{\text{value}}(k', b', z'_\ell; \theta^{-}_{\text{value}}))$$
+$$y_\ell = e(\cdot) - \eta(e) + \beta \cdot V^{\text{eff}}(\theta_{\text{value}}^-)$$
+where the RHS use slowly updating target parameters $\theta^-$.
+
+**BR loss: MSE**
+$$\mathcal{L}^{\text{BR}} = \frac{1}{|\mathcal{B}|} \sum_{i \in \mathcal{B}} \left(\widetilde{V}(\theta)- y_{i,1} \right)^2$$
+where $y_{i,1}$ is a fixed label (constant) and $\widetilde{V}(\theta)$ uses current value network $\theta$ to update.
 
 **Combined Critic Loss**
 $$\mathcal{L}_{\text{critic}} = \omega_1 \mathcal{L}^{\text{BR}} + \mathcal{L}^{\text{price}}$$
@@ -984,7 +1164,7 @@ where $\omega_1$ is exogenous weight to balance the two loss components (tuned t
 ### Actor Update
 
 The actor maximizes expected continuation value:
-$$\mathcal{L}^{\text{BR}}_{\text{actor}} = -\frac{1}{|\mathcal{B}|} \sum_{i \in \mathcal{B}} \left[ e(\cdot) - \eta(e) + \beta \cdot V_{\text{eff}}(\Gamma_{\text{value}}(k'_i, b'_i, z'_{i,1}; \theta_{\text{value}})) \right]$$
+$$\mathcal{L}^{\text{BR}}_{\text{actor}} = -\frac{1}{|\mathcal{B}|} \sum_{i \in \mathcal{B}} \left[ e(\cdot) - \eta(e) + \beta \cdot V^{\text{eff}}(k'_i, b'_i, z'_{i,1}; \theta_{\text{value}}) \right]$$
 
 The smooth $V_{\text{eff}}$ (rather than hard $\max$) is essential here. A hard max has zero gradient in the default region, providing no signal for the actor to adjust $(k', b')$ to exit default.
 

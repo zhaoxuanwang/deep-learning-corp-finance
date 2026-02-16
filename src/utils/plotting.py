@@ -8,6 +8,7 @@ Provides loss curves, policy slices, and scenario comparisons.
 import numpy as np
 import matplotlib.pyplot as plt
 from typing import Dict, List, Optional, Tuple, Union
+import warnings
 
 
 
@@ -204,11 +205,72 @@ def plot_2d_policy_slice(
     return ax
 
 
-def plot_policy_panels(
+def _resolve_frictionless_benchmark(
+    frictionless_benchmark: Optional[Dict]
+) -> Optional[Tuple[object, object]]:
+    """
+    Validate frictionless benchmark payload and return (params, shock_params).
+    """
+    if frictionless_benchmark is None:
+        return None
+    if not isinstance(frictionless_benchmark, dict):
+        raise ValueError(
+            "frictionless_benchmark must be a dict with keys 'params' and 'shock_params'."
+        )
+    if "params" not in frictionless_benchmark or "shock_params" not in frictionless_benchmark:
+        raise ValueError(
+            "frictionless_benchmark must include both 'params' and 'shock_params'."
+        )
+    return frictionless_benchmark["params"], frictionless_benchmark["shock_params"]
+
+
+def _add_frictionless_overlay_basic(
+    ax_k: plt.Axes,
+    ax_logz: plt.Axes,
+    eval_data: Dict,
+    params,
+    shock_params,
+    label: str = "Frictionless",
+) -> None:
+    """
+    Overlay analytical frictionless benchmark on basic-model policy panels.
+    """
+    from src.utils.analysis import compute_frictionless_policy
+
+    # Panel k' vs k at fixed z: analytical policy is a horizontal line.
+    fixed_z = float(eval_data["fixed_z_val"])
+    k_star_frictionless = compute_frictionless_policy(fixed_z, params, shock_params)
+    ax_k.axhline(
+        y=k_star_frictionless,
+        color="black",
+        linestyle="--",
+        linewidth=2.0,
+        alpha=1.0,
+        label=label,
+        zorder=10,
+    )
+
+    # Panel k' vs log(z) at fixed k: analytical policy is a curve in z.
+    z_vals = eval_data["z_vals"]
+    logz_vals = eval_data["logz_vals"]
+    k_star_curve = compute_frictionless_policy(z_vals, params, shock_params)
+    ax_logz.plot(
+        logz_vals,
+        k_star_curve,
+        "k--",
+        linewidth=2.0,
+        alpha=1.0,
+        label=label,
+        zorder=10,
+    )
+
+
+def plot_policy_slices_single(
     eval_data: Dict,
     figsize: Optional[Tuple[int, int]] = None,
     suptitle: Optional[str] = None,
-    show_45_line: bool = True
+    show_45_line: bool = True,
+    frictionless_benchmark: Optional[Dict] = None,
 ) -> plt.Figure:
     """
     Create multi-panel plot of policy functions from evaluate_policy() output.
@@ -222,6 +284,8 @@ def plot_policy_panels(
         figsize: Figure size. If None, auto-determined based on model type.
         suptitle: Super title for entire figure.
         show_45_line: If True, add 45-degree steady-state lines where applicable.
+        frictionless_benchmark: Optional dict with 'params' and 'shock_params'.
+            If provided, overlays analytical frictionless benchmark on basic-model panels.
 
     Returns:
         plt.Figure: Multi-panel figure.
@@ -238,15 +302,22 @@ def plot_policy_panels(
         >>> # Basic model
         >>> result = train_basic_br(dataset, ...)
         >>> grid = evaluate_policy(result, k_bounds=(0.5, 3), logz_bounds=(-0.3, 0.3))
-        >>> fig = plot_policy_panels(grid, suptitle="Basic Model Policy")
+        >>> fig = plot_policy_slices_single(grid, suptitle="Basic Model Policy")
         >>>
         >>> # Risky model
         >>> result = train_risky_br(dataset, ...)
         >>> grid = evaluate_policy(result, k_bounds=(0.5, 3), logz_bounds=(-0.3, 0.3),
         ...                        b_bounds=(0, 2))
-        >>> fig = plot_policy_panels(grid, suptitle="Risky Debt Model Policy")
+        >>> fig = plot_policy_slices_single(grid, suptitle="Risky Debt Model Policy")
     """
     model_type = eval_data.get('model_type', 'basic')
+    benchmark_payload = _resolve_frictionless_benchmark(frictionless_benchmark)
+    if model_type != "basic" and benchmark_payload is not None:
+        warnings.warn(
+            "frictionless_benchmark is ignored for risky model policy panels.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
 
     if model_type == 'basic':
         # 1x2 layout: k' vs k, k' vs z
@@ -266,6 +337,18 @@ def plot_policy_panels(
             eval_data, x_var='logz', y_var='k_next',
             ax=axes[1], show_45_line=show_45_line
         )
+
+        if benchmark_payload is not None:
+            params, shock_params = benchmark_payload
+            _add_frictionless_overlay_basic(
+                axes[0],
+                axes[1],
+                eval_data=eval_data,
+                params=params,
+                shock_params=shock_params,
+            )
+            axes[0].legend(loc='best', fontsize=9)
+            axes[1].legend(loc='best', fontsize=9)
 
     else:  # risky model
         # 2x3 layout
@@ -297,19 +380,21 @@ def plot_policy_panels(
     return fig
 
 
-def plot_policy_comparison_panels(
+def plot_policy_slices_compare(
     eval_datas: List[Dict],
     labels: List[str],
     figsize: Optional[Tuple[int, int]] = None,
     suptitle: Optional[str] = None,
     show_45_line: bool = True,
-    frictionless_benchmark: Optional[Dict] = None
+    frictionless_benchmark: Optional[Dict] = None,
+    layout: str = "overlay",
 ) -> plt.Figure:
     """
-    Create multi-panel comparison plot overlaying multiple policies.
+    Create multi-panel comparison plot for multiple evaluated policies.
 
-    Similar to plot_policy_panels() but overlays multiple policies on each panel
-    for comparison across different training runs or parameter settings.
+    Supports two layouts:
+    - overlay: all policies overlaid on shared panels (existing behavior)
+    - rows: one row per policy, each row has [k' vs k, k' vs log(z)] for basic model
 
     Args:
         eval_datas: List of outputs from evaluate_policy().
@@ -320,19 +405,21 @@ def plot_policy_comparison_panels(
         frictionless_benchmark: Optional dict with 'params' and 'shock_params'.
             If provided, overlays the analytical frictionless solution as a
             dashed black line. Only applies to basic model.
+        layout: Either 'overlay' or 'rows'. 'rows' is currently supported for
+            basic model only.
 
     Returns:
         plt.Figure: Multi-panel comparison figure.
 
     Example:
         >>> # Compare LR vs ER vs BR methods
-        >>> fig = plot_policy_comparison_panels(
+        >>> fig = plot_policy_slices_compare(
         ...     [grid_lr, grid_er, grid_br],
         ...     labels=['LR', 'ER', 'BR'],
         ...     suptitle="Method Comparison"
         ... )
         >>> # With frictionless benchmark (for baseline scenario)
-        >>> fig = plot_policy_comparison_panels(
+        >>> fig = plot_policy_slices_compare(
         ...     [grid_lr, grid_er, grid_br],
         ...     labels=['LR', 'ER', 'BR'],
         ...     frictionless_benchmark={'params': params, 'shock_params': shock_params}
@@ -340,6 +427,12 @@ def plot_policy_comparison_panels(
     """
     if len(eval_datas) == 0:
         raise ValueError("eval_datas must not be empty")
+    if len(labels) != len(eval_datas):
+        raise ValueError(
+            f"labels length ({len(labels)}) must match eval_datas length ({len(eval_datas)})."
+        )
+    if layout not in {"overlay", "rows"}:
+        raise ValueError(f"layout must be one of {{'overlay', 'rows'}}, got '{layout}'.")
 
     # Use first dataset to determine model type
     model_type = eval_datas[0].get('model_type', 'basic')
@@ -351,8 +444,52 @@ def plot_policy_comparison_panels(
                            f"Index 0 is '{model_type}', index {i} is '{d.get('model_type')}'")
 
     colors = plt.cm.tab10(np.linspace(0, 1, len(eval_datas)))
+    benchmark_payload = _resolve_frictionless_benchmark(frictionless_benchmark)
 
-    if model_type == 'basic':
+    if layout == "rows":
+        if model_type != "basic":
+            raise ValueError("layout='rows' is currently supported for basic model only.")
+        if figsize is None:
+            figsize = (12, 4 * len(eval_datas))
+
+        fig, axes = plt.subplots(len(eval_datas), 2, figsize=figsize, squeeze=False)
+
+        for row, (data, lbl, color) in enumerate(zip(eval_datas, labels, colors)):
+            plot_2d_policy_slice(
+                data,
+                x_var='k',
+                y_var='k_next',
+                ax=axes[row, 0],
+                show_45_line=show_45_line,
+                line_color=color,
+                label=lbl,
+            )
+            plot_2d_policy_slice(
+                data,
+                x_var='logz',
+                y_var='k_next',
+                ax=axes[row, 1],
+                show_45_line=False,
+                line_color=color,
+                label=lbl,
+            )
+
+            if benchmark_payload is not None:
+                params, shock_params = benchmark_payload
+                _add_frictionless_overlay_basic(
+                    axes[row, 0],
+                    axes[row, 1],
+                    eval_data=data,
+                    params=params,
+                    shock_params=shock_params,
+                )
+
+            axes[row, 0].set_title(f"{lbl}: k' vs k", fontsize=11, fontweight='bold')
+            axes[row, 1].set_title(f"{lbl}: k' vs log(z)", fontsize=11, fontweight='bold')
+            axes[row, 0].legend(loc='best', fontsize=9)
+            axes[row, 1].legend(loc='best', fontsize=9)
+
+    elif model_type == 'basic':
         if figsize is None:
             figsize = (12, 5)
 
@@ -369,17 +506,6 @@ def plot_policy_comparison_panels(
             k_vals = eval_datas[0]['k_vals']
             axes[0].plot(k_vals, k_vals, 'k--', linewidth=1.0, alpha=0.7, label='45°')
 
-        # Add frictionless benchmark (horizontal line at fixed z) - drawn on top
-        if frictionless_benchmark is not None:
-            from src.utils.analysis import compute_frictionless_policy
-            params = frictionless_benchmark['params']
-            shock_params = frictionless_benchmark['shock_params']
-            fixed_z = eval_datas[0]['fixed_z_val']
-            k_star_frictionless = compute_frictionless_policy(fixed_z, params, shock_params)
-            axes[0].axhline(y=k_star_frictionless, color='black', linestyle='--',
-                           linewidth=2.0, alpha=1.0, label='Frictionless', zorder=10)
-        axes[0].legend(loc='best', fontsize=9)
-
         # Panel 2: k' vs log(z)
         for data, lbl, color in zip(eval_datas, labels, colors):
             plot_2d_policy_slice(
@@ -387,20 +513,25 @@ def plot_policy_comparison_panels(
                 ax=axes[1], show_45_line=False,
                 line_color=color, label=lbl
             )
-
-        # Add frictionless benchmark curve - drawn on top
-        if frictionless_benchmark is not None:
-            from src.utils.analysis import compute_frictionless_policy
-            params = frictionless_benchmark['params']
-            shock_params = frictionless_benchmark['shock_params']
-            z_vals = eval_datas[0]['z_vals']
-            logz_vals = eval_datas[0]['logz_vals']
-            k_star_curve = compute_frictionless_policy(z_vals, params, shock_params)
-            axes[1].plot(logz_vals, k_star_curve, 'k--', linewidth=2.0,
-                        alpha=1.0, label='Frictionless', zorder=10)
+        if benchmark_payload is not None:
+            params, shock_params = benchmark_payload
+            _add_frictionless_overlay_basic(
+                axes[0],
+                axes[1],
+                eval_data=eval_datas[0],
+                params=params,
+                shock_params=shock_params,
+            )
+        axes[0].legend(loc='best', fontsize=9)
         axes[1].legend(loc='best', fontsize=9)
 
     else:  # risky model
+        if benchmark_payload is not None:
+            warnings.warn(
+                "frictionless_benchmark is ignored for risky model plots.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
         if figsize is None:
             figsize = (15, 10)
 
@@ -439,6 +570,103 @@ def plot_policy_comparison_panels(
 
     plt.tight_layout()
     return fig
+
+
+def plot_policy_slices_compare_overlay(
+    eval_datas: List[Dict],
+    labels: List[str],
+    figsize: Optional[Tuple[int, int]] = None,
+    suptitle: Optional[str] = None,
+    show_45_line: bool = True,
+    frictionless_benchmark: Optional[Dict] = None,
+) -> plt.Figure:
+    """
+    Compare multiple policy slices using an overlay layout on shared panels.
+    """
+    return plot_policy_slices_compare(
+        eval_datas=eval_datas,
+        labels=labels,
+        figsize=figsize,
+        suptitle=suptitle,
+        show_45_line=show_45_line,
+        frictionless_benchmark=frictionless_benchmark,
+        layout="overlay",
+    )
+
+
+def plot_policy_slices_compare_rows(
+    eval_datas: List[Dict],
+    labels: List[str],
+    figsize: Optional[Tuple[int, int]] = None,
+    suptitle: Optional[str] = None,
+    show_45_line: bool = True,
+    frictionless_benchmark: Optional[Dict] = None,
+) -> plt.Figure:
+    """
+    Compare multiple policy slices with one row per run (basic model only).
+    """
+    return plot_policy_slices_compare(
+        eval_datas=eval_datas,
+        labels=labels,
+        figsize=figsize,
+        suptitle=suptitle,
+        show_45_line=show_45_line,
+        frictionless_benchmark=frictionless_benchmark,
+        layout="rows",
+    )
+
+
+def plot_policy_panels(
+    eval_data: Dict,
+    figsize: Optional[Tuple[int, int]] = None,
+    suptitle: Optional[str] = None,
+    show_45_line: bool = True,
+    frictionless_benchmark: Optional[Dict] = None,
+) -> plt.Figure:
+    """
+    Deprecated alias for plot_policy_slices_single().
+    """
+    warnings.warn(
+        "plot_policy_panels is deprecated; use plot_policy_slices_single.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    return plot_policy_slices_single(
+        eval_data=eval_data,
+        figsize=figsize,
+        suptitle=suptitle,
+        show_45_line=show_45_line,
+        frictionless_benchmark=frictionless_benchmark,
+    )
+
+
+def plot_policy_comparison_panels(
+    eval_datas: List[Dict],
+    labels: List[str],
+    figsize: Optional[Tuple[int, int]] = None,
+    suptitle: Optional[str] = None,
+    show_45_line: bool = True,
+    frictionless_benchmark: Optional[Dict] = None,
+    layout: str = "overlay",
+) -> plt.Figure:
+    """
+    Deprecated alias for plot_policy_slices_compare().
+    """
+    warnings.warn(
+        "plot_policy_comparison_panels is deprecated; use plot_policy_slices_compare, "
+        "plot_policy_slices_compare_overlay, or plot_policy_slices_compare_rows.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    return plot_policy_slices_compare(
+        eval_datas=eval_datas,
+        labels=labels,
+        figsize=figsize,
+        suptitle=suptitle,
+        show_45_line=show_45_line,
+        frictionless_benchmark=frictionless_benchmark,
+        layout=layout,
+    )
 
 
 # =============================================================================
@@ -1041,7 +1269,7 @@ def plot_basic_loss_curves(
 
     Creates a 2x3 panel figure:
         Row 1: LR loss, ER loss, BR Actor loss
-        Row 2: LR (log scale), ER (log scale), BR Critic (rel_mse)
+        Row 2: LR (log scale), ER (log scale), BR Critic (actual loss_critic)
 
     Args:
         result_lr: Training result dict from LR method with 'history' key
@@ -1114,17 +1342,11 @@ def plot_basic_loss_curves(
     axes[1, 1].grid(True, alpha=0.3)
     axes[1, 1].legend()
 
-    # BR Critic: Relative MSE (should decrease)
-    if 'rel_mse' in result_br['history']:
-        axes[1, 2].plot(iter_br, result_br['history']['rel_mse'],
-                        color='red', linewidth=2, label='Relative MSE')
-        axes[1, 2].set_title('BR: Critic Rel MSE (should ↓)', fontsize=11, fontweight='bold')
-        axes[1, 2].set_ylabel('Relative MSE')
-    else:
-        axes[1, 2].plot(iter_br, result_br['history']['loss_critic'],
-                        color='red', linewidth=2, label='Critic Loss')
-        axes[1, 2].set_title('BR: Critic Loss', fontsize=11, fontweight='bold')
-        axes[1, 2].set_ylabel('Loss')
+    # BR Critic: always plot actual optimization loss
+    axes[1, 2].plot(iter_br, result_br['history']['loss_critic'],
+                    color='red', linewidth=2, label='Critic Loss')
+    axes[1, 2].set_title('BR: Critic Loss (actual)', fontsize=11, fontweight='bold')
+    axes[1, 2].set_ylabel('Loss')
     axes[1, 2].set_xlabel('Iteration')
     axes[1, 2].grid(True, alpha=0.3)
     axes[1, 2].legend()
@@ -1149,7 +1371,7 @@ def plot_risky_loss_curves(
     Plot loss curves for risky debt BR training.
 
     Creates a 2x2 panel figure:
-        (0,0): Critic Relative MSE (should decrease)
+        (0,0): Critic Loss (actual training objective)
         (0,1): Actor Loss (more negative = better)
         (1,0): Price Loss (should decrease)
         (1,1): Value Scale Growth (context)
@@ -1168,17 +1390,11 @@ def plot_risky_loss_curves(
     history = result_risky['history']
     iter_risky = history.get('iteration', list(range(len(history['loss_actor']))))
 
-    # 1.1 Critic Loss - Relative MSE (should decrease)
-    if 'rel_mse' in history:
-        axes[0, 0].plot(iter_risky, history['rel_mse'],
-                        color='red', linewidth=2, label='Relative MSE')
-        axes[0, 0].set_title('Critic: Relative MSE (should ↓)', fontsize=11, fontweight='bold')
-        axes[0, 0].set_ylabel('Relative MSE')
-    else:
-        axes[0, 0].plot(iter_risky, history['loss_critic'],
-                        color='red', linewidth=2, label='Critic Loss')
-        axes[0, 0].set_title('Critic Loss', fontsize=11, fontweight='bold')
-        axes[0, 0].set_ylabel('Loss')
+    # 1.1 Critic Loss - actual objective used in training
+    axes[0, 0].plot(iter_risky, history['loss_critic'],
+                    color='red', linewidth=2, label='Critic Loss')
+    axes[0, 0].set_title('Critic Loss (actual)', fontsize=11, fontweight='bold')
+    axes[0, 0].set_ylabel('Loss')
     axes[0, 0].set_xlabel('Iteration')
     axes[0, 0].grid(True, alpha=0.3)
     axes[0, 0].legend()
@@ -1225,7 +1441,7 @@ def plot_risky_loss_curves(
 
     # Compute summary metrics
     summary = {
-        'rel_mse': history.get('rel_mse', [0])[-1],
+        'loss_critic': history['loss_critic'][-1],
         'loss_actor': history['loss_actor'][-1],
         'loss_price': history['loss_price'][-1],
         'mean_value_scale': history.get('mean_value_scale', [0])[-1],
@@ -1306,3 +1522,234 @@ def plot_baseline_validation(
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
 
     return fig
+
+
+def plot_baseline_policy_validation(
+    results_baseline: Dict,
+    baseline_params,
+    shock_params,
+    k_bounds: Tuple[float, float],
+    logz_bounds: Tuple[float, float],
+    save_path: Optional[str] = None,
+    methods: Optional[List[str]] = None,
+    ref_method: Optional[str] = None,
+    ncols: Optional[int] = None,
+    show_missing: bool = True,
+    figsize: Optional[Tuple[int, int]] = None,
+) -> Tuple[plt.Figure, Dict[str, Union[str, float, List[str]]]]:
+    """
+    Baseline frictionless validation plot with one row per requested method.
+
+    Args:
+        results_baseline: Dict mapping method name to legacy training result dict.
+        baseline_params: EconomicParams for the baseline scenario.
+        shock_params: ShockParams used in data/training.
+        k_bounds: Capital bounds (min, max).
+        logz_bounds: log(z) bounds (min, max).
+        save_path: Optional output path.
+        methods: Ordered list of methods to plot. Accepts canonical ids and aliases.
+            Default: ['lr', 'er', 'br_reg', 'br'].
+        ref_method: Optional method used to compute reference k*. If None, inferred.
+        ncols: Deprecated. Ignored.
+        show_missing: Deprecated placeholder behavior. Missing methods are skipped.
+        figsize: Figure size. If None, chosen from grid shape.
+
+    Returns:
+        Tuple of (figure, metadata).
+        metadata contains:
+        - methods_plotted
+        - ref_method
+        - ref_key
+        - methods_requested
+        - k_star
+    """
+    from src.utils.analysis import evaluate_policy, get_steady_state_policy
+
+    def _normalize_method_name(name: str) -> str:
+        return name.strip().lower().replace("-", "_")
+
+    method_layout = ["lr", "er", "br_reg", "br"]
+    method_aliases = {
+        "lr": ("lr", "basic_lr"),
+        "er": ("er", "basic_er"),
+        "br_reg": ("br_reg", "br_multitask", "basic_br_reg", "basic_br_multitask"),
+        "br": ("br", "br_actor_critic", "basic_br", "basic_br_actor_critic"),
+    }
+    method_labels = {
+        "lr": "LR",
+        "er": "ER",
+        "br_reg": "BR-reg",
+        "br": "BR Actor-Critic",
+    }
+
+    requested_methods = methods or method_layout
+    if len(requested_methods) == 0:
+        raise ValueError("methods must not be empty.")
+
+    alias_to_slot = {}
+    for slot, aliases in method_aliases.items():
+        for alias in aliases:
+            alias_to_slot[_normalize_method_name(alias)] = slot
+
+    normalized_results = {
+        _normalize_method_name(method_name): method_name
+        for method_name in results_baseline.keys()
+    }
+
+    def _resolve_method(requested_method: str) -> Tuple[str, Optional[str]]:
+        requested_norm = _normalize_method_name(requested_method)
+        slot = alias_to_slot.get(requested_norm, requested_norm)
+        candidates = list(method_aliases.get(slot, (requested_norm,)))
+        if requested_norm not in [_normalize_method_name(c) for c in candidates]:
+            candidates.append(requested_norm)
+
+        for candidate in candidates:
+            candidate_norm = _normalize_method_name(candidate)
+            if candidate_norm in normalized_results:
+                return slot, normalized_results[candidate_norm]
+
+        return slot, None
+
+    panel_specs = []
+    for requested in requested_methods:
+        slot, resolved_key = _resolve_method(requested)
+        panel_specs.append(
+            {
+                "requested": _normalize_method_name(requested),
+                "slot": slot,
+                "resolved_key": resolved_key,
+            }
+        )
+
+    available_specs = [panel for panel in panel_specs if panel["resolved_key"] is not None]
+    available = [panel["slot"] for panel in available_specs]
+    if not available:
+        raise ValueError("results_baseline is empty. Run one or more baseline training cells first.")
+    if ncols is not None:
+        warnings.warn(
+            "plot_baseline_policy_validation: argument 'ncols' is ignored in the "
+            "new rows layout.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+    if show_missing and len(available_specs) != len(panel_specs):
+        missing = [
+            panel["requested"] for panel in panel_specs if panel["resolved_key"] is None
+        ]
+        warnings.warn(
+            f"plot_baseline_policy_validation: missing methods are skipped in rows "
+            f"layout: {missing}",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+
+    if ref_method is not None:
+        ref_slot, ref_key = _resolve_method(ref_method)
+        if ref_key is None:
+            raise ValueError(
+                f"Requested ref_method='{ref_method}' is not available in results_baseline."
+            )
+    else:
+        ref_priority = ["br", "br_reg", "er", "lr"]
+        ref_slot = None
+        ref_key = None
+        for preferred_slot in ref_priority:
+            matched = next(
+                (panel for panel in available_specs if panel["slot"] == preferred_slot),
+                None,
+            )
+            if matched is not None:
+                ref_slot = matched["slot"]
+                ref_key = matched["resolved_key"]
+                break
+        if ref_slot is None or ref_key is None:
+            ref_slot = available_specs[0]["slot"]
+            ref_key = available_specs[0]["resolved_key"]
+
+    ss_ref = get_steady_state_policy(
+        results_baseline[ref_key],
+        k_bounds=k_bounds,
+        logz_bounds=logz_bounds,
+    )
+    k_star = float(ss_ref["k_star_val"])
+
+    eval_datas: List[Dict] = []
+    labels: List[str] = []
+    resolved_keys: Dict[str, str] = {}
+    for panel in available_specs:
+        method_slot = panel["slot"]
+        resolved_key = panel["resolved_key"]
+        resolved_keys[method_slot] = resolved_key
+        eval_datas.append(
+            evaluate_policy(
+                results_baseline[resolved_key],
+                k_bounds=k_bounds,
+                logz_bounds=logz_bounds,
+                fixed_k_val=k_star,
+                n_z=100,
+            )
+        )
+        labels.append(method_labels.get(method_slot, method_slot))
+
+    if figsize is None:
+        figsize = (12, 4 * len(eval_datas))
+    fig = plot_policy_slices_compare_rows(
+        eval_datas=eval_datas,
+        labels=labels,
+        figsize=figsize,
+        suptitle="Baseline Validation: Network vs Analytical Frictionless Solution",
+        show_45_line=True,
+        frictionless_benchmark={
+            "params": baseline_params,
+            "shock_params": shock_params,
+        },
+    )
+
+    if save_path:
+        fig.savefig(save_path, dpi=150, bbox_inches="tight")
+
+    metadata = {
+        "methods_requested": [_normalize_method_name(method_name) for method_name in requested_methods],
+        "methods_plotted": available,
+        "ref_method": ref_slot,
+        "ref_key": ref_key,
+        "resolved_keys": resolved_keys,
+        "k_star": k_star,
+    }
+    return fig, metadata
+
+
+def plot_quick_baseline_validation(
+    results_baseline: Dict,
+    baseline_params,
+    shock_params,
+    k_bounds: Tuple[float, float],
+    logz_bounds: Tuple[float, float],
+    save_path: Optional[str] = None,
+    methods: Optional[List[str]] = None,
+    ref_method: Optional[str] = None,
+    ncols: Optional[int] = None,
+    show_missing: bool = True,
+    figsize: Optional[Tuple[int, int]] = None,
+) -> Tuple[plt.Figure, Dict[str, Union[str, float, List[str]]]]:
+    """
+    Deprecated alias for plot_baseline_policy_validation().
+    """
+    warnings.warn(
+        "plot_quick_baseline_validation is deprecated; use plot_baseline_policy_validation.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    return plot_baseline_policy_validation(
+        results_baseline=results_baseline,
+        baseline_params=baseline_params,
+        shock_params=shock_params,
+        k_bounds=k_bounds,
+        logz_bounds=logz_bounds,
+        save_path=save_path,
+        methods=methods,
+        ref_method=ref_method,
+        ncols=ncols,
+        show_missing=show_missing,
+        figsize=figsize,
+    )

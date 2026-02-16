@@ -1,23 +1,31 @@
 """
-ddp_debt.py
+Offline risky-model DDP solver.
 
-Implements a dynamic corporate finance model with risky debt and optimal capital investment.
-This solver handles the 'Loop-within-a-Loop' equilibrium:
-1. Inner Loop: Value Function Iteration (Firm optimizes given prices).
-2. Outer Loop: Bond Price Iteration (Lenders price risk given firm behavior).
+Implements a dynamic corporate finance model with risky debt and optimal
+capital investment. The solver uses a loop-within-a-loop equilibrium:
+1. Inner loop: firm optimization for a fixed bond-price schedule.
+2. Outer loop: lender bond-price fixed point from endogenous default risk.
+
+Transition probabilities are estimated from observed (z, z_next_main) pairs
+in the input flat dataset. No internal shock simulation is performed.
 """
 
-from typing import Tuple
+from typing import Any, Callable, Dict, Literal, Optional, Tuple
 
 import tensorflow as tf
 
-from src.economy.parameters import EconomicParams, ShockParams, convert_to_tf
-from src.ddp.ddp_config import DDPGridConfig, initialize_markov_process
+from src.economy.data import DatasetBundle
+from src.economy.parameters import EconomicParams, convert_to_tf
+from src.ddp.ddp_config import (
+    DDPGridConfig,
+    estimate_transition_matrix_from_dataset,
+    extract_bounds_from_metadata,
+    initialize_markov_process,
+)
 from src.economy import logic
-from typing import Optional
 
 
-class DebtModelDDP:
+class RiskyModelDDP:
     """
     Solves a dynamic corporate finance model with risky debt and endogenous
     interest rates using Discrete Dynamic Programming (DDP).
@@ -50,31 +58,61 @@ class DebtModelDDP:
 
     def __init__(
         self, 
-        params: EconomicParams, 
-        shock_params: ShockParams,
-        grid_config: Optional[DDPGridConfig] = None
+        params: EconomicParams,
+        shock_params: Optional[Any] = None,
+        grid_config: Optional[DDPGridConfig] = None,
+        *,
+        dataset: Optional[Dict[str, tf.Tensor]] = None,
+        dataset_metadata: Optional[Dict[str, Any]] = None,
+        delta: Optional[float] = None,
+        reward_matrix_fn: Optional[Callable[..., tf.Tensor]] = None,
     ):
         """
         Initialize the model, grids, and precompute static cash flows.
 
         Args:
-            params (EconomicParams): The economic parameters.
-            shock_params (ShockParams): The shock parameters.
-            grid_config (DDPGridConfig): Grid settings (uses defaults if None).
+            params: Economic parameters.
+            dataset: Flattened dataset with at least {'z', 'z_next_main'}.
+            dataset_metadata: Metadata containing canonical bounds.
+            grid_config: Numerical grid settings.
+            delta: Optional depreciation override for grid construction.
+            reward_matrix_fn: Optional custom reward matrix builder.
         """
         self.params = params
         self.shock_params = shock_params
         self.grid_config = grid_config or DDPGridConfig()
         self.beta = tf.constant(1 / (1 + params.r_rate), dtype=tf.float32)
+        self.reward_matrix_fn = reward_matrix_fn
 
-        # --- 1. Generate Grids ---
-        z_grid_np, prob_matrix_np = initialize_markov_process(shock_params, self.grid_config.z_size)
-        k_grid_np = self.grid_config.generate_capital_grid(params)
-        b_grid_np = self.grid_config.generate_bond_grid(
-            params,
-            k_max=k_grid_np.max(),
-            z_max=z_grid_np.max()
-        )
+        if dataset is not None and dataset_metadata is not None:
+            self.dataset = dataset
+            self.dataset_metadata = dataset_metadata
+            bounds = extract_bounds_from_metadata(dataset_metadata)
+            delta_val = float(params.delta if delta is None else delta)
+
+            # --- 1. Generate Grids ---
+            k_grid_np, _, b_grid_np = self.grid_config.generate_grids(bounds, delta=delta_val)
+            z_grid_np, prob_matrix_np = estimate_transition_matrix_from_dataset(
+                dataset,
+                bounds,
+                z_size=self.grid_config.z_size,
+            )
+        else:
+            # Backward-compatible legacy path.
+            if shock_params is None:
+                raise ValueError(
+                    "Offline path requires dataset + dataset_metadata. "
+                    "Legacy path requires shock_params."
+                )
+            z_grid_np, prob_matrix_np = initialize_markov_process(shock_params, self.grid_config.z_size)
+            k_grid_np = self.grid_config.generate_capital_grid(params)
+            b_grid_np = self.grid_config.generate_bond_grid(
+                params,
+                k_max=k_grid_np.max(),
+                z_min=z_grid_np.min(),
+            )
+            self.dataset = None
+            self.dataset_metadata = None
 
         # --- 2. Convert to TensorFlow Constants ---
         self.z_grid, self.prob_matrix, self.k_grid, self.b_grid = convert_to_tf(
@@ -84,10 +122,32 @@ class DebtModelDDP:
         # --- 3. Store Dimensions ---
         self.nz = self.grid_config.z_size
         self.nk = len(k_grid_np)
-        self.nb = self.grid_config.b_size
+        self.nb = len(b_grid_np)
 
         # --- 4. Precompute Static Flows ---
         self.static_flows = self._build_static_cash_flows()
+
+    @classmethod
+    def from_dataset_bundle(
+        cls,
+        params: EconomicParams,
+        bundle: DatasetBundle,
+        *,
+        grid_config: Optional[DDPGridConfig] = None,
+        delta: Optional[float] = None,
+        reward_matrix_fn: Optional[Callable[..., tf.Tensor]] = None,
+    ) -> "RiskyModelDDP":
+        """
+        Convenience constructor for metadata-first offline workflows.
+        """
+        return cls(
+            params,
+            dataset=bundle.data,
+            dataset_metadata=bundle.metadata,
+            grid_config=grid_config,
+            delta=delta,
+            reward_matrix_fn=reward_matrix_fn,
+        )
 
     def _build_static_cash_flows(self) -> tf.Tensor:
         """
@@ -161,6 +221,18 @@ class DebtModelDDP:
             tf.Tensor: The 5D reward matrix representing Div(z, k, k', b, b').
                 Shape: (nz, nk, nk, nb, nb).
         """
+        if self.reward_matrix_fn is not None:
+            return self.reward_matrix_fn(
+                bond_price_schedule=bond_price_schedule,
+                z_grid=self.z_grid,
+                k_grid=self.k_grid,
+                b_grid=self.b_grid,
+                prob_matrix=self.prob_matrix,
+                params=self.params,
+                temperature=1e-6,
+                logit_clip=20.0,
+            )
+
         params = self.params
 
         # --- 1. Pre-calculation & Reshaping for Broadcasting ---
@@ -237,66 +309,62 @@ class DebtModelDDP:
         )
 
     @tf.function
-    def _compute_bellman_step(self, v_curr: tf.Tensor, reward_matrix: tf.Tensor) -> tf.Tensor:
+    def _compute_bellman_step_with_policy(
+        self,
+        v_curr: tf.Tensor,
+        reward_matrix: tf.Tensor
+    ) -> Tuple[tf.Tensor, tf.Tensor, tf.Tensor]:
         """
-        Performs a single Bellman Contraction Step.
-
-        V_next(z, k, b) = max_{k', b'} [ Reward + beta * E[V_curr(z', k', b') | z] ]
-        Subject to limited liability: V >= 0.
-
-        Args:
-            v_curr (tf.Tensor): Current guess of Value Function (nz, nk, nb).
-            reward_matrix (tf.Tensor): Payoff matrix (nz, nk, nk, nb, nb).
+        Bellman step that returns both values and argmax policy indices.
 
         Returns:
-            tf.Tensor: Updated Value Function of shape (nz, nk, nb).
+            v_next: Updated value function (nz, nk, nb).
+            pol_k_idx: Optimal k' index for each state (nz, nk, nb).
+            pol_b_idx: Optimal b' index for each state (nz, nk, nb).
         """
-        # 1. Expectation & Discounting: E[V(z', k', b') | z]
-        # We flatten (nk, nb) to handle the matrix multiplication with prob_matrix (nz, nz)
-        # Input: (nz, nk, nb) -> Flatten: (nz, nk*nb)
         v_flat = tf.reshape(v_curr, [self.nz, -1])
-
-        # Matmul: (nz, nz) @ (nz, nk*nb) -> (nz, nk*nb)
         ev_flat = tf.matmul(self.prob_matrix, v_flat)
-
-        # Reshape back to (nz, nk, nb)
         ev = tf.reshape(ev_flat, [self.nz, self.nk, self.nb])
-
-        # Continuation Value (CV)
-        # Shape: (nz, nk, nb)
         cv = self.beta * ev
 
-        # 2. Maximization via map_fn
+        value_spec = tf.TensorSpec((self.nk, self.nb), tf.float32)
+        index_spec = tf.TensorSpec((self.nk, self.nb), tf.int32)
+
         def process_z_bellman(inputs):
-            # r_slice: Get Reward Payoffs for state z
-            # Shape: (nk, nk, nb, nb) -> corresponding to (k_curr, k_next, b_curr, b_next)
-            # cv_slice: Get Future Value for state z
-            # CV Shape: (nk, nb) -> corresponding to (k_next, b_next)
             r_slice, cv_slice = inputs
 
-            # Reshape CV for broadcasting: (nk, nb) -> (1, nk, 1, nb)
-            # Aligns (k_next, b_next) with the reward matrix structure
             cv_broad = tf.reshape(cv_slice, [1, self.nk, 1, self.nb])
-
-            # C. Total Value = Current Reward + Discounted Future Value
-            # Broadcasting: (nk, nk, nb, nb) + (1, nk, 1, nb) -> (nk, nk, nb, nb)
             rhs = r_slice + cv_broad
 
-            # D. Optimization
-            # Reduce Max over next_k (axis 1) and next_b (axis 3)
-            # Result: (nk, nb)
-            v_unconstrained = tf.reduce_max(rhs, axis=[1, 3])
+            # Reorder to (k_curr, b_curr, k_next, b_next), then flatten action dims.
+            rhs_ordered = tf.transpose(rhs, perm=[0, 2, 1, 3])
+            rhs_flat = tf.reshape(rhs_ordered, [self.nk, self.nb, -1])
 
-            # E. Limited liability: Max(V, 0)
-            return tf.maximum(v_unconstrained, 0.0)
+            best_linear_idx = tf.argmax(rhs_flat, axis=-1, output_type=tf.int32)
+            v_unconstrained = tf.reduce_max(rhs_flat, axis=-1)
+            v_state = tf.maximum(v_unconstrained, 0.0)
 
-        # Execute map_fn
-        return tf.map_fn(
+            best_k_idx = best_linear_idx // self.nb
+            best_b_idx = best_linear_idx % self.nb
+            return v_state, best_k_idx, best_b_idx
+
+        v_next, pol_k_idx, pol_b_idx = tf.map_fn(
             process_z_bellman,
             (reward_matrix, cv),
-            fn_output_signature=tf.float32,
+            fn_output_signature=(value_spec, index_spec, index_spec),
             parallel_iterations=10
         )
+        return v_next, pol_k_idx, pol_b_idx
+
+    @tf.function
+    def _compute_bellman_step(self, v_curr: tf.Tensor, reward_matrix: tf.Tensor) -> tf.Tensor:
+        """
+        Bellman step returning only updated values.
+
+        This is used by value-only callers (for example, some unit tests).
+        """
+        v_next, _, _ = self._compute_bellman_step_with_policy(v_curr, reward_matrix)
+        return v_next
 
     @tf.function
     def _compute_bond_price(self, v_next: tf.Tensor) -> tf.Tensor:
@@ -323,10 +391,6 @@ class DebtModelDDP:
         # Default: Value is 0 (or less)
         default_bool = tf.math.less_equal(v_next, 0.0)
         is_default = tf.cast(default_bool, tf.float32)
-
-        # Solvent: Value is strictly positive
-        # Complementary probability: 1 - is_default
-        is_solvent = tf.math.subtract(1.0, is_default)
 
         # 2. Calculate Lender Payoff (Solvent vs Default)
         # is_default tells us which regime we are in.
@@ -359,71 +423,168 @@ class DebtModelDDP:
         total_bond_value = expected_payoff / (1 + params.r_rate)
 
         # 5. Convert to Unit Price: q = 1 / (1 + r_tilde)
-        # Use divide_no_nan to handle the b=0 case safely
+        # Use divide_no_nan and pin b'<=0 cases to risk-free price.
+        # Under borrowing-only grids, this only affects b'=0.
         bond_unit_price = tf.math.divide_no_nan(total_bond_value, b_next_broad)
+        rf_price = 1.0 / (1.0 + params.r_rate)
+        bond_unit_price = tf.where(
+            b_next_broad <= 0.0,
+            tf.cast(rf_price, bond_unit_price.dtype),
+            bond_unit_price
+        )
+
+        # Numerical guardrail: enforce no-arbitrage price bounds.
+        bond_unit_price = tf.clip_by_value(
+            bond_unit_price,
+            clip_value_min=0.0,
+            clip_value_max=tf.cast(rf_price, bond_unit_price.dtype),
+        )
 
         return bond_unit_price
 
-    def solve_risky_debt_vfi(
-        self, tol: float = 1e-4, max_iter: int = 50, damping_weight: float = 1.0
+    @tf.function
+    def _evaluate_policy_indices(
+        self,
+        policy_k_idx: tf.Tensor,
+        policy_b_idx: tf.Tensor,
+        reward_matrix: tf.Tensor,
+        v_init: tf.Tensor,
+        steps: int = 300,
+    ) -> tf.Tensor:
+        """
+        Howard-style policy evaluation for fixed risky-model policy indices.
+
+        Limited-liability option (default to zero) remains active during
+        evaluation via value = max(policy_value, 0).
+        """
+        policy_linear_idx = policy_k_idx * self.nb + policy_b_idx
+        output_spec = tf.TensorSpec((self.nk, self.nb), tf.float32)
+
+        def gather_reward(inputs):
+            r_slice, idx_slice = inputs
+            r_ordered = tf.transpose(r_slice, perm=[0, 2, 1, 3])  # (k, b, k', b')
+            r_flat = tf.reshape(r_ordered, [self.nk, self.nb, -1])
+            return tf.gather(r_flat, idx_slice, axis=2, batch_dims=2)
+
+        reward_policy = tf.map_fn(
+            gather_reward,
+            (reward_matrix, policy_linear_idx),
+            fn_output_signature=output_spec,
+            parallel_iterations=10,
+        )
+
+        value = v_init
+        for _ in range(steps):
+            v_flat = tf.reshape(value, [self.nz, -1])
+            ev_flat = tf.matmul(self.prob_matrix, v_flat)
+            ev_grid = tf.reshape(ev_flat, [self.nz, self.nk, self.nb])
+
+            def gather_ev(inputs):
+                ev_slice, idx_slice = inputs
+                ev_slice_flat = tf.reshape(ev_slice, [-1])
+                return tf.gather(ev_slice_flat, idx_slice)
+
+            ev_choice = tf.map_fn(
+                gather_ev,
+                (ev_grid, policy_linear_idx),
+                fn_output_signature=output_spec,
+                parallel_iterations=10,
+            )
+            value = tf.maximum(reward_policy + self.beta * ev_choice, 0.0)
+
+        return value
+
+    def solve_risky(
+        self,
+        tol: float = 1e-4,
+        max_iter: int = 50,
+        damping_weight: float = 1.0,
+        inner_solver: Literal["vfi", "pfi"] = "vfi",
+        inner_solver_kwargs: Optional[Dict[str, Any]] = None,
     ) -> Tuple[tf.Tensor, Tuple[tf.Tensor, tf.Tensor], tf.Tensor]:
         """
-        Solves for Equilibrium Bond Price and Firm Value using 'Loop-within-a-Loop'.
-
-        Algorithm:
-            1. Outer Loop: Guesses a price schedule 'q'.
-            2. Inner Loop (VFI): Solves firm value 'V' given 'q'.
-            3. Update: Updates 'q' based on default risks implied by 'V'.
-            4. Repeat until prices converge.
+        Solve risky-model equilibrium with configurable inner firm solver.
 
         Args:
-            tol (float): Convergence tolerance for prices.
-            max_iter (int): Max outer loop iterations.
-            damping_weight (float): Weight for price updates (1.0 = No Damping).
-
-        Returns:
-            Tuple[tf.Tensor, Tuple[tf.Tensor, tf.Tensor], tf.Tensor]:
-                - v_star: Converged value function.
-                - policy: Optimal policy grids (k_prime, b_prime).
-                - q_star: Equilibrium bond price schedule.
+            tol: Outer-loop price convergence tolerance.
+            max_iter: Maximum outer-loop iterations.
+            damping_weight: Price update weight in (0, 1].
+            inner_solver: "vfi" or "pfi" for the inner firm problem.
+            inner_solver_kwargs: Optional kwargs passed to inner solver.
         """
-        print(f"Starting Risky Debt Solver (Damping={damping_weight})...")
+        if inner_solver not in {"vfi", "pfi"}:
+            raise ValueError(f"inner_solver must be 'vfi' or 'pfi'. Got '{inner_solver}'.")
+        if not (0.0 < damping_weight <= 1.0):
+            raise ValueError(f"damping_weight must be in (0, 1]. Got {damping_weight}.")
+
+        inner_solver_kwargs = inner_solver_kwargs or {}
+        print(f"Starting Risky DDP Solver (inner={inner_solver.upper()}, damping={damping_weight})...")
+
         v_star = None
         policy = None
+        rf_price = 1.0 / (1.0 + self.params.r_rate)
+        q_current = tf.ones((self.nz, self.nk, self.nb), dtype=tf.float32) * rf_price
 
-        # 1. Initialize Guess: Risk-Free Unit Price
-        # q = 1 / (1 + r) for all states
-        q_current = tf.ones((self.nz, self.nk, self.nb)) / (1 + self.params.r_rate)
-
-        for i in range(max_iter):
-            # --- INNER LOOP: Solve Firm Problem given q ---
-            # 1. Compute Rewards (Dividends) based on current prices
+        for _ in range(max_iter):
             reward_matrix = self._compute_reward_matrix(q_current)
 
-            # 2. Solve VFI to get V(z, k, b)
-            # This implicitly determines the default set {V < 0}
-            v_star, policy = self.solve_vfi(reward_matrix)
+            if inner_solver == "vfi":
+                v_star, policy = self.solve_vfi(reward_matrix, **inner_solver_kwargs)
+            else:
+                v_star, policy = self.solve_pfi(reward_matrix, **inner_solver_kwargs)
 
-            # --- OUTER LOOP: Update Market Prices ---
-            # 3. Bank updates prices based on firm's new default regions
             q_new = self._compute_bond_price(v_star)
-
-            # --- Check Convergence ---
-            diff_tensor = tf.abs(tf.math.subtract(q_new, q_current))
-            diff = tf.reduce_max(diff_tensor)
-
+            diff = float(tf.reduce_max(tf.abs(q_new - q_current)).numpy())
             if diff < tol:
                 print("Strategic Equilibrium Converged!")
                 return v_star, policy, q_new
 
-            # Update guess with smoothing to avoid oscillation
-            # q_next = (1 - weight) * q_old + weight * q_new
-            step_diff = tf.math.subtract(q_new, q_current)
-            step_scaled = tf.math.multiply(step_diff, damping_weight)
-            q_current = tf.math.add(q_current, step_scaled)
+            q_current = q_current + damping_weight * (q_new - q_current)
+            q_current = tf.clip_by_value(q_current, 0.0, tf.cast(rf_price, tf.float32))
 
         print("Warning: Strategic Loop reached max iterations.")
         return v_star, policy, q_current
+
+    def solve_risky_vfi(
+        self,
+        tol: float = 1e-4,
+        max_iter: int = 50,
+        damping_weight: float = 1.0,
+        inner_vfi_tol: float = 1e-5,
+        inner_vfi_max_iter: int = 2000,
+    ) -> Tuple[tf.Tensor, Tuple[tf.Tensor, tf.Tensor], tf.Tensor]:
+        """
+        Risky-model equilibrium with inner VFI.
+        """
+        return self.solve_risky(
+            tol=tol,
+            max_iter=max_iter,
+            damping_weight=damping_weight,
+            inner_solver="vfi",
+            inner_solver_kwargs={"tol": inner_vfi_tol, "max_iter": inner_vfi_max_iter},
+        )
+
+    def solve_risky_pfi(
+        self,
+        tol: float = 1e-4,
+        max_iter: int = 50,
+        damping_weight: float = 1.0,
+        inner_pfi_max_iter: int = 200,
+        inner_pfi_eval_steps: int = 400,
+    ) -> Tuple[tf.Tensor, Tuple[tf.Tensor, tf.Tensor], tf.Tensor]:
+        """
+        Risky-model equilibrium with inner Howard-style policy iteration.
+        """
+        return self.solve_risky(
+            tol=tol,
+            max_iter=max_iter,
+            damping_weight=damping_weight,
+            inner_solver="pfi",
+            inner_solver_kwargs={
+                "max_iter": inner_pfi_max_iter,
+                "eval_steps": inner_pfi_eval_steps,
+            },
+        )
 
     @staticmethod
     def _argmax_2d(tensor_4d: tf.Tensor) -> Tuple[tf.Tensor, tf.Tensor]:
@@ -537,23 +698,66 @@ class DebtModelDDP:
                 - v_star: Optimal value function.
                 - policy: Tuple of optimal (k, b) choices.
         """
-        # Initialize Guess (Zeros)
-        v_curr = tf.zeros((self.nz, self.nk, self.nb))
+        v_curr = tf.zeros((self.nz, self.nk, self.nb), dtype=tf.float32)
+        pol_k_idx = tf.zeros((self.nz, self.nk, self.nb), dtype=tf.int32)
+        pol_b_idx = tf.zeros((self.nz, self.nk, self.nb), dtype=tf.int32)
 
         for iteration in range(max_iter):
-            # Step
-            v_next = self._compute_bellman_step(v_curr, reward_matrix)
-
-            # Check convergence
-            diff_tensor = tf.abs(tf.math.subtract(v_next, v_curr))
-            diff = tf.reduce_max(diff_tensor)
-
+            v_next, pol_k_idx, pol_b_idx = self._compute_bellman_step_with_policy(
+                v_curr, reward_matrix
+            )
+            diff = float(tf.reduce_max(tf.abs(v_next - v_curr)).numpy())
             if diff < tol:
                 print(f"    VFI Converged: {iteration} iters, Diff={diff:.6f}")
-                return v_next, self._extract_policy(reward_matrix, v_next)
-
-            # Update
+                return v_next, (
+                    tf.gather(self.k_grid, pol_k_idx),
+                    tf.gather(self.b_grid, pol_b_idx),
+                )
             v_curr = v_next
 
         print("    Warning: VFI did not converge.")
-        return v_curr, self._extract_policy(reward_matrix, v_curr)
+        return v_curr, (
+            tf.gather(self.k_grid, pol_k_idx),
+            tf.gather(self.b_grid, pol_b_idx),
+        )
+
+    def solve_pfi(
+        self,
+        reward_matrix: tf.Tensor,
+        max_iter: int = 200,
+        eval_steps: int = 400,
+    ) -> Tuple[tf.Tensor, Tuple[tf.Tensor, tf.Tensor]]:
+        """
+        Howard-style Policy Function Iteration for the risky-model inner problem.
+        """
+        policy_k_idx = tf.zeros((self.nz, self.nk, self.nb), dtype=tf.int32)
+        policy_b_idx = tf.zeros((self.nz, self.nk, self.nb), dtype=tf.int32)
+        v_curr = tf.zeros((self.nz, self.nk, self.nb), dtype=tf.float32)
+
+        for iteration in range(max_iter):
+            v_eval = self._evaluate_policy_indices(
+                policy_k_idx, policy_b_idx, reward_matrix, v_curr, steps=eval_steps
+            )
+            v_greedy, new_k_idx, new_b_idx = self._compute_bellman_step_with_policy(
+                v_eval, reward_matrix
+            )
+
+            k_changed = tf.reduce_any(tf.not_equal(new_k_idx, policy_k_idx))
+            b_changed = tf.reduce_any(tf.not_equal(new_b_idx, policy_b_idx))
+            policy_changed = bool(k_changed.numpy() or b_changed.numpy())
+            if not policy_changed:
+                print(f"    PFI Converged: {iteration + 1} policy updates.")
+                return v_greedy, (
+                    tf.gather(self.k_grid, new_k_idx),
+                    tf.gather(self.b_grid, new_b_idx),
+                )
+
+            policy_k_idx = new_k_idx
+            policy_b_idx = new_b_idx
+            v_curr = v_greedy
+
+        print("    Warning: PFI did not converge.")
+        return v_curr, (
+            tf.gather(self.k_grid, policy_k_idx),
+            tf.gather(self.b_grid, policy_b_idx),
+        )

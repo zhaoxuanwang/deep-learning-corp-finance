@@ -12,7 +12,7 @@ Input Convention:
 """
 
 import tensorflow as tf
-from typing import Tuple
+from typing import Optional, Tuple
 
 class RiskyPolicyNetwork(tf.keras.Model):
     """
@@ -490,7 +490,8 @@ def compute_effective_value(
     k: tf.Tensor,
     temperature: float,
     logit_clip: float = 20.0,
-    noise: bool = True
+    noise: bool = True,
+    noise_seed: Optional[tf.Tensor] = None
 ) -> Tuple[tf.Tensor, tf.Tensor]:
     """
     Compute effective continuation value with smooth default probability.
@@ -515,6 +516,9 @@ def compute_effective_value(
         logit_clip: Clipping bound for normalized value (default 20.0)
         noise: If True, add Gumbel noise for exploration (training).
                If False, use deterministic sigmoid (evaluation).
+        noise_seed: Optional stateless RNG seed for Gumbel noise. If provided,
+            default probability exploration is deterministic and call-order
+            independent.
 
     Returns:
         Tuple of:
@@ -528,7 +532,13 @@ def compute_effective_value(
     V_norm = V_tilde / safe_k
 
     # Compute default probability using Gumbel-Sigmoid
-    p_default = indicator_default(V_norm, temperature, logit_clip=logit_clip, noise=noise)
+    p_default = indicator_default(
+        V_norm,
+        temperature,
+        logit_clip=logit_clip,
+        noise=noise,
+        noise_seed=noise_seed
+    )
 
     # Effective value: (1 - p) * V
     # When p -> 1 (default), V_eff -> 0

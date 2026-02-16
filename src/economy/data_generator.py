@@ -88,18 +88,25 @@ Example:
 from __future__ import annotations
 
 import os
-import json
-import hashlib
 from pathlib import Path
-from datetime import datetime
-import numpy as np
 import tensorflow as tf
 from typing import Dict, Iterator, Optional, Tuple, Any, List
-from dataclasses import dataclass
 
 from src.economy.parameters import EconomicParams, ShockParams
 from src.economy.rng import SeedSchedule, SeedScheduleConfig, VariableID
-from src.economy.shocks import step_ar1_tf
+from src.economy.data import (
+    default_cache_dir,
+    compute_config_hash,
+    build_cache_path,
+    build_metadata,
+    save_dataset_to_disk,
+    load_dataset_from_disk,
+    generate_initial_states,
+    generate_shocks,
+    rollout_forked_path,
+    generate_batch,
+    build_flattened_dataset,
+)
 
 
 # =============================================================================
@@ -179,9 +186,7 @@ class DataGenerator:
 
         if cache_dir is None:
             # Default to standard data directory: PROJECT_ROOT/data
-            # This file is in src/economy/data_generator.py -> root is ../..
-            project_root = Path(__file__).resolve().parent.parent.parent
-            self.cache_dir = str(project_root / "data")
+            self.cache_dir = default_cache_dir(__file__)
         else:
             self.cache_dir = cache_dir
 
@@ -209,25 +214,18 @@ class DataGenerator:
         Returns:
             12-character hex string
         """
-        # Include all configuration that affects dataset generation
-        # Only include parameters that affect z-path rollout
-        config_tuple = (
-            self.master_seed,
-            self.sim_batch_size,
-            self.T,
-            self.n_sim_batches,
-            self.N_val,
-            self.N_test,
-            self.k_bounds,
-            self.logz_bounds,
-            self.b_bounds,
-            self.shock_params.rho,      # AR(1) persistence
-            self.shock_params.sigma,    # AR(1) variance
-            self.shock_params.mu        # AR(1) unconditional mean
+        return compute_config_hash(
+            master_seed=self.master_seed,
+            sim_batch_size=self.sim_batch_size,
+            horizon=self.T,
+            n_sim_batches=self.n_sim_batches,
+            n_val=self.N_val,
+            n_test=self.N_test,
+            k_bounds=self.k_bounds,
+            logz_bounds=self.logz_bounds,
+            b_bounds=self.b_bounds,
+            shock_params=self.shock_params,
         )
-        config_str = str(config_tuple)
-        hash_obj = hashlib.md5(config_str.encode())
-        return hash_obj.hexdigest()[:12]
 
     def _get_cache_path(self, split: str) -> str:
         """
@@ -243,35 +241,24 @@ class DataGenerator:
             raise ValueError("cache_dir is None, cannot generate cache path")
 
         config_hash = self._get_config_hash()
-        filename = f"{split}_{config_hash}.npz"
-        return os.path.join(self.cache_dir, filename)
+        return build_cache_path(self.cache_dir, split, config_hash)
 
     def _get_metadata(self) -> Dict[str, Any]:
         """
         Generate metadata for dataset verification.
         """
-        return {
-            "schema_version": "1.0",
-            "master_seed": [int(x) for x in self.master_seed],
-            "dims": {
-                "n": self.sim_batch_size,
-                "T": self.T,
-                "J": self.n_sim_batches,
-                "N_val": self.N_val,
-                "N_test": self.N_test
-            },
-            "bounds": {
-                "k": [float(x) for x in self.k_bounds],
-                "logz": [float(x) for x in self.logz_bounds],
-                "b": [float(x) for x in self.b_bounds]
-            },
-            "shock_params": {
-                "rho": float(self.shock_params.rho),
-                "sigma": float(self.shock_params.sigma),
-                "mu": float(self.shock_params.mu)
-            },
-            "creation_timestamp": str(datetime.now())
-        }
+        return build_metadata(
+            master_seed=self.master_seed,
+            sim_batch_size=self.sim_batch_size,
+            horizon=self.T,
+            n_sim_batches=self.n_sim_batches,
+            n_val=self.N_val,
+            n_test=self.N_test,
+            k_bounds=self.k_bounds,
+            logz_bounds=self.logz_bounds,
+            b_bounds=self.b_bounds,
+            shock_params=self.shock_params,
+        )
 
     def _save_to_disk(self, dataset: Dict[str, tf.Tensor], path: str, metadata: Optional[Dict[str, Any]] = None):
         """
@@ -282,20 +269,12 @@ class DataGenerator:
             path: File path for saving (.npz file)
             metadata: Optional dictionary of metadata to save
         """
-        if not self.save_to_disk:
-            return
-
-        # Create directory if it doesn't exist
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-
-        # Convert tensors to numpy arrays
-        numpy_data = {key: tensor.numpy() for key, tensor in dataset.items()}
-        
-        # Add metadata if provided
-        if metadata is not None:
-            numpy_data["_metadata"] = json.dumps(metadata)
-
-        np.savez_compressed(path, **numpy_data)
+        save_dataset_to_disk(
+            dataset,
+            path,
+            save_to_disk=self.save_to_disk,
+            metadata=metadata,
+        )
 
     def _load_from_disk(self, path: str) -> Dict[str, tf.Tensor]:
         """
@@ -310,39 +289,7 @@ class DataGenerator:
         Raises:
             ValueError: If metadata does not match current generator configuration.
         """
-        # Load numpy arrays
-        data = np.load(path)
-        result = {}
-        
-        # Check metadata
-        if "_metadata" in data:
-            stored_meta = json.loads(str(data["_metadata"]))
-            current_meta = self._get_metadata()
-            
-            # Helper to compare dictionaries ignoring timestamp
-            def check_mismatch(section):
-                if stored_meta.get(section) != current_meta.get(section):
-                    return True
-                return False
-
-            if (check_mismatch("master_seed") or 
-                check_mismatch("dims") or 
-                check_mismatch("bounds") or 
-                check_mismatch("params")):
-                 
-                 raise ValueError(
-                     f"Cached dataset metadata mismatch!\n"
-                     f"Stored: {json.dumps(stored_meta, indent=2)}\n"
-                     f"Current: {json.dumps(current_meta, indent=2)}\n"
-                     f"File: {path}"
-                 )
-        
-        # Convert to TensorFlow tensors (excluding metadata)
-        for key in data.keys():
-            if key != "_metadata":
-                result[key] = tf.constant(data[key])
-                
-        return result
+        return load_dataset_from_disk(path, current_metadata=self._get_metadata())
 
     def _generate_initial_states(
         self,
@@ -365,39 +312,15 @@ class DataGenerator:
             z0: Initial productivity (batch_size,)
             b0: Initial debt (batch_size,)
         """
-        k_min, k_max = self.k_bounds
-        logz_min, logz_max = self.logz_bounds
-        b_min, b_max = self.b_bounds
-
-        # Sample k0 uniformly
-        k0 = tf.random.stateless_uniform(
-            shape=(batch_size,),
-            seed=k_seed,
-            minval=k_min,
-            maxval=k_max,
-            dtype=tf.float32
+        return generate_initial_states(
+            batch_size,
+            self.k_bounds,
+            self.logz_bounds,
+            self.b_bounds,
+            k_seed=k_seed,
+            z_seed=z_seed,
+            b_seed=b_seed,
         )
-
-        # Sample log(z0) uniformly, then convert to z0
-        logz0 = tf.random.stateless_uniform(
-            shape=(batch_size,),
-            seed=z_seed,
-            minval=logz_min,
-            maxval=logz_max,
-            dtype=tf.float32
-        )
-        z0 = tf.exp(logz0)
-
-        # Sample b0 uniformly
-        b0 = tf.random.stateless_uniform(
-            shape=(batch_size,),
-            seed=b_seed,
-            minval=b_min,
-            maxval=b_max,
-            dtype=tf.float32
-        )
-
-        return k0, z0, b0
 
     def _generate_shocks(
         self,
@@ -419,20 +342,12 @@ class DataGenerator:
             eps1: First shock sequence (batch_size, T)
             eps2: Second shock sequence (batch_size, T)
         """
-        # Generate standard normal shocks
-        eps1 = tf.random.stateless_normal(
-            shape=(batch_size, T),
-            seed=eps1_seed,
-            dtype=tf.float32
+        return generate_shocks(
+            batch_size,
+            T,
+            eps1_seed=eps1_seed,
+            eps2_seed=eps2_seed,
         )
-
-        eps2 = tf.random.stateless_normal(
-            shape=(batch_size, T),
-            seed=eps2_seed,
-            dtype=tf.float32
-        )
-
-        return eps1, eps2
 
     def _rollout_forked_path(
         self,
@@ -452,34 +367,7 @@ class DataGenerator:
             z_path: Main trajectory (batch_size, T+1)
             z_fork: Forked next states (batch_size, T, 1) corresponding to z_path[:,t]
         """
-        batch_size = tf.shape(z0)[0]
-        T = tf.shape(eps_main)[1]
-        
-        z_main_list = [z0]
-        z_fork_list = []
-        
-        z_current = z0
-        
-        for t in range(T):
-            # 1. Main Path Step
-            z_next_main = step_ar1_tf(
-                z_current, self.shock_params.rho, self.shock_params.sigma, self.shock_params.mu, eps=eps_main[:, t]
-            )
-            z_main_list.append(z_next_main)
-            
-            # 2. Fork Step (from SAME current state, using different shock)
-            z_next_fork = step_ar1_tf(
-                z_current, self.shock_params.rho, self.shock_params.sigma, self.shock_params.mu, eps=eps_fork[:, t]
-            )
-            z_fork_list.append(tf.reshape(z_next_fork, [-1, 1]))
-            
-            # Update state along MAIN path
-            z_current = z_next_main
-            
-        z_path = tf.stack(z_main_list, axis=1) # (B, T+1)
-        z_fork = tf.stack(z_fork_list, axis=1) # (B, T, 1)
-        
-        return z_path, z_fork
+        return rollout_forked_path(z0, eps_main, eps_fork, self.shock_params)
 
     def _generate_batch(
         self,
@@ -503,35 +391,15 @@ class DataGenerator:
                 - 'eps1': First shock sequence (batch_size, T)
                 - 'eps2': Second shock sequence (batch_size, T)
         """
-        # Generate initial states
-        k0, z0, b0 = self._generate_initial_states(
-            batch_size,
-            k_seed=seeds_dict[VariableID.K0],
-            z_seed=seeds_dict[VariableID.Z0],
-            b_seed=seeds_dict[VariableID.B0]
+        return generate_batch(
+            seeds_dict=seeds_dict,
+            batch_size=batch_size,
+            horizon=self.T,
+            k_bounds=self.k_bounds,
+            logz_bounds=self.logz_bounds,
+            b_bounds=self.b_bounds,
+            shock_params=self.shock_params,
         )
-
-        # Generate shocks
-        eps1, eps2 = self._generate_shocks(
-            batch_size,
-            self.T,
-            eps1_seed=seeds_dict[VariableID.EPS1],
-            eps2_seed=seeds_dict[VariableID.EPS2]
-        )
-
-        # Rollout z-path (Main) and Forks
-        # We use eps1 for main path, eps2 for forks
-        z_path, z_fork = self._rollout_forked_path(z0, eps1, eps2)
-
-        return {
-            'k0': k0,
-            'z0': z0,
-            'b0': b0,
-            'z_path': z_path, # Main trajectory
-            'z_fork': z_fork, # Pre-computed forks for AiO
-            'eps_path': eps1,
-            'eps_fork': eps2
-        }
 
     def get_training_batches(self) -> Iterator[Dict[str, tf.Tensor]]:
         """
@@ -766,102 +634,18 @@ class DataGenerator:
                 setattr(self, cache_attr, dataset)
                 return dataset
 
-        # Generate flattened dataset
-        # Get full trajectory dataset
+        # Generate flattened dataset from trajectory data.
         traj_data = self.get_training_dataset()
-
-        # Extract relevant arrays
-        z_path = traj_data['z_path']  # (N, T+1)
-        z_fork = traj_data['z_fork']  # (N, T, 1)
-
-        # Get dimensions
-        N = tf.shape(z_path)[0]  # Number of trajectories
-        T = tf.shape(z_path)[1] - 1  # Horizon (z_path is T+1)
-        N_total = N * T  # Total flattened samples
-
-        # === FLATTENING ===
-        # For each trajectory i and timestep t (t=0..T-1), create observation:
-        #   z[i,t] = z_path[i, t]
-        #   z_next_main[i,t] = z_path[i, t+1]
-        #   z_next_fork[i,t] = z_fork[i, t, 0]
-
-        # Extract z (current): take z_path[:, 0:T]
-        z_curr = z_path[:, :-1]  # (N, T)
-
-        # Extract z_next_main: take z_path[:, 1:T+1]
-        z_next_main = z_path[:, 1:]  # (N, T)
-
-        # Extract z_next_fork: z_fork is already (N, T, 1), squeeze last dim
-        z_next_fork = tf.squeeze(z_fork, axis=-1)  # (N, T)
-
-        # Flatten from (N, T) to (N*T,)
-        z_flat = tf.reshape(z_curr, [-1])  # (N*T,)
-        z_next_main_flat = tf.reshape(z_next_main, [-1])  # (N*T,)
-        z_next_fork_flat = tf.reshape(z_next_fork, [-1])  # (N*T,)
-
-        # === INDEPENDENT K SAMPLING ===
-        # Sample k independently for each of the N*T observations
-        # Use deterministic seed for reproducibility: derive from master seed
-        k_seed = tf.constant([
-            self.master_seed[0] + 400,  # Offset for flattened k sampling
-            self.master_seed[1] + 0
-        ], dtype=tf.int32)
-
-        k_min, k_max = self.k_bounds
-        k_flat = tf.random.stateless_uniform(
-            shape=[N_total],
-            seed=k_seed,
-            minval=k_min,
-            maxval=k_max,
-            dtype=tf.float32
+        result = build_flattened_dataset(
+            traj_data=traj_data,
+            seed_schedule=self.seed_schedule,
+            split="train",
+            k_bounds=self.k_bounds,
+            b_bounds=self.b_bounds,
+            include_debt=include_debt,
+            shuffle=True,
+            seed_step=0,
         )
-
-        # === INDEPENDENT B SAMPLING (if include_debt) ===
-        b_flat = None
-        if include_debt:
-            b_seed = tf.constant([
-                self.master_seed[0] + 450,  # Different offset from k
-                self.master_seed[1] + 0
-            ], dtype=tf.int32)
-
-            b_min, b_max = self.b_bounds
-            b_flat = tf.random.stateless_uniform(
-                shape=[N_total],
-                seed=b_seed,
-                minval=b_min,
-                maxval=b_max,
-                dtype=tf.float32
-            )
-
-        # === SHUFFLING ===
-        # Shuffle all arrays together using the same permutation
-        # This ensures i.i.d. property for SGD
-        shuffle_seed = tf.constant([
-            self.master_seed[0] + 500,  # Offset for shuffling
-            self.master_seed[1] + 0
-        ], dtype=tf.int32)
-
-        # Create permutation indices
-        indices = tf.range(N_total, dtype=tf.int32)
-        shuffled_indices = tf.random.experimental.stateless_shuffle(indices, seed=shuffle_seed)
-
-        # Apply permutation to all arrays
-        k_shuffled = tf.gather(k_flat, shuffled_indices)
-        z_shuffled = tf.gather(z_flat, shuffled_indices)
-        z_next_main_shuffled = tf.gather(z_next_main_flat, shuffled_indices)
-        z_next_fork_shuffled = tf.gather(z_next_fork_flat, shuffled_indices)
-
-        # Build result dictionary
-        result = {
-            'k': k_shuffled,
-            'z': z_shuffled,
-            'z_next_main': z_next_main_shuffled,
-            'z_next_fork': z_next_fork_shuffled
-        }
-
-        if include_debt:
-            b_shuffled = tf.gather(b_flat, shuffled_indices)
-            result['b'] = b_shuffled
 
         # Store in memory cache
         setattr(self, cache_attr, result)
@@ -932,77 +716,18 @@ class DataGenerator:
                 setattr(self, cache_attr, dataset)
                 return dataset
 
-        # Generate flattened dataset from trajectory validation data
+        # Generate flattened dataset from trajectory validation data.
         traj_data = self.get_validation_dataset()
-
-        # Extract relevant arrays
-        z_path = traj_data['z_path']  # (N_val, T+1)
-        z_fork = traj_data['z_fork']  # (N_val, T, 1)
-
-        # Get dimensions
-        N = tf.shape(z_path)[0]  # Number of validation trajectories
-        T = tf.shape(z_path)[1] - 1  # Horizon (z_path is T+1)
-        N_total = N * T  # Total flattened samples
-
-        # === FLATTENING ===
-        # Extract z (current): take z_path[:, 0:T]
-        z_curr = z_path[:, :-1]  # (N, T)
-
-        # Extract z_next_main: take z_path[:, 1:T+1]
-        z_next_main = z_path[:, 1:]  # (N, T)
-
-        # Extract z_next_fork: z_fork is already (N, T, 1), squeeze last dim
-        z_next_fork = tf.squeeze(z_fork, axis=-1)  # (N, T)
-
-        # Flatten from (N, T) to (N*T,)
-        z_flat = tf.reshape(z_curr, [-1])  # (N*T,)
-        z_next_main_flat = tf.reshape(z_next_main, [-1])  # (N*T,)
-        z_next_fork_flat = tf.reshape(z_next_fork, [-1])  # (N*T,)
-
-        # === INDEPENDENT K SAMPLING ===
-        # Sample k independently for validation (different seed offset from training)
-        k_seed = tf.constant([
-            self.master_seed[0] + 600,  # Offset for validation flattened k sampling
-            self.master_seed[1] + 0
-        ], dtype=tf.int32)
-
-        k_min, k_max = self.k_bounds
-        k_flat = tf.random.stateless_uniform(
-            shape=[N_total],
-            seed=k_seed,
-            minval=k_min,
-            maxval=k_max,
-            dtype=tf.float32
+        result = build_flattened_dataset(
+            traj_data=traj_data,
+            seed_schedule=self.seed_schedule,
+            split="val",
+            k_bounds=self.k_bounds,
+            b_bounds=self.b_bounds,
+            include_debt=include_debt,
+            shuffle=False,
+            seed_step=None,
         )
-
-        # === INDEPENDENT B SAMPLING (if include_debt) ===
-        b_flat = None
-        if include_debt:
-            b_seed = tf.constant([
-                self.master_seed[0] + 650,  # Different offset from k and training b
-                self.master_seed[1] + 0
-            ], dtype=tf.int32)
-
-            b_min, b_max = self.b_bounds
-            b_flat = tf.random.stateless_uniform(
-                shape=[N_total],
-                seed=b_seed,
-                minval=b_min,
-                maxval=b_max,
-                dtype=tf.float32
-            )
-
-        # NOTE: No shuffling for validation - we want deterministic evaluation
-        # Build result dictionary
-        result = {
-            'k': k_flat,
-            'z': z_flat,
-            'z_next_main': z_next_main_flat,
-            'z_next_fork': z_next_fork_flat
-        }
-
-        if include_debt:
-            result['b'] = b_flat
 
         # Store in memory cache
         setattr(self, cache_attr, result)

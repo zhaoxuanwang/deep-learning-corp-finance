@@ -11,7 +11,7 @@ All defaults are imported from src.trainers.config to avoid config drift.
 """
 
 import math
-from typing import Literal, Union, Any
+from typing import Literal, Union, Any, Optional
 from dataclasses import dataclass
 import tensorflow as tf
 
@@ -112,7 +112,6 @@ class AnnealingSchedule:
 # GATE & INDICATOR FUNCTIONS
 # =============================================================================
 
-from typing import Union, Any
 import tensorflow as tf
 
 Numeric = Union[tf.Tensor, Any]
@@ -128,7 +127,8 @@ def indicator_default(
     V_tilde_norm: Numeric,
     temperature: Union[float, AnnealingSchedule],
     logit_clip: float = DEFAULT_INDICATOR_LOGIT_CLIP,
-    noise: bool = True
+    noise: bool = True,
+    noise_seed: Optional[tf.Tensor] = None
 ):
     """
     Compute smooth default probability using Gumbel-Sigmoid for exploration.
@@ -141,6 +141,8 @@ def indicator_default(
         temperature: Temperature parameter (tau)
         logit_clip: Clip range for the normalized value (default: DEFAULT_INDICATOR_LOGIT_CLIP)
         noise: If True, add Gumbel noise. If False, use plain Sigmoid.
+        noise_seed: Optional stateless RNG seed (shape [2], int32) for reproducible
+            Gumbel noise draws. If None, falls back to stateful RNG.
     """
     x = tf.convert_to_tensor(V_tilde_norm)
     dtype = x.dtype
@@ -153,7 +155,16 @@ def indicator_default(
     if noise:
         # 3. Draw random noise u ~ Uniform(0,1)
         # 4. Gumbel noise term: log(u) - log(1-u)
-        u = tf.random.uniform(tf.shape(x), minval=1e-6, maxval=1.0-1e-6, dtype=dtype)
+        if noise_seed is not None:
+            u = tf.random.stateless_uniform(
+                tf.shape(x),
+                seed=tf.cast(noise_seed, tf.int32),
+                minval=1e-6,
+                maxval=1.0 - 1e-6,
+                dtype=dtype
+            )
+        else:
+            u = tf.random.uniform(tf.shape(x), minval=1e-6, maxval=1.0-1e-6, dtype=dtype)
         gumbel_noise = tf.math.log(u) - tf.math.log(1.0 - u)
         
         # 5. Compute Gumbel-Sigmoid

@@ -401,9 +401,7 @@ def pricing_residual_bond_price(
     """
     Lender zero-profit pricing residual (bond price formulation).
 
-    f = q · b' · (1+r) - β · [(1-p) · b' + p · R]
-
-    where β = 1/(1+r) is the discount factor.
+    f = q · b' · (1+r) - [(1-p) · b' + p · R]
 
     Reference:
         report_brief.md lines 1046-1059:
@@ -422,17 +420,15 @@ def pricing_residual_bond_price(
     Returns:
         f: Pricing residual (batch,). Positive = lender earns profit.
     """
-    beta = 1.0 / (1.0 + r_risk_free)
-
     # LHS: Market value of bond * gross risk-free return
     # This represents what the lender pays (discounted) times the opportunity cost
     lhs = q * b_next * (1 + r_risk_free)
 
-    # RHS: Expected discounted payoff to lender
+    # RHS: Expected payoff to lender
     # If solvent: get full repayment b'
     # If default: get recovery R
     expected_payoff = (1 - p_default) * b_next + p_default * recovery
-    rhs = beta * expected_payoff
+    rhs = expected_payoff
 
     return lhs - rhs
 

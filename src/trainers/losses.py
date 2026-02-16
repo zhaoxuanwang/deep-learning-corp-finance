@@ -4,11 +4,11 @@ src/trainers/losses.py
 Loss functions for training DNN approximations.
 Implements exact formulations from outline_v2.md.
 
-Loss Types:
+ Loss Types:
 - LR: Lifetime Reward (maximize discounted rewards)
-- ER: Euler Residual (AiO form for squared residual)
-- BR: Bellman Residual (actor-critic with proper detachment)
-- Price: Lender zero-profit residual (AiO form)
+- ER: Euler Residual (MSE / AiO estimators)
+- BR: Bellman Residual (actor-critic with proper detachment; MSE / AiO)
+- Price: Lender zero-profit residual (MSE / AiO)
 """
 
 import tensorflow as tf
@@ -246,8 +246,7 @@ def compute_br_critic_diagnostics(
     """
     Compute diagnostic metrics for BR critic.
 
-    The cross-product loss mean(delta1 * delta2) is unbiased but can be negative
-    and non-monotone. These diagnostics provide more interpretable metrics.
+    These diagnostics provide interpretable, non-negative proxies for BR error.
 
     IMPORTANT: The absolute MSE naturally increases as the value function learns
     to predict larger (more meaningful) values. The RELATIVE metrics (rel_mse,
@@ -260,19 +259,15 @@ def compute_br_critic_diagnostics(
 
     Returns:
         Dict with:
-            1. cross_product (the actual loss): mean(delta1 * delta2)
-            2. mse_proxy (always positive): mean(0.5 * (delta1^2 + delta2^2))
-            3. mae_proxy (always positive): mean(0.5 * (|delta1| + |delta2|))
-            4. rel_mse (scale-invariant): mean((delta / |y|)^2), better for convergence monitoring
-            5. rel_mae (scale-invariant): mean(|delta / y|), interpretable as % error
-            6. mean_value_scale: mean(|y|), context for absolute metrics
+            1. mse_proxy (always positive): mean(0.5 * (delta1^2 + delta2^2))
+            2. rel_mse (scale-invariant): mean((delta / |y|)^2), better for convergence monitoring
+            3. rel_mae (scale-invariant): mean(|delta / y|), interpretable as % error
+            4. mean_value_scale: mean(|y|), context for absolute metrics
     """
     delta1 = V_curr - y1
     delta2 = V_curr - y2
 
-    cross_product = float(tf.reduce_mean(delta1 * delta2))
     mse_proxy = float(tf.reduce_mean(0.5 * (delta1**2 + delta2**2)))
-    mae_proxy = float(tf.reduce_mean(0.5 * (tf.abs(delta1) + tf.abs(delta2))))
 
     # Scale-invariant relative metrics (what really matters for convergence)
     # Use |y| as denominator with small epsilon for stability
@@ -287,9 +282,7 @@ def compute_br_critic_diagnostics(
     mean_value_scale = float(tf.reduce_mean(tf.abs(y_avg)))
 
     return {
-        "cross_product": cross_product,
         "mse_proxy": mse_proxy,
-        "mae_proxy": mae_proxy,
         "rel_mse": rel_mse,
         "rel_mae": rel_mae,
         "mean_value_scale": mean_value_scale,

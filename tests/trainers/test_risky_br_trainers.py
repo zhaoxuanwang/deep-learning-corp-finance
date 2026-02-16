@@ -23,6 +23,7 @@ import pytest
 import numpy as np
 import shutil
 import os
+import src.trainers.risky_trainers as risky_trainers_module
 
 from src.economy.parameters import EconomicParams, ShockParams
 from src.networks.network_risky import (
@@ -32,7 +33,7 @@ from src.networks.network_risky import (
     RiskyPriceNetwork,
     compute_effective_value
 )
-from src.trainers.risky import RiskyDebtTrainerBR
+from src.trainers.risky_trainers import RiskyDebtTrainerBR
 from src.utils.annealing import AnnealingSchedule
 
 
@@ -483,3 +484,56 @@ class TestRiskyBRIntegration:
         # Check metrics returned
         assert "loss_critic" in metrics
         assert "loss_actor" in metrics
+
+    def test_evaluate_respects_loss_type(self, networks, params, shock_params, flat_data, monkeypatch):
+        """evaluate() should use configured critic loss family (mse/crossprod)."""
+        policy_net, value_net, price_net = networks
+
+        trainer_mse = RiskyDebtTrainerBR(
+            policy_net=policy_net,
+            value_net=value_net,
+            price_net=price_net,
+            params=params,
+            shock_params=shock_params,
+            optimizer_actor=tf.keras.optimizers.Adam(learning_rate=1e-3),
+            optimizer_critic=tf.keras.optimizers.Adam(learning_rate=1e-3),
+            weight_br=0.1,
+            n_critic_steps=1,
+            polyak_tau=0.9,
+            smoothing=AnnealingSchedule(init_temp=1.0, min_temp=0.01, decay_rate=0.9),
+            logit_clip=20.0,
+            loss_type="mse",
+        )
+
+        trainer_cross = RiskyDebtTrainerBR(
+            policy_net=policy_net,
+            value_net=value_net,
+            price_net=price_net,
+            params=params,
+            shock_params=shock_params,
+            optimizer_actor=tf.keras.optimizers.Adam(learning_rate=1e-3),
+            optimizer_critic=tf.keras.optimizers.Adam(learning_rate=1e-3),
+            weight_br=0.1,
+            n_critic_steps=1,
+            polyak_tau=0.9,
+            smoothing=AnnealingSchedule(init_temp=1.0, min_temp=0.01, decay_rate=0.9),
+            logit_clip=20.0,
+            loss_type="crossprod",
+        )
+
+        monkeypatch.setattr(risky_trainers_module, "compute_br_critic_loss_mse", lambda *args, **kwargs: tf.constant(111.0))
+        monkeypatch.setattr(risky_trainers_module, "compute_br_critic_loss_aio", lambda *args, **kwargs: tf.constant(222.0))
+
+        metrics_mse = trainer_mse.evaluate(
+            flat_data["k"], flat_data["b"], flat_data["z"],
+            flat_data["z_next_main"], flat_data["z_next_fork"],
+            temperature=0.1
+        )
+        metrics_cross = trainer_cross.evaluate(
+            flat_data["k"], flat_data["b"], flat_data["z"],
+            flat_data["z_next_main"], flat_data["z_next_fork"],
+            temperature=0.1
+        )
+
+        assert np.isclose(metrics_mse["loss_critic"], 111.0)
+        assert np.isclose(metrics_cross["loss_critic"], 222.0)

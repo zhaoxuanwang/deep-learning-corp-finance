@@ -17,9 +17,6 @@ Tests verify:
 
 import tensorflow as tf
 import pytest
-import shutil
-import os
-from pathlib import Path
 
 from src.economy.data_generator import DataGenerator, create_data_generator
 from src.economy.parameters import EconomicParams, ShockParams
@@ -28,15 +25,11 @@ from src.networks.network_basic import build_basic_networks
 
 
 @pytest.fixture
-def temp_cache_dir():
+def temp_cache_dir(tmp_path):
     """Temporary cache directory for test data."""
-    path = "tests/temp_data_cache_br"
-    if os.path.exists(path):
-        shutil.rmtree(path)
-    os.makedirs(path)
-    yield path
-    if os.path.exists(path):
-        shutil.rmtree(path)
+    path = tmp_path / "temp_data_cache_br"
+    path.mkdir(parents=True, exist_ok=True)
+    return str(path)
 
 
 @pytest.fixture

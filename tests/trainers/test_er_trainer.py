@@ -7,9 +7,6 @@ Tests for Euler Residual (ER) trainer with flattened data and target networks.
 import tensorflow as tf
 import pytest
 import numpy as np
-import shutil
-import os
-from pathlib import Path
 
 from src.economy.data_generator import DataGenerator
 from src.economy.parameters import EconomicParams, ShockParams
@@ -22,15 +19,11 @@ from src.networks.network_basic import build_basic_networks
 # =============================================================================
 
 @pytest.fixture
-def temp_cache_dir():
+def temp_cache_dir(tmp_path):
     """Temporary cache directory for data generation."""
-    path = "tests/temp_data_cache_er"
-    if os.path.exists(path):
-        shutil.rmtree(path)
-    os.makedirs(path)
-    yield path
-    if os.path.exists(path):
-        shutil.rmtree(path)
+    path = tmp_path / "temp_data_cache_er"
+    path.mkdir(parents=True, exist_ok=True)
+    return str(path)
 
 
 @pytest.fixture

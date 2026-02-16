@@ -112,10 +112,10 @@ def test_bond_grid_scaling(default_params):
     
     k_max_small = 10.0
     k_max_large = 1000.0
-    z_max = 1.0
+    z_min = 0.5
 
-    b_grid_small = grid_config.generate_bond_grid(default_params, k_max_small, z_max)
-    b_grid_large = grid_config.generate_bond_grid(default_params, k_max_large, z_max)
+    b_grid_small = grid_config.generate_bond_grid(default_params, k_max=k_max_small, z_min=z_min)
+    b_grid_large = grid_config.generate_bond_grid(default_params, k_max=k_max_large, z_min=z_min)
 
     # The upper bound of the large economy should be substantially higher
     scale_factor = b_grid_large[-1] / b_grid_small[-1]

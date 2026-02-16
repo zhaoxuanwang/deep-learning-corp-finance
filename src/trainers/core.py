@@ -23,6 +23,27 @@ from src.trainers.stopping import ConvergenceChecker, create_convergence_checker
 logger = logging.getLogger(__name__)
 
 
+def _with_metric_aliases(metrics: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Add stable canonical metric aliases while preserving legacy keys.
+    """
+    enriched = dict(metrics)
+    alias_map = {
+        "loss_LR": "train/lr_loss",
+        "loss_ER": "train/er_loss",
+        "loss_BR_reg": "train/br_reg_loss",
+        "loss_critic": "critic/loss",
+        "loss_actor": "actor/loss",
+        "loss_price": "price/loss",
+        "rel_mse": "critic/rel_mse",
+        "rel_mae": "critic/rel_mae",
+    }
+    for src, dst in alias_map.items():
+        if src in metrics and dst not in enriched:
+            enriched[dst] = metrics[src]
+    return enriched
+
+
 def execute_training_loop(
     trainer: Any,
     dataset: Iterator[Dict[str, tf.Tensor]],
@@ -30,7 +51,9 @@ def execute_training_loop(
     anneal_config: AnnealingConfig,
     method_name: str = "unknown",
     validation_data: Optional[Dict[str, tf.Tensor]] = None,
-    validation_fn: Optional[Callable] = None
+    validation_fn: Optional[Callable] = None,
+    required_batch_keys: Optional[set[str]] = None,
+    batch_adapter: Optional[Callable[[Dict[str, tf.Tensor]], Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """
     Execute the common training loop with optional early stopping.
@@ -79,41 +102,48 @@ def execute_training_loop(
     # Peek at first batch to validate format without consuming it
     first_batch = next(dataset)
 
-    # Detect method family from name (e.g., "basic_lr" -> "lr")
-    method_parts = method_name.lower().split('_')
-    method_family = None
-    for part in ['lr', 'er', 'br']:
-        if part in method_parts:
-            method_family = part
-            break
-
-    if method_family is None:
-        logger.warning(f"Could not detect method family from '{method_name}', skipping format validation")
-    else:
-        # Validate based on method family
+    if required_batch_keys is not None:
+        required = set(required_batch_keys)
         batch_keys = set(first_batch.keys())
+        if not required.issubset(batch_keys):
+            raise ValueError(
+                f"Method '{method_name}' requires batch keys {required}. "
+                f"Found keys: {batch_keys}."
+            )
+        logger.info(f"Dataset format validation passed for {method_name}")
+    else:
+        # Backward-compatible heuristic for older call sites.
+        method_parts = method_name.lower().split('_')
+        method_family = None
+        for part in ['lr', 'er', 'br']:
+            if part in method_parts:
+                method_family = part
+                break
 
-        if method_family == 'lr':
-            # LR methods require trajectory data
-            required_keys = {'k0', 'z_path'}
-            if not required_keys.issubset(batch_keys):
-                raise ValueError(
-                    f"Method '{method_name}' (LR family) requires TRAJECTORY data with keys {required_keys}.\n"
-                    f"Found keys: {batch_keys}\n"
-                    f"Use DataGenerator.get_training_dataset() or get_training_batches() for LR methods."
-                )
+        if method_family is None:
+            logger.warning(f"Could not detect method family from '{method_name}', skipping format validation")
+        else:
+            batch_keys = set(first_batch.keys())
 
-        elif method_family in ['er', 'br']:
-            # ER/BR methods require flattened data
-            required_keys = {'k', 'z', 'z_next_main', 'z_next_fork'}
-            if not required_keys.issubset(batch_keys):
-                raise ValueError(
-                    f"Method '{method_name}' ({method_family.upper()} family) requires FLATTENED data with keys {required_keys}.\n"
-                    f"Found keys: {batch_keys}\n"
-                    f"Use DataGenerator.get_flattened_training_dataset() for ER/BR methods."
-                )
+            if method_family == 'lr':
+                required_keys = {'k0', 'z_path'}
+                if not required_keys.issubset(batch_keys):
+                    raise ValueError(
+                        f"Method '{method_name}' (LR family) requires TRAJECTORY data with keys {required_keys}.\n"
+                        f"Found keys: {batch_keys}\n"
+                        f"Use DataGenerator.get_training_dataset() or get_training_batches() for LR methods."
+                    )
 
-        logger.info(f"Dataset format validation passed for {method_family.upper()} method")
+            elif method_family in ['er', 'br']:
+                required_keys = {'k', 'z', 'z_next_main', 'z_next_fork'}
+                if not required_keys.issubset(batch_keys):
+                    raise ValueError(
+                        f"Method '{method_name}' ({method_family.upper()} family) requires FLATTENED data with keys {required_keys}.\n"
+                        f"Found keys: {batch_keys}\n"
+                        f"Use DataGenerator.get_flattened_training_dataset() for ER/BR methods."
+                    )
+
+            logger.info(f"Dataset format validation passed for {method_family.upper()} method")
 
     # Create new iterator that includes the first batch
     # Use a generator to prepend the first batch
@@ -158,17 +188,21 @@ def execute_training_loop(
             break
         
         # 3. Prepare Arguments for train_step
-        # Map dataset keys (k0, z0, b0) to standardized keys (k, z, b) expected by trainers
-        train_args = {}
-        if "k0" in batch_states: train_args["k"] = batch_states["k0"]
-        if "z0" in batch_states: train_args["z"] = batch_states["z0"] 
-        if "b0" in batch_states: train_args["b"] = batch_states["b0"]
-        
-        # Combine all potential args
+        if batch_adapter is not None:
+            base_args = batch_adapter(batch_states)
+        else:
+            # Backward-compatible default adapter.
+            base_args = dict(batch_states)
+            if "k0" in batch_states:
+                base_args["k"] = batch_states["k0"]
+            if "z0" in batch_states:
+                base_args["z"] = batch_states["z0"]
+            if "b0" in batch_states:
+                base_args["b"] = batch_states["b0"]
+
         step_args = {
-            **batch_states,
-            **train_args,
-            "temperature": current_temp
+            **base_args,
+            "temperature": current_temp,
         }
         
         # Filter args based on trainer.train_step signature
@@ -186,6 +220,7 @@ def execute_training_loop(
 
         # 4. Train Step
         metrics = trainer.train_step(**filtered_args)
+        metrics = _with_metric_aliases(metrics)
         
         # 5. Logging
         if i % opt_config.log_every == 0 or i == 1:

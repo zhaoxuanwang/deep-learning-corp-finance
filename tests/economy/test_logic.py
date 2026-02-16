@@ -295,7 +295,7 @@ class TestEulerPrimitives:
 # === SECTION 5: Recovery & Pricing Tests ===
 
 class TestRecoveryAndPricing:
-    """Tests for recovery_value and pricing_residual_zero_profit."""
+    """Tests for recovery_value and pricing residual formulas."""
     
     def test_recovery_value_formula(self, params):
         """R = (1-α)[(1-τ)π + (1-δ)k']"""
@@ -356,6 +356,32 @@ class TestRecoveryAndPricing:
         )
         
         assert f.numpy() < 0
+
+    def test_pricing_residual_bond_price_zero_when_fair_no_default(self):
+        """Bond-price residual is zero at q=1/(1+r) when p_D=0."""
+        r_risk_free = 0.04
+        q_fair = tf.constant([1.0 / (1.0 + r_risk_free)])
+        b_next = tf.constant([1.0])
+        p_default = tf.constant([0.0])
+        recovery = tf.constant([0.0])
+
+        f = logic.pricing_residual_bond_price(
+            q_fair, b_next, r_risk_free, p_default, recovery
+        )
+        assert np.isclose(f.numpy(), 0.0, atol=1e-6)
+
+    def test_pricing_residual_bond_price_positive_when_q_too_high(self):
+        """Residual is positive when bond is overpriced (q too high)."""
+        r_risk_free = 0.04
+        q_high = tf.constant([1.2 / (1.0 + r_risk_free)])
+        b_next = tf.constant([1.0])
+        p_default = tf.constant([0.0])
+        recovery = tf.constant([0.0])
+
+        f = logic.pricing_residual_bond_price(
+            q_high, b_next, r_risk_free, p_default, recovery
+        )
+        assert f.numpy() > 0
 
 
 # === SECTION 6: Differentiability Tests ===
@@ -420,7 +446,6 @@ class TestDifferentiability:
         assert np.isfinite(grad.numpy()), "Gradient should be finite"
         # Gradient should be non-zero (from both convex and fixed cost)
         assert grad.numpy() != 0, "Gradient should be non-zero"
-
 
 
 

@@ -10,10 +10,12 @@ Allows resuming analysis without re-running expensive training.
 import json
 import os
 from pathlib import Path
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Union
 from dataclasses import asdict, is_dataclass
 
 import tensorflow as tf
+
+from src.trainers.results import TrainingResult
 
 
 def _get_custom_objects() -> Dict[str, Any]:
@@ -40,7 +42,7 @@ def _get_custom_objects() -> Dict[str, Any]:
 # =============================================================================
 
 def save_training_result(
-    result: Dict[str, Any],
+    result: Union[Dict[str, Any], TrainingResult],
     save_dir: str,
     name: str,
     overwrite: bool = False,
@@ -78,6 +80,9 @@ def save_training_result(
         >>> save_training_result(result, '../checkpoints', 'basic_br')
         Saved checkpoint to ../checkpoints/basic_br/
     """
+    if isinstance(result, TrainingResult):
+        result = result.to_legacy_dict()
+
     checkpoint_dir = Path(save_dir) / name
 
     if checkpoint_dir.exists() and not overwrite:

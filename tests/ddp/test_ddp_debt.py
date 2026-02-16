@@ -4,8 +4,7 @@ import numpy as np
 import dataclasses
 
 # Import key models
-from src.ddp.ddp_debt import DebtModelDDP
-from src.ddp import DDPGridConfig
+from src.ddp import DDPGridConfig, RiskyModelDDP
 from src.economy.parameters import EconomicParams, ShockParams
 
 
@@ -26,28 +25,27 @@ def test_generate_bond_grid_refined():
 
     # Define Economy Scale
     k_max = 100.0
-    z_max = 2.0
+    z_min = 0.5
 
     # 2. EXECUTE
-    b_grid = grid_config.generate_bond_grid(params, k_max, z_max)
+    b_grid = grid_config.generate_bond_grid(params, k_max=k_max, z_min=z_min)
 
-    # 3. VERIFY: LOWER BOUND (Savings)
-    # Formula: b_min = -1.5 * k_max
-    # Expected: -1.5 * 100 = -150.0
-    expected_b_min = -150.0
+    # 3. VERIFY: LOWER BOUND (Borrowing-only)
+    # Formula: b_min = 0
+    expected_b_min = 0.0
     assert np.isclose(b_grid[0], expected_b_min), \
-        f"Lower Bound (Savings) incorrect. Expected {expected_b_min}, Got {b_grid[0]}"
+        f"Lower Bound (Borrowing-only) incorrect. Expected {expected_b_min}, Got {b_grid[0]}"
 
     # 4. VERIFY: UPPER BOUND (Max Debt Capacity)
     # Formula components check:
 
-    # A. Max Output (y_max)
-    # y = z * k^theta = 2.0 * 100^0.5 = 2.0 * 10 = 20.0
-    y_max = 20.0
+    # A. Worst-state Output (y_min)
+    # y = z_min * k^theta = 0.5 * 100^0.5 = 0.5 * 10 = 5.0
+    y_min = 5.0
 
     # B. After-Tax Cash Flow
-    # (1 - tax) * y = 0.8 * 20 = 16.0
-    term_profit = (1 - 0.2) * y_max
+    # (1 - tax) * y_min = 0.8 * 5 = 4.0
+    term_profit = (1 - 0.2) * y_min
 
     # C. Tax Shield
     # tax * delta * k = 0.2 * 0.1 * 100 = 2.0
@@ -57,7 +55,7 @@ def test_generate_bond_grid_refined():
     # frac_liquid * k = 0.9 * 100 = 90.0
     term_collateral = 90.0
 
-    expected_b_max = term_profit + term_shield + term_collateral
+    expected_b_max = term_profit + term_shield + term_collateral  # 4 + 2 + 90 = 96
 
     assert np.isclose(b_grid[-1], expected_b_max), \
         f"Upper Bound (Max Debt) incorrect. Expected {expected_b_max}, Got {b_grid[-1]}"
@@ -69,40 +67,40 @@ def test_generate_bond_grid_refined():
 
 # --- 1. FIXTURE ---
 @pytest.fixture
-def model_debt():
+def model_risky():
     """
-    Standard fixture for creating a DebtModelDDP instance.
+    Standard fixture for creating a RiskyModelDDP instance.
     Uses small grids for speed, but real parameters.
     """
     params = EconomicParams(r_rate=0.04)
     shock_params = ShockParams()
     grid_config = DDPGridConfig(z_size=2, k_size=5, b_size=4, grid_type="log_linear")
-    return DebtModelDDP(params, shock_params, grid_config)
+    return RiskyModelDDP(params, shock_params, grid_config)
 
 
 # --- 2. INITIALIZATION TESTS ---
 
-def test_initialization_shapes_and_types(model_debt):
+def test_initialization_shapes_and_types(model_risky):
     """
     Verifies that the model initializes dimensions, grids, and tensors correctly.
     """
     # 1. Scalar Attributes
     # Beta = 1 / (1.04) ~ 0.9615
-    expected_beta = 1 / (1 + model_debt.params.r_rate)
-    assert np.isclose(model_debt.beta.numpy(), expected_beta), "Beta calculation incorrect"
+    expected_beta = 1 / (1 + model_risky.params.r_rate)
+    assert np.isclose(model_risky.beta.numpy(), expected_beta), "Beta calculation incorrect"
 
     # 2. Dimensions
-    assert model_debt.nz == 2
-    assert model_debt.nk == 5
-    assert model_debt.nb == 4
+    assert model_risky.nz == 2
+    assert model_risky.nk == 5
+    assert model_risky.nb == 4
 
     # 3. TensorFlow Conversions
-    assert isinstance(model_debt.z_grid, tf.Tensor)
-    assert isinstance(model_debt.k_grid, tf.Tensor)
-    assert isinstance(model_debt.b_grid, tf.Tensor)
+    assert isinstance(model_risky.z_grid, tf.Tensor)
+    assert isinstance(model_risky.k_grid, tf.Tensor)
+    assert isinstance(model_risky.b_grid, tf.Tensor)
 
     # Check Dtypes (Critical for GPU)
-    assert model_debt.prob_matrix.dtype == tf.float32
+    assert model_risky.prob_matrix.dtype == tf.float32
 
 
 def test_initialization_dynamic_grid_size():
@@ -115,12 +113,12 @@ def test_initialization_dynamic_grid_size():
     
     # Case A: Log Linear (Fixed Request)
     grid_fixed = DDPGridConfig(k_size=10, grid_type="log_linear")
-    model_fixed = DebtModelDDP(params, shock_params, grid_fixed)
+    model_fixed = RiskyModelDDP(params, shock_params, grid_fixed)
     assert model_fixed.nk == 10, "Log_linear should preserve requested k_size"
 
     # Case B: Delta Rule (Dynamic Request)
     grid_dynamic = DDPGridConfig(k_size=10, grid_type="delta_rule")
-    model_dynamic = DebtModelDDP(params, shock_params, grid_dynamic)
+    model_dynamic = RiskyModelDDP(params, shock_params, grid_dynamic)
 
     actual_tensor_len = model_dynamic.k_grid.shape[0]
 
@@ -131,7 +129,7 @@ def test_initialization_dynamic_grid_size():
 
 # --- 3. BOND PRICING TESTS ---
 
-def test_compute_bond_price_logic(model_debt):
+def test_compute_bond_price_logic(model_risky):
     """
     CRITICAL TEST: Verifies the equilibrium pricing logic.
     Checks that:
@@ -141,12 +139,12 @@ def test_compute_bond_price_logic(model_debt):
     4. Prices NEVER go negative (Limited Liability).
     """
     # Risk Free Price (Maximum possible price)
-    rf_price = 1.0 / (1 + model_debt.params.r_rate)
+    rf_price = 1.0 / (1 + model_risky.params.r_rate)
 
     # --- SCENARIO A: The "Safe" Firm ---
     # We force V_next to be positive everywhere (Solvent)
-    v_solvent = tf.ones((model_debt.nz, model_debt.nk, model_debt.nb))
-    q_solvent = model_debt._compute_bond_price(v_solvent)
+    v_solvent = tf.ones((model_risky.nz, model_risky.nk, model_risky.nb))
+    q_solvent = model_risky._compute_bond_price(v_solvent)
 
     # Assert: Price should be effectively Risk-Free
     # Allow small float error (1e-6)
@@ -155,19 +153,19 @@ def test_compute_bond_price_logic(model_debt):
     assert diff.numpy() < 1e-6, "Solvent firm didn't get risk-free rate"
 
     # --- SCENARIO B: The "Defaulting" Firm ---
-    v_default = -1.0 * tf.ones((model_debt.nz, model_debt.nk, model_debt.nb))
-    q_default = model_debt._compute_bond_price(v_default)
+    v_default = -1.0 * tf.ones((model_risky.nz, model_risky.nk, model_risky.nb))
+    q_default = model_risky._compute_bond_price(v_default)
 
-    # Get the b_grid to distinguish Borrowing from Saving
-    b_grid_vals = model_debt.b_grid.numpy()
+    # Get b-grid slices for non-borrowing (b=0) vs positive debt (b>0).
+    b_grid_vals = model_risky.b_grid.numpy()
 
-    # 1. CHECK SAVINGS (b <= 0): Should be Risk-Free
+    # 1. CHECK NON-BORROWING (b <= 0): Should be Risk-Free
     # We look for indices where b <= 0
-    savings_indices = np.where(b_grid_vals <= 0)[0]
-    if len(savings_indices) > 0:
-        q_savings = tf.gather(q_default, savings_indices, axis=2)
-        diff = tf.reduce_max(tf.abs(q_savings - rf_price))
-        assert diff < 1e-6, "Savings should be Risk-Free even in default (Bank returns deposit)."
+    no_borrow_indices = np.where(b_grid_vals <= 0)[0]
+    if len(no_borrow_indices) > 0:
+        q_no_borrow = tf.gather(q_default, no_borrow_indices, axis=2)
+        diff = tf.reduce_max(tf.abs(q_no_borrow - rf_price))
+        assert diff < 1e-6, "Non-borrowing states should be priced at the risk-free rate."
 
     # 2. CHECK DEBT (b > 0): Should be Risky (if Recovery < Debt)
     borrow_indices = np.where(b_grid_vals > 0)[0]
@@ -192,7 +190,7 @@ def test_compute_bond_price_logic(model_debt):
     assert min_price >= 0.0, f"Price negative! Min: {min_price}"
 
 
-def test_compute_reward_matrix_shapes_and_values(model_debt):
+def test_compute_reward_matrix_shapes_and_values(model_risky):
     """
     Verifies the 5D reward matrix calculation.
     1. Shape Check: Ensures dimensions (nz, nk, nk, nb, nb) are correct.
@@ -202,14 +200,14 @@ def test_compute_reward_matrix_shapes_and_values(model_debt):
     # 1. SETUP: Create a Mock Price Schedule
     # We assume Price = 1.0 everywhere to make math simple for the audit
     # Shape needed: (nz, nk, nb) -> indices correspond to (z, k_next, b_next)
-    q_mock = tf.ones((model_debt.nz, model_debt.nk, model_debt.nb))
+    q_mock = tf.ones((model_risky.nz, model_risky.nk, model_risky.nb))
 
     # 2. EXECUTE
-    rewards_5d = model_debt._compute_reward_matrix(q_mock)
+    rewards_5d = model_risky._compute_reward_matrix(q_mock)
 
     # 3. VERIFY SHAPE
     # Expected: (nz, nk_curr, nk_next, nb_curr, nb_next)
-    expected_shape = (model_debt.nz, model_debt.nk, model_debt.nk, model_debt.nb, model_debt.nb)
+    expected_shape = (model_risky.nz, model_risky.nk, model_risky.nk, model_risky.nb, model_risky.nb)
     assert rewards_5d.shape == expected_shape, \
         f"Reward matrix shape mismatch. Expected {expected_shape}, Got {rewards_5d.shape}"
 
@@ -219,14 +217,14 @@ def test_compute_reward_matrix_shapes_and_values(model_debt):
 
     # A. Extract Raw Values from Grids
     # Note: Use .numpy() for scalar extraction
-    z_val = model_debt.z_grid[0].numpy()
-    k_curr_val = model_debt.k_grid[0].numpy()
-    k_next_val = model_debt.k_grid[1].numpy()
-    b_curr_val = model_debt.b_grid[0].numpy()
-    b_next_val = model_debt.b_grid[1].numpy()
+    z_val = model_risky.z_grid[0].numpy()
+    k_curr_val = model_risky.k_grid[0].numpy()
+    k_next_val = model_risky.k_grid[1].numpy()
+    b_curr_val = model_risky.b_grid[0].numpy()
+    b_next_val = model_risky.b_grid[1].numpy()
 
     # B. Manual Calculation of the Budget Constraint
-    p = model_debt.params
+    p = model_risky.params
 
     # Operating Profit
     profit = (1 - p.tax) * z_val * (k_curr_val ** p.theta)
@@ -284,21 +282,21 @@ def test_compute_reward_matrix_shapes_and_values(model_debt):
         """
 
 
-def test_equity_issuance_cost_trigger(model_debt):
+def test_equity_issuance_cost_trigger(model_risky):
     """
     Verifies that equity issuance costs strictly lower the reward
     when dividends are negative.
     """
     # 0. SETUP: Ensure we have a model WITH explicit injection costs
     params_with_cost = dataclasses.replace(
-        model_debt.params,
+        model_risky.params,
         cost_inject_fixed=0.1,
         cost_inject_linear=0.1
     )
-    model_costly = DebtModelDDP(params_with_cost, model_debt.shock_params, model_debt.grid_config)
+    model_costly = RiskyModelDDP(params_with_cost, model_risky.shock_params, model_risky.grid_config)
     
     # 1. BASELINE: Calculate rewards WITH costs
-    q_mock = tf.ones((model_debt.nz, model_debt.nk, model_debt.nb))
+    q_mock = tf.ones((model_risky.nz, model_risky.nk, model_risky.nb))
     rewards_with_cost = model_costly._compute_reward_matrix(q_mock)
 
     # Find a cell where investment is huge (Small k -> Big k) to force negative dividends
@@ -312,14 +310,14 @@ def test_equity_issuance_cost_trigger(model_debt):
     # 2. EXPERIMENT: Create a NEW model WITHOUT costs
     # We use dataclasses.replace to clone the params but change specific fields
     params_no_cost = dataclasses.replace(
-        model_debt.params,
+        model_risky.params,
         cost_inject_fixed=0.0,
         cost_inject_linear=0.0
     )
 
     # Re-initialize the model with these cheap parameters
     # (Since grids depend on params, it's safer to make a fresh instance)
-    model_cheap = DebtModelDDP(params_no_cost, model_debt.shock_params, model_debt.grid_config)
+    model_cheap = RiskyModelDDP(params_no_cost, model_risky.shock_params, model_risky.grid_config)
 
     rewards_no_cost = model_cheap._compute_reward_matrix(q_mock)
     reward_no_cost = rewards_no_cost[cell_idx]
@@ -332,11 +330,11 @@ def test_equity_issuance_cost_trigger(model_debt):
 
 
 # --- Bellman Test 1: Optimization Logic ---
-def test_bellman_optimization(model_debt):
+def test_bellman_optimization(model_risky):
     """
     Verifies the agent correctly identifies the maximum reward index.
     """
-    nz, nk, nb = model_debt.nz, model_debt.nk, model_debt.nb
+    nz, nk, nb = model_risky.nz, model_risky.nk, model_risky.nb
 
     # Setup: Zero future value, zero reward everywhere except one "needle in haystack"
     v_curr_zero = tf.zeros((nz, nk, nb))
@@ -348,7 +346,7 @@ def test_bellman_optimization(model_debt):
     reward_tf = tf.constant(reward_needle)
 
     # Execute
-    v_next = model_debt._compute_bellman_step(v_curr_zero, reward_tf)
+    v_next = model_risky._compute_bellman_step(v_curr_zero, reward_tf)
 
     # Assert
     val_opt = v_next[0, 0, 0].numpy()
@@ -359,39 +357,39 @@ def test_bellman_optimization(model_debt):
 
 
 # --- Test 2: Discounting Logic ---
-def test_bellman_discounting(model_debt):
+def test_bellman_discounting(model_risky):
     """
     Verifies that future values are correctly discounted by beta.
     """
-    nz, nk, nb = model_debt.nz, model_debt.nk, model_debt.nb
+    nz, nk, nb = model_risky.nz, model_risky.nk, model_risky.nb
 
     # Setup: Constant future value of 100, zero current reward
     v_curr_100 = tf.ones((nz, nk, nb)) * 100.0
     reward_zero = tf.zeros((nz, nk, nk, nb, nb))
 
     # Execute
-    v_next = model_debt._compute_bellman_step(v_curr_100, reward_zero)
+    v_next = model_risky._compute_bellman_step(v_curr_100, reward_zero)
 
     # Assert
-    expected_val = model_debt.beta.numpy() * 100.0
+    expected_val = model_risky.beta.numpy() * 100.0
     avg_val = np.mean(v_next.numpy())
 
     np.testing.assert_allclose(avg_val, expected_val, rtol=1e-5, err_msg="Discounting beta applied incorrectly.")
 
 
 # --- Test 3: Limited Liability ---
-def test_bellman_limited_liability(model_debt):
+def test_bellman_limited_liability(model_risky):
     """
     Verifies that the firm defaults (value = 0) if total value is negative.
     """
-    nz, nk, nb = model_debt.nz, model_debt.nk, model_debt.nb
+    nz, nk, nb = model_risky.nz, model_risky.nk, model_risky.nb
 
     # Setup: Huge negative reward, zero future value
     v_curr_zero = tf.zeros((nz, nk, nb))
     reward_loss = tf.ones((nz, nk, nk, nb, nb)) * -1000.0
 
     # Execute
-    v_next = model_debt._compute_bellman_step(v_curr_zero, reward_loss)
+    v_next = model_risky._compute_bellman_step(v_curr_zero, reward_loss)
 
     # Assert
     min_val = np.min(v_next.numpy())
@@ -399,12 +397,12 @@ def test_bellman_limited_liability(model_debt):
 
 
 # --- Test 4: Expectation / Probability Mixing ---
-def test_bellman_expectation_mixing(model_debt):
+def test_bellman_expectation_mixing(model_risky):
     """
     Verifies the matrix multiplication for expected value E[V].
     Uses a manual probability matrix to ensure deterministic calculation.
     """
-    nz, nk, nb = model_debt.nz, model_debt.nk, model_debt.nb
+    nz, nk, nb = model_risky.nz, model_risky.nk, model_risky.nb
 
     # Note: Requires at least 2 states
     if nz < 2:
@@ -417,30 +415,30 @@ def test_bellman_expectation_mixing(model_debt):
 
     # Setup Prob Matrix: 50/50 transition from State 0 to (0, 1)
     # We patch the instance only for this test
-    original_prob = model_debt.prob_matrix
+    original_prob = model_risky.prob_matrix
     p_manual = np.zeros((nz, nz), dtype=np.float32)
     p_manual[0, 0] = 0.5
     p_manual[0, 1] = 0.5
     p_manual[1, 1] = 1.0  # Absorb in state 1
-    model_debt.prob_matrix = tf.constant(p_manual)
+    model_risky.prob_matrix = tf.constant(p_manual)
 
     try:
         # Execute
         reward_zero = tf.zeros((nz, nk, nk, nb, nb))
-        v_next = model_debt._compute_bellman_step(v_mixed, reward_zero)
+        v_next = model_risky._compute_bellman_step(v_mixed, reward_zero)
 
         # Assert: State 0 should be beta * (0.5*0 + 0.5*100) = beta * 50
-        expected_val = model_debt.beta.numpy() * 50.0
+        expected_val = model_risky.beta.numpy() * 50.0
         actual_val = v_next[0, 0, 0].numpy()
 
         np.testing.assert_allclose(actual_val, expected_val, err_msg="Expectation matrix math failed.")
 
     finally:
         # Clean up: Restore original matrix even if test fails
-        model_debt.prob_matrix = original_prob
+        model_risky.prob_matrix = original_prob
 
 
-def test_solve_vfi_geometric_series(model_debt):
+def test_solve_vfi_geometric_series(model_risky):
     """
     GOLD STANDARD TEST: Verifies convergence to the theoretical limit.
 
@@ -457,16 +455,16 @@ def test_solve_vfi_geometric_series(model_debt):
 
     # Create a reward matrix where EVERY transition gives 10.0
     # Shape: (nz, nk, nk, nb, nb)
-    shape_5d = (model_debt.nz, model_debt.nk, model_debt.nk, model_debt.nb, model_debt.nb)
+    shape_5d = (model_risky.nz, model_risky.nk, model_risky.nk, model_risky.nb, model_risky.nb)
     reward_constant = reward_cons * tf.ones(shape_5d)
 
     # 2. EXECUTE
     # Use a strict tolerance to check precision
     # Note: We assume you have implemented _extract_policy, otherwise this will crash.
-    v_converged, policy = model_debt.solve_vfi(reward_constant, tol=1e-6, max_iter=2000)
+    v_converged, policy = model_risky.solve_vfi(reward_constant, tol=1e-6, max_iter=2000)
 
     # 3. VERIFY THEORETICAL LIMIT
-    beta = model_debt.beta.numpy()
+    beta = model_risky.beta.numpy()
     expected_value = reward_cons / (1.0 - beta)  # e.g., 10 / 0.04 = 250.0
 
     # Calculate error
@@ -489,16 +487,16 @@ def test_solve_vfi_geometric_series(model_debt):
     assert np.mean(actual_values) > 10.0, "VFI didn't seem to iterate (Value is too low)."
 
 
-def test_solve_vfi_max_iter_cutoff(model_debt):
+def test_solve_vfi_max_iter_cutoff(model_risky):
     """
     Verifies that the solver respects the max_iter argument (Safety Break).
     """
     reward = 10.0
-    reward_constant = reward * tf.ones((model_debt.nz, model_debt.nk, model_debt.nk, model_debt.nb, model_debt.nb))
+    reward_constant = reward * tf.ones((model_risky.nz, model_risky.nk, model_risky.nk, model_risky.nb, model_risky.nb))
 
     # Run for exactly 1 iteration
     # Start (0) -> Step 1 (Reward + beta*0) = 10.0
-    v_1step, _ = model_debt.solve_vfi(reward_constant, max_iter=1)
+    v_1step, _ = model_risky.solve_vfi(reward_constant, max_iter=1)
 
     # The value should be exactly R (first term of series)
     expected_val = reward
@@ -508,7 +506,7 @@ def test_solve_vfi_max_iter_cutoff(model_debt):
         f"Max Iteration limit ignored. Expected {expected_val} (1 step), Got {actual_val}"
 
 
-def test_solve_risky_bond_integration(model_debt):
+def test_solve_risky_bond_integration(model_risky):
     """
     INTEGRATION TEST: Runs the full Outer Loop (Price Equilibrium).
 
@@ -516,17 +514,17 @@ def test_solve_risky_bond_integration(model_debt):
     1. Execution: Runs without crashing.
     2. Bounds: Prices are within [0, RiskFree].
     3. Logic: High debt should carry a risk premium (lower price)
-              compared to savings (risk-free price).
+              compared to the non-borrowing point (risk-free price).
     """
     # 1. EXECUTE
-    v_star, policy, q_star = model_debt.solve_risky_debt_vfi()
+    v_star, policy, q_star = model_risky.solve_risky_vfi()
 
     # 2. CHECK OUTPUT TYPES
     assert v_star is not None
     assert q_star is not None
 
     # 3. CHECK BOUNDS (No Arbitrage)
-    rf_price = 1.0 / (1 + model_debt.params.r_rate)
+    rf_price = 1.0 / (1 + model_risky.params.r_rate)
 
     # Max price must not exceed Risk-Free (allow tiny float error)
     max_q = tf.reduce_max(q_star).numpy()
@@ -537,29 +535,67 @@ def test_solve_risky_bond_integration(model_debt):
     assert min_q >= 0.0, "Negative bond prices found!"
 
     # 4. CHECK RISK SPREADS
-    # Compare Price of Savings (b < 0) vs Price of High Debt (b > 0)
-    # We average over z and k to look at the 'pure' effect of debt
+    # Compare the non-borrowing point (b=0) vs the highest debt point (b=max).
+    # We average over z and k to isolate the pure debt-level effect.
     avg_price_by_debt = tf.reduce_mean(q_star, axis=[0, 1]).numpy()
 
     # Identify indices
-    b_grid = model_debt.b_grid.numpy()
-    savings_idx = 0  # Most negative b (Savings)
-    debt_idx = -1  # Most positive b (High Debt)
+    b_grid = model_risky.b_grid.numpy()
+    no_borrow_idx = 0
+    high_debt_idx = -1
 
-    p_savings = avg_price_by_debt[savings_idx]
-    p_debt = avg_price_by_debt[debt_idx]
+    p_no_borrow = avg_price_by_debt[no_borrow_idx]
+    p_high_debt = avg_price_by_debt[high_debt_idx]
 
-    # Assert Savings are priced ~ Risk Free
-    # Note: If b_grid[0] is negative, it's a deposit -> Risk Free
-    if b_grid[savings_idx] <= 0:
-        assert np.isclose(p_savings, rf_price, atol=1e-3), \
-            "Savings should be priced at Risk-Free rate."
+    # Assert non-borrowing states are priced approximately at the risk-free rate.
+    if b_grid[no_borrow_idx] <= 0:
+        assert np.isclose(p_no_borrow, rf_price, atol=1e-3), \
+            "Non-borrowing states should be priced at the risk-free rate."
 
-    # Assert Debt is priced lower (Risk Premium)
+    # Assert high debt is priced lower (positive risk premium)
     # Note: This assertion assumes the model is calibrated such that default is possible.
-    # If parameters are too safe, p_debt might equal p_savings.
+    # If parameters are too safe, p_high_debt might equal p_no_borrow.
     # We use <= to be safe, but ideally <.
-    assert p_debt <= p_savings, \
-        "Curve inversion! Debt is more expensive than savings?"
+    assert p_high_debt <= p_no_borrow, \
+        "Curve inversion: high debt is priced above the non-borrowing point."
 
-    print(f"\n    Market Prices checked: Savings={p_savings:.4f}, Debt={p_debt:.4f}")
+    print(f"\n    Market prices checked: no-borrow={p_no_borrow:.4f}, high-debt={p_high_debt:.4f}")
+
+
+def test_inner_vfi_pfi_consistency(model_risky):
+    """
+    VFI and PFI should agree on the same fixed-price inner firm problem.
+    """
+    q_rf = tf.ones((model_risky.nz, model_risky.nk, model_risky.nb), dtype=tf.float32)
+    q_rf = q_rf / (1 + model_risky.params.r_rate)
+    reward_matrix = model_risky._compute_reward_matrix(q_rf)
+
+    v_vfi, (pk_vfi, pb_vfi) = model_risky.solve_vfi(
+        reward_matrix, tol=1e-5, max_iter=1200
+    )
+    v_pfi, (pk_pfi, pb_pfi) = model_risky.solve_pfi(
+        reward_matrix, max_iter=120, eval_steps=300
+    )
+
+    max_val_diff = float(np.max(np.abs(v_vfi.numpy() - v_pfi.numpy())))
+    assert max_val_diff < 5e-2, f"Inner VFI/PFI value mismatch: {max_val_diff}"
+    assert pk_vfi.shape == pk_pfi.shape == (model_risky.nz, model_risky.nk, model_risky.nb)
+    assert pb_vfi.shape == pb_pfi.shape == (model_risky.nz, model_risky.nk, model_risky.nb)
+
+
+def test_solve_risky_bond_with_inner_pfi(model_risky):
+    """
+    Full outer-loop equilibrium should also run with inner PFI.
+    """
+    v_star, policy, q_star = model_risky.solve_risky_pfi(
+        max_iter=5,
+        inner_pfi_max_iter=40,
+        inner_pfi_eval_steps=120,
+    )
+
+    rf_price = 1.0 / (1 + model_risky.params.r_rate)
+    assert v_star.shape == (model_risky.nz, model_risky.nk, model_risky.nb)
+    assert q_star.shape == (model_risky.nz, model_risky.nk, model_risky.nb)
+    assert tf.reduce_min(q_star).numpy() >= 0.0
+    assert tf.reduce_max(q_star).numpy() <= rf_price + 1e-5
+    assert isinstance(policy, tuple) and len(policy) == 2

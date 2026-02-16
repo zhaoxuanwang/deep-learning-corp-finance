@@ -248,31 +248,39 @@ class ConvergenceChecker:
             2. Policy Stability: Actor value relative improvement < epsilon_act
 
         """
-        critic_key = 'loss_critic'
-        actor_key = 'loss_actor'
+        # Actor-Critic BR: use critic + actor keys
+        if 'loss_critic' in metrics and 'loss_actor' in metrics:
+            critic_loss = metrics['loss_critic']
+            actor_loss = metrics['loss_actor']
 
-        if critic_key not in metrics or actor_key not in metrics:
-            return False
+            critic_converged = abs(critic_loss) < self.br_critic_epsilon
 
-        critic_loss = metrics[critic_key]
-        actor_loss = metrics[actor_key]
+            self.state.loss_history.append(actor_loss)
+            actor_converged = False
+            if len(self.state.loss_history) >= self.lr_window + 1:
+                past_actor = self.state.loss_history[-self.lr_window - 1]
+                if abs(past_actor) > DEFAULT_DIVISION_EPSILON:
+                    relative_change = (actor_loss - past_actor) / abs(past_actor)
+                    actor_converged = abs(relative_change) < self.br_actor_epsilon
 
-        # Condition 1: Critic accuracy (loss close to zero)
-        critic_converged = abs(critic_loss) < self.br_critic_epsilon
+            return critic_converged and actor_converged
 
-        # Condition 2: Actor stability (use similar logic to LR)
-        # Track actor loss history
-        self.state.loss_history.append(actor_loss)
+        # BR regression variants: use combined objective.
+        if 'loss_BR_reg' in metrics:
+            current_loss = metrics['loss_BR_reg']
+            objective_converged = abs(current_loss) < self.br_critic_epsilon
 
-        actor_converged = False
-        if len(self.state.loss_history) >= self.lr_window + 1:
-            past_actor = self.state.loss_history[-self.lr_window - 1]
-            if abs(past_actor) > DEFAULT_DIVISION_EPSILON:
-                relative_change = (actor_loss - past_actor) / abs(past_actor)
-                actor_converged = abs(relative_change) < self.br_actor_epsilon
+            self.state.loss_history.append(current_loss)
+            stability_converged = False
+            if len(self.state.loss_history) >= self.lr_window + 1:
+                past_loss = self.state.loss_history[-self.lr_window - 1]
+                if abs(past_loss) > DEFAULT_DIVISION_EPSILON:
+                    relative_change = (current_loss - past_loss) / abs(past_loss)
+                    stability_converged = abs(relative_change) < self.br_actor_epsilon
 
-        # Both conditions must be met
-        return critic_converged and actor_converged
+            return objective_converged and stability_converged
+
+        return False
 
 
 def create_convergence_checker(

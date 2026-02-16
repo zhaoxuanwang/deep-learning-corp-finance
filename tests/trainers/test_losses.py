@@ -14,10 +14,13 @@ from src.trainers.losses import (
     compute_lr_loss,
     compute_lr_loss_risky,
     compute_er_loss_aio,
+    compute_er_loss_mse,
     compute_br_critic_loss_aio,
+    compute_br_critic_loss_mse,
     compute_br_actor_loss,
     compute_br_actor_loss_risky,
     compute_price_loss_aio,
+    compute_price_loss_mse,
     compute_critic_objective,
 )
 from src.economy.logic import (
@@ -80,6 +83,16 @@ class TestERLoss:
         # (1*3 + 2*4) / 2 = (3 + 8) / 2 = 5.5
         expected = 5.5
         assert np.isclose(loss.numpy(), expected)
+
+    def test_er_mse_loss(self):
+        """ER MSE loss = mean(0.5 * (f1^2 + f2^2))."""
+        f1 = tf.constant([[1.0], [2.0]])
+        f2 = tf.constant([[3.0], [4.0]])
+
+        loss = compute_er_loss_mse(f1, f2)
+
+        expected = (0.5 * (1.0**2 + 3.0**2) + 0.5 * (2.0**2 + 4.0**2)) / 2.0
+        assert np.isclose(loss.numpy(), expected)
     
     def test_euler_chi(self):
         """euler_chi = 1 + psi_I where psi_I = phi_0 * I / k."""
@@ -116,6 +129,16 @@ class TestBRLoss:
         # products: 0.2*0.1 = 0.02 and 0.2*0.1 = 0.02
         # mean: 0.02
         expected = ((1.0-0.8)*(1.0-0.9) + (2.0-1.8)*(2.0-1.9)) / 2
+        assert np.isclose(loss.numpy(), expected)
+
+    def test_critic_loss_mse(self):
+        """Critic MSE loss = mean(0.5 * ((V-y1)^2 + (V-y2)^2))."""
+        V = tf.constant([[1.0], [2.0]])
+        y1 = tf.constant([[0.8], [1.8]])
+        y2 = tf.constant([[0.9], [1.9]])
+
+        loss = compute_br_critic_loss_mse(V, y1, y2)
+        expected = (0.5 * ((0.2**2 + 0.1**2)) + 0.5 * ((0.2**2 + 0.1**2))) / 2.0
         assert np.isclose(loss.numpy(), expected)
     
     def test_actor_loss_main_shock_only(self):
@@ -162,6 +185,15 @@ class TestPriceLoss:
         loss = compute_price_loss_aio(f1, f2)
         
         expected = (0.01 + 0.04) / 2
+        assert np.isclose(loss.numpy(), expected)
+
+    def test_price_loss_mse(self):
+        """Price MSE loss = mean(0.5 * (f1^2 + f2^2))."""
+        f1 = tf.constant([[0.1], [0.2]])
+        f2 = tf.constant([[0.3], [0.4]])
+
+        loss = compute_price_loss_mse(f1, f2)
+        expected = (0.5 * (0.1**2 + 0.3**2) + 0.5 * (0.2**2 + 0.4**2)) / 2.0
         assert np.isclose(loss.numpy(), expected)
     
     def test_pricing_residual_formula(self):

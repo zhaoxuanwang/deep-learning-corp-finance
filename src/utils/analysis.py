@@ -10,6 +10,9 @@ import numpy as np
 import matplotlib.pyplot as plt
 from typing import Dict, Any, Optional
 
+from src.economy.grids import generate_state_grids
+from src.economy.parameters import EconomicParams
+
 def summarize_stored_metadata(file_path: str):
     """
     Load and summarize the metadata stored in a .npz dataset file.
@@ -47,10 +50,17 @@ def summarize_stored_metadata(file_path: str):
         for k, v in dims.items():
             print(f"  {k}: {v}")
             
-        params = metadata.get("params", {})
-        print("\nParameters:")
-        for k, v in params.items():
-            print(f"  {k}: {v}")
+        bounds = metadata.get("bounds", {})
+        if bounds:
+            print("\nBounds:")
+            for k, v in bounds.items():
+                print(f"  {k}: {v}")
+
+        shock_params = metadata.get("shock_params", {})
+        if shock_params:
+            print("\nShock Params:")
+            for k, v in shock_params.items():
+                print(f"  {k}: {v}")
 
         print("-" * 40)
 
@@ -189,12 +199,24 @@ def compute_frictionless_policy(z, params, shock_params):
 # POLICY EVALUATION
 # =============================================================================
 
+def _resolve_delta_from_result(result_dict: Dict[str, Any]) -> float:
+    """
+    Resolve depreciation rate for multiplicative capital grid construction.
+    """
+    default_delta = float(EconomicParams.delta)
+    params_obj = result_dict.get("params") or result_dict.get("_params")
+    if params_obj is None:
+        return default_delta
+    if isinstance(params_obj, dict):
+        return float(params_obj.get("delta", default_delta))
+    return float(getattr(params_obj, "delta", default_delta))
+
+
 def evaluate_policy(
     result: Dict[str, Any],
     k_bounds: tuple,
     logz_bounds: tuple,
     b_bounds: Optional[tuple] = None,
-    n_k: int = 100,
     n_z: int = 50,
     n_b: int = 100,
     # Fixed indices (alternative to fixed values)
@@ -212,6 +234,9 @@ def evaluate_policy(
     Discretizes the learned optimal policy onto regular grids. Supports both
     the basic model (k, z) and risky debt model (k, b, z).
 
+    The capital grid size is determined automatically by the multiplicative
+    grid scheme (depends on k_bounds and the depreciation rate delta).
+
     Args:
         result: Training result dictionary from train_basic_* or train_risky_*.
                 Must contain '_policy_net' key with the trained policy network.
@@ -219,10 +244,9 @@ def evaluate_policy(
         logz_bounds: (min, max) for log-productivity grid.
         b_bounds: (min, max) for debt grid. Required for risky debt model,
                   ignored for basic model.
-        n_k: Number of grid points for capital (default: 50).
-        n_z: Number of grid points for productivity (default: 15).
-        n_b: Number of grid points for debt (default: 10). Ignored for basic model.
-        fixed_k_idx: Index for fixed capital slice (0 to n_k-1).
+        n_z: Number of grid points for productivity (default: 50).
+        n_b: Number of grid points for debt (default: 100). Ignored for basic model.
+        fixed_k_idx: Index for fixed capital slice.
         fixed_z_idx: Index for fixed productivity slice (0 to n_z-1).
         fixed_b_idx: Index for fixed debt slice (0 to n_b-1). Ignored for basic model.
         fixed_k_val: Fixed capital value (overrides fixed_k_idx if provided).
@@ -234,7 +258,8 @@ def evaluate_policy(
             Basic Model (2D grids):
                 - 'k': Capital mesh (n_k, n_z)
                 - 'z': Productivity mesh (n_k, n_z)
-                - 'logz': Log-productivity mesh (n_k, n_z)
+                - 'log_z': Log-productivity mesh (n_k, n_z)
+                - 'logz': Legacy alias of 'log_z'
                 - 'k_next': Policy output for k' (n_k, n_z)
                 - 'b_next': None (not applicable)
                 - 'fixed_k_val': Scalar value of fixed k
@@ -246,7 +271,8 @@ def evaluate_policy(
             Risky Debt Model (3D grids):
                 - 'k': Capital mesh (n_k, n_z, n_b)
                 - 'z': Productivity mesh (n_k, n_z, n_b)
-                - 'logz': Log-productivity mesh (n_k, n_z, n_b)
+                - 'log_z': Log-productivity mesh (n_k, n_z, n_b)
+                - 'logz': Legacy alias of 'log_z'
                 - 'b': Debt mesh (n_k, n_z, n_b)
                 - 'k_next': Policy output for k' (n_k, n_z, n_b)
                 - 'b_next': Policy output for b' (n_k, n_z, n_b)
@@ -259,7 +285,8 @@ def evaluate_policy(
             Common:
                 - 'k_vals': 1D array of capital grid values
                 - 'z_vals': 1D array of productivity grid values
-                - 'logz_vals': 1D array of log-productivity grid values
+                - 'log_z_vals': 1D array of log-productivity grid values
+                - 'logz_vals': Legacy alias of 'log_z_vals'
                 - 'b_vals': 1D array of debt grid values (or None for basic)
                 - 'fixed_k_idx': Index used for fixed k
                 - 'fixed_z_idx': Index used for fixed z
@@ -311,15 +338,24 @@ def evaluate_policy(
     if is_risky_model and b_bounds is None:
         raise ValueError("b_bounds is required for risky debt model evaluation.")
 
-    # Create 1D grid arrays
-    k_vals = np.linspace(k_bounds[0], k_bounds[1], n_k)
-    logz_vals = np.linspace(logz_bounds[0], logz_bounds[1], n_z)
-    z_vals = np.exp(logz_vals)
-
-    if is_risky_model:
-        b_vals = np.linspace(b_bounds[0], b_bounds[1], n_b)
-    else:
-        b_vals = None
+    # Create model-consistent state grids:
+    # - k: multiplicative
+    # - log_z/z: log-linear
+    # - b: linear
+    grid_bounds = {
+        "k": tuple(k_bounds),
+        "log_z": tuple(logz_bounds),
+        "b": tuple(b_bounds) if b_bounds is not None else (0.0, 0.0),
+    }
+    delta = _resolve_delta_from_result(result)
+    k_vals, z_vals, b_grid = generate_state_grids(
+        grid_bounds,
+        delta=delta,
+        n_z=n_z,
+        n_b=n_b,
+    )
+    logz_vals = np.log(np.maximum(z_vals, 1e-12))
+    b_vals = b_grid if is_risky_model else None
 
     # === Resolve fixed indices ===
     # For each dimension, use fixed_*_val if provided, else use fixed_*_idx, else use midpoint
@@ -348,7 +384,7 @@ def evaluate_policy(
 
     # === Evaluate policy on grid ===
     if is_risky_model:
-        # 3D grid for risky debt model: (n_k, n_z, n_b)
+        # 3D grid for risky debt model: (n_k_actual, n_z, n_b)
         K, Z, B = np.meshgrid(k_vals, z_vals, b_vals, indexing='ij')
         LOGZ = np.log(Z)
 
@@ -365,13 +401,14 @@ def evaluate_policy(
         # Predict: risky policy returns (k_next, b_next)
         k_next_tensor, b_next_tensor = policy_net(tensor_k, tensor_b, tensor_z)
 
-        k_next_np = k_next_tensor.numpy().reshape(n_k, n_z, n_b)
-        b_next_np = b_next_tensor.numpy().reshape(n_k, n_z, n_b)
+        k_next_np = k_next_tensor.numpy().reshape(len(k_vals), len(z_vals), len(b_vals))
+        b_next_np = b_next_tensor.numpy().reshape(len(k_vals), len(z_vals), len(b_vals))
 
         return {
             # 3D grids
             'k': K,
             'z': Z,
+            'log_z': LOGZ,
             'logz': LOGZ,
             'b': B,
             'k_next': k_next_np,
@@ -379,6 +416,7 @@ def evaluate_policy(
             # 1D grid arrays (for convenience)
             'k_vals': k_vals,
             'z_vals': z_vals,
+            'log_z_vals': logz_vals,
             'logz_vals': logz_vals,
             'b_vals': b_vals,
             # Fixed values
@@ -392,11 +430,11 @@ def evaluate_policy(
             'fixed_b_idx': fixed_b_idx_resolved,
             # Metadata
             'model_type': 'risky',
-            'grid_shape': (n_k, n_z, n_b),
+            'grid_shape': (len(k_vals), len(z_vals), len(b_vals)),
         }
 
     else:
-        # 2D grid for basic model: (n_k, n_z)
+        # 2D grid for basic model: (n_k_actual, n_z)
         K, Z = np.meshgrid(k_vals, z_vals, indexing='ij')
         LOGZ = np.log(Z)
 
@@ -410,12 +448,13 @@ def evaluate_policy(
 
         # Predict: basic policy returns k_next only
         k_next_tensor = policy_net(tensor_k, tensor_z)
-        k_next_np = k_next_tensor.numpy().reshape(n_k, n_z)
+        k_next_np = k_next_tensor.numpy().reshape(len(k_vals), len(z_vals))
 
         return {
             # 2D grids
             'k': K,
             'z': Z,
+            'log_z': LOGZ,
             'logz': LOGZ,
             'b': None,
             'k_next': k_next_np,
@@ -423,6 +462,7 @@ def evaluate_policy(
             # 1D grid arrays (for convenience)
             'k_vals': k_vals,
             'z_vals': z_vals,
+            'log_z_vals': logz_vals,
             'logz_vals': logz_vals,
             'b_vals': None,
             # Fixed values
@@ -436,7 +476,7 @@ def evaluate_policy(
             'fixed_b_idx': None,
             # Metadata
             'model_type': 'basic',
-            'grid_shape': (n_k, n_z),
+            'grid_shape': (len(k_vals), len(z_vals)),
         }
 
 
@@ -526,17 +566,26 @@ def get_steady_state_policy(
     if is_risky_model and b_bounds is None:
         raise ValueError("b_bounds is required for risky debt model.")
 
-    # Create 1D grids
-    k_vals = np.linspace(k_bounds[0], k_bounds[1], n_grid)
-    logz_vals = np.linspace(logz_bounds[0], logz_bounds[1], n_grid)
-    z_vals = np.exp(logz_vals)
+    # Create model-consistent state grids from shared grid utilities.
+    grid_bounds = {
+        "k": tuple(k_bounds),
+        "log_z": tuple(logz_bounds),
+        "b": tuple(b_bounds) if b_bounds is not None else (0.0, 0.0),
+    }
+    delta = _resolve_delta_from_result(result)
+    k_vals, z_vals, b_grid = generate_state_grids(
+        grid_bounds,
+        delta=delta,
+        n_z=n_grid,
+        n_b=n_grid,
+    )
 
     # Midpoint indices
-    z_mid_idx = n_grid // 2
+    z_mid_idx = len(z_vals) // 2
     z_mid_val = z_vals[z_mid_idx]
 
     # Outlier threshold: exclude bottom outlier_pct of range
-    k_outlier_threshold = k_bounds[0] + outlier_pct * (k_bounds[1] - k_bounds[0])
+    k_outlier_threshold = float(k_vals[0]) + outlier_pct * float(k_vals[-1] - k_vals[0])
 
     def find_crossing(state_vals: np.ndarray, policy_vals: np.ndarray,
                       outlier_threshold: float) -> tuple:
@@ -594,16 +643,18 @@ def get_steady_state_policy(
         return selected_idx, float(crossing_val)
 
     if is_risky_model:
-        b_vals = np.linspace(b_bounds[0], b_bounds[1], n_grid)
-        b_mid_idx = n_grid // 2
+        b_vals = b_grid
+        if b_vals is None:
+            raise ValueError("b_bounds must produce a valid debt grid for risky model.")
+        b_mid_idx = len(b_vals) // 2
         b_mid_val = b_vals[b_mid_idx]
-        b_outlier_threshold = b_bounds[0] + outlier_pct * (b_bounds[1] - b_bounds[0])
+        b_outlier_threshold = float(b_vals[0]) + outlier_pct * float(b_vals[-1] - b_vals[0])
 
         # === Step 1: Find k* with b and z fixed at midpoints ===
         # Evaluate policy(k, b_mid, z_mid) for all k
         tensor_k = tf.constant(k_vals.reshape(-1, 1), dtype=tf.float32)
-        tensor_b = tf.constant(np.full((n_grid, 1), b_mid_val), dtype=tf.float32)
-        tensor_z = tf.constant(np.full((n_grid, 1), z_mid_val), dtype=tf.float32)
+        tensor_b = tf.constant(np.full((len(k_vals), 1), b_mid_val), dtype=tf.float32)
+        tensor_z = tf.constant(np.full((len(k_vals), 1), z_mid_val), dtype=tf.float32)
 
         k_next_tensor, _ = policy_net(tensor_k, tensor_b, tensor_z)
         k_next_vals = k_next_tensor.numpy().flatten()
@@ -612,9 +663,9 @@ def get_steady_state_policy(
 
         # === Step 2: Find b* with k fixed at k* and z at midpoint ===
         # Evaluate policy(k*, b, z_mid) for all b
-        tensor_k_star = tf.constant(np.full((n_grid, 1), k_star_val), dtype=tf.float32)
+        tensor_k_star = tf.constant(np.full((len(b_vals), 1), k_star_val), dtype=tf.float32)
         tensor_b_all = tf.constant(b_vals.reshape(-1, 1), dtype=tf.float32)
-        tensor_z_mid = tf.constant(np.full((n_grid, 1), z_mid_val), dtype=tf.float32)
+        tensor_z_mid = tf.constant(np.full((len(b_vals), 1), z_mid_val), dtype=tf.float32)
 
         _, b_next_tensor = policy_net(tensor_k_star, tensor_b_all, tensor_z_mid)
         b_next_vals = b_next_tensor.numpy().flatten()
@@ -630,15 +681,16 @@ def get_steady_state_policy(
             'b_star_val': b_star_val,
             'model_type': 'risky',
             'k_bounds': k_bounds,
+            'log_z_bounds': logz_bounds,
             'logz_bounds': logz_bounds,
             'b_bounds': b_bounds,
-            'n_grid': n_grid,
+            'n_grid': len(k_vals),
         }
 
     else:
         # Basic model: find k* with z fixed at midpoint
         tensor_k = tf.constant(k_vals.reshape(-1, 1), dtype=tf.float32)
-        tensor_z = tf.constant(np.full((n_grid, 1), z_mid_val), dtype=tf.float32)
+        tensor_z = tf.constant(np.full((len(k_vals), 1), z_mid_val), dtype=tf.float32)
 
         k_next_tensor = policy_net(tensor_k, tensor_z)
         k_next_vals = k_next_tensor.numpy().flatten()
@@ -654,9 +706,10 @@ def get_steady_state_policy(
             'b_star_val': None,
             'model_type': 'basic',
             'k_bounds': k_bounds,
+            'log_z_bounds': logz_bounds,
             'logz_bounds': logz_bounds,
             'b_bounds': None,
-            'n_grid': n_grid,
+            'n_grid': len(k_vals),
         }
 
 

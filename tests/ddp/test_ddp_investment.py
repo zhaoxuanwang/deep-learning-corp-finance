@@ -4,20 +4,19 @@ import numpy as np
 
 # Adjust imports to match your folder structure
 from src.economy.parameters import EconomicParams, ShockParams
-from src.ddp import DDPGridConfig
-from src.ddp.ddp_investment import InvestmentModelDDP
+from src.ddp import DDPGridConfig, BasicModelDDP
 
 
 @pytest.fixture
 def model_ddp():
     """
-    Standard fixture for creating a DDP model instance.
+    Standard fixture for creating a basic-model DDP instance.
     Uses a small grid to keep tests fast.
     """
     params = EconomicParams()
     shock_params = ShockParams()
     grid_config = DDPGridConfig(z_size=5, k_size=10)
-    return InvestmentModelDDP(params, shock_params, grid_config)
+    return BasicModelDDP(params, shock_params, grid_config)
 
 
 def test_initialization_shapes(model_ddp):
@@ -52,7 +51,7 @@ def test_reward_values_no_costs():
     )
     grid_config = DDPGridConfig(k_size=5, z_size=2, grid_type="log_linear")
     shock_params = ShockParams()
-    model = InvestmentModelDDP(params, shock_params, grid_config)
+    model = BasicModelDDP(params, shock_params, grid_config)
 
     # Extract values
     z = model.z_grid[0]
@@ -101,7 +100,7 @@ def test_solver_integration_vfi(model_ddp):
     Runs the VFI solver and checks basic economic properties of the result.
     """
     # Solve with loose tolerance for speed in unit tests
-    v_star, policy_k = model_ddp.solve_invest_vfi(tol=1e-4, max_iter=500)
+    v_star, policy_k = model_ddp.solve_basic_vfi(tol=1e-4, max_iter=500)
 
     # 1. Check Shapes
     assert v_star.shape == (model_ddp.nz, model_ddp.nk)
@@ -127,10 +126,10 @@ def test_solvers_consistency(model_ddp):
     converge to the same solution (within tolerance).
     """
     # 1. Solve using VFI (Robust)
-    v_vfi, policy_vfi = model_ddp.solve_invest_vfi(tol=1e-5, max_iter=2000)
+    v_vfi, policy_vfi = model_ddp.solve_basic_vfi(tol=1e-5, max_iter=2000)
 
     # 2. Solve using PFI (Fast)
-    v_pfi, policy_pfi = model_ddp.solve_invest_pfi(max_iter=50, eval_steps=500)
+    v_pfi, policy_pfi = model_ddp.solve_basic_pfi(max_iter=50, eval_steps=500)
 
     # 3. Compare Value Functions
     diff_v = np.max(np.abs(v_vfi - v_pfi))

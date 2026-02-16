@@ -1,4 +1,3 @@
-
 import pytest
 import numpy as np
 from src.economy.parameters import EconomicParams, ShockParams
@@ -49,4 +48,3 @@ def test_markov_process_integrity(shock_params):
     # Check 3: Dimensions
     assert len(z_grid) == z_size
     assert prob_matrix.shape == (z_size, z_size)
-

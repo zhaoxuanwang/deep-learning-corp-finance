@@ -140,8 +140,8 @@ class RiskyDebtConfig:
     weight_br: float = DEFAULT_WEIGHT_BR
 
     # Loss computation method for critic:
-    # - "mse": Mean Squared Error, L = E[f²], biased but stable (industry standard)
-    # - "crossprod": AiO cross-product, L = E[f₁·f₂], unbiased but can be negative
+    # - "mse": Mean Squared Error, L = E[f²], biased but stable (default)
+    # - "crossprod": AiO cross-product, L = E[f₁·f₂], unbiased
     loss_type: str = "mse"
 
     # LR method: adaptive Lagrange multiplier parameters
@@ -169,29 +169,65 @@ class MethodConfig:
     Configuration for the solution method (Algorithm).
 
     Attributes:
-        name: Method identifier (e.g., "basic_lr", "basic_er", "basic_br", "risky_br")
+        name: Method identifier (e.g., "basic_lr", "basic_er",
+            "basic_br_actor_critic", "basic_br_multitask",
+            "risky_br_actor_critic")
         n_critic: Number of critic updates per actor update (BR methods only)
         polyak_tau: Polyak averaging coefficient for target networks (ER/BR methods)
         loss_type: Loss computation method for ER/BR critic updates:
-            - "crossprod": AiO cross-product E[f₁·f₂], unbiased but can be negative (default)
-            - "mse": Mean Squared Error E[f²], biased but stable (industry standard)
-            For basic models, "crossprod" is default (backward compatible, works adequately).
+            - "mse": Mean Squared Error E[f²], biased but stable
+            - "crossprod": AiO cross-product E[f₁·f₂], unbiased (default)
             For risky debt, configure via RiskyDebtConfig.loss_type instead.
+        br_normalization: BR normalization mode for BR-family losses:
+            - "frictionless": Normalize by frictionless steady-state value scale (default)
+            - "none": Disable BR normalization
+            - "custom": Use br_normalizer_value
+        br_normalizer_value: Custom normalizer value when br_normalization="custom"
+        br_normalizer_epsilon: Lower bound for absolute normalizer value
+        br_reg_weight_foc: Weight on FOC regularization term for basic BR regression method
+        br_reg_weight_env: Weight on envelope regularization term for basic BR regression method
+        br_reg_use_foc: Whether to include FOC term in basic BR regression method
+        br_reg_use_env: Whether to include envelope term in basic BR regression method
         risky: Optional configuration for risky debt model
     """
     name: str  # e.g., "basic_lr", "basic_er", "risky_br", etc.
     n_critic: int = DEFAULT_N_CRITIC  # Critic updates per actor update (BR methods)
     polyak_tau: float = DEFAULT_POLYAK_TAU  # Polyak averaging coefficient for target networks (ER/BR methods)
-    loss_type: str = "crossprod"  # "crossprod" (default, backward compatible) or "mse" (stable)
+    loss_type: str = "mse"  # "mse" (default, stable) or "crossprod" (unbiased)
+    br_normalization: str = "frictionless"  # "frictionless" (default), "none", "custom"
+    br_normalizer_value: Optional[float] = None
+    br_normalizer_epsilon: float = 1e-8
+    br_reg_weight_foc: float = 1.0
+    br_reg_weight_env: float = 1.0
+    br_reg_use_foc: bool = True
+    br_reg_use_env: bool = True
     risky: Optional[RiskyDebtConfig] = None
 
     def __post_init__(self):
+        self.br_normalization = self.br_normalization.strip().lower().replace("-", "_")
         valid_loss_types = {"mse", "crossprod"}
         if self.loss_type not in valid_loss_types:
             raise ValueError(
                 f"loss_type must be one of {valid_loss_types}, got '{self.loss_type}'"
             )
 
+        if self.br_reg_weight_foc < 0:
+            raise ValueError(f"br_reg_weight_foc must be >= 0, got {self.br_reg_weight_foc}")
+        if self.br_reg_weight_env < 0:
+            raise ValueError(f"br_reg_weight_env must be >= 0, got {self.br_reg_weight_env}")
+        valid_norm_modes = {"none", "frictionless", "custom"}
+        if self.br_normalization not in valid_norm_modes:
+            raise ValueError(
+                f"br_normalization must be one of {valid_norm_modes}, got '{self.br_normalization}'"
+            )
+        if self.br_normalization == "custom" and self.br_normalizer_value is None:
+            raise ValueError(
+                "br_normalization='custom' requires br_normalizer_value."
+            )
+        if self.br_normalizer_epsilon <= 0:
+            raise ValueError(
+                f"br_normalizer_epsilon must be > 0, got {self.br_normalizer_epsilon}"
+            )
 
 # =============================================================================
 # EXPERIMENT CONFIG (Master Configuration)

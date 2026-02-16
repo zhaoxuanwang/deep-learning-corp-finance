@@ -72,7 +72,8 @@ class TestDeterminism:
             b_bounds=(0.0, 3.0),
             sim_batch_size=16,
             T=5,
-            n_sim_batches=3
+            n_sim_batches=3,
+            save_to_disk=False
         )
 
         gen2 = DataGenerator(
@@ -83,7 +84,8 @@ class TestDeterminism:
             b_bounds=(0.0, 3.0),
             sim_batch_size=16,
             T=5,
-            n_sim_batches=3
+            n_sim_batches=3,
+            save_to_disk=False
         )
 
         batches1 = list(gen1.get_training_batches())
@@ -108,7 +110,8 @@ class TestDeterminism:
             sim_batch_size=16,
             T=5,
             n_sim_batches=10,
-            N_val=32
+            N_val=32,
+            save_to_disk=False
         )
 
         gen2 = DataGenerator(
@@ -120,7 +123,8 @@ class TestDeterminism:
             sim_batch_size=16,
             T=5,
             n_sim_batches=10,
-            N_val=32
+            N_val=32,
+            save_to_disk=False
         )
 
         val1 = gen1.get_validation_dataset()
@@ -140,7 +144,8 @@ class TestDeterminism:
             sim_batch_size=16,
             T=5,
             n_sim_batches=10,
-            N_test=64
+            N_test=64,
+            save_to_disk=False
         )
 
         gen2 = DataGenerator(
@@ -152,7 +157,8 @@ class TestDeterminism:
             sim_batch_size=16,
             T=5,
             n_sim_batches=10,
-            N_test=64
+            N_test=64,
+            save_to_disk=False
         )
 
         test1 = gen1.get_test_dataset()
@@ -514,7 +520,8 @@ class TestSealedTest:
             sim_batch_size=basic_generator.sim_batch_size,
             T=basic_generator.T,
             n_sim_batches=basic_generator.n_sim_batches,
-            N_test=basic_generator.N_test
+            N_test=basic_generator.N_test,
+            save_to_disk=False
         )
 
         test_data2 = gen2.get_test_dataset()
@@ -541,7 +548,8 @@ class TestDefaultSizes:
             b_bounds=(0.0, 3.0),
             sim_batch_size=16,
             T=5,
-            n_sim_batches=10
+            n_sim_batches=10,
+            save_to_disk=False
             # N_val not specified
         )
 
@@ -557,7 +565,8 @@ class TestDefaultSizes:
             b_bounds=(0.0, 3.0),
             sim_batch_size=16,
             T=5,
-            n_sim_batches=10
+            n_sim_batches=10,
+            save_to_disk=False
             # N_test not specified
         )
 
@@ -575,7 +584,8 @@ class TestDefaultSizes:
             T=5,
             n_sim_batches=10,
             N_val=100,
-            N_test=200
+            N_test=200,
+            save_to_disk=False
         )
 
         assert gen.N_val == 100
@@ -836,6 +846,52 @@ class TestDataGeneratorCaching:
         assert os.path.exists(cache_path1)
         assert os.path.exists(cache_path2)
 
+    def test_cache_metadata_mismatch_detected_for_shock_params(self, shock_params, cache_dir):
+        """Tampering cached shock_params metadata should raise on load."""
+        import json
+        import numpy as np
+
+        gen = DataGenerator(
+            master_seed=(42, 100),
+            shock_params=shock_params,
+            k_bounds=(0.5, 5.0),
+            logz_bounds=(-0.3, 0.3),
+            b_bounds=(0.0, 3.0),
+            sim_batch_size=16,
+            T=5,
+            n_sim_batches=10,
+            N_val=32,
+            N_test=64,
+            cache_dir=cache_dir
+        )
+        _ = gen.get_validation_dataset()
+        cache_path = gen._get_cache_path("validation")
+
+        # Tamper cached metadata
+        with np.load(cache_path) as data:
+            payload = {k: data[k] for k in data.files if k != "_metadata"}
+            meta = json.loads(str(data["_metadata"]))
+        meta["shock_params"]["sigma"] = float(meta["shock_params"]["sigma"]) + 0.01
+        payload["_metadata"] = json.dumps(meta)
+        np.savez_compressed(cache_path, **payload)
+
+        # Fresh generator should reject tampered cache
+        gen_fresh = DataGenerator(
+            master_seed=(42, 100),
+            shock_params=shock_params,
+            k_bounds=(0.5, 5.0),
+            logz_bounds=(-0.3, 0.3),
+            b_bounds=(0.0, 3.0),
+            sim_batch_size=16,
+            T=5,
+            n_sim_batches=10,
+            N_val=32,
+            N_test=64,
+            cache_dir=cache_dir
+        )
+        with pytest.raises(ValueError, match="metadata mismatch"):
+            gen_fresh.get_validation_dataset()
+
     def test_cache_preserves_tensor_types(self, cached_generator, cache_dir):
         """Tensros loaded from cache have correct dtype and shape."""
         # Force generation and save
@@ -933,8 +989,9 @@ class TestDataGeneratorCaching:
         assert os.path.exists(val_cache)
         assert os.path.exists(test_cache)
 
-    def test_no_cache_without_cache_dir(self, shock_params):
-        """No cache files created when cache_dir is None."""
+    def test_no_cache_when_save_to_disk_disabled(self, shock_params, tmp_path):
+        """No cache files are created when save_to_disk=False."""
+        cache_dir = str(tmp_path / "cache_disabled")
         gen = DataGenerator(
             master_seed=(42, 100),
             shock_params=shock_params,
@@ -944,14 +1001,18 @@ class TestDataGeneratorCaching:
             sim_batch_size=16,
             T=5,
             n_sim_batches=10,
-            cache_dir=None
+            cache_dir=cache_dir,
+            save_to_disk=False
         )
 
         val_data = gen.get_validation_dataset()
         test_data = gen.get_test_dataset()
 
-        # Should not create any cache files
-        # (Can't check this directly, but no errors should occur)
+        from pathlib import Path
+        cache_files = list(Path(cache_dir).glob("*.npz"))
+
+        # No cache files should be written
+        assert len(cache_files) == 0
         assert val_data is not None
         assert test_data is not None
 
@@ -1044,7 +1105,8 @@ class TestFlattenedDataset:
             b_bounds=(0.0, 3.0),
             sim_batch_size=16,
             T=5,
-            n_sim_batches=10
+            n_sim_batches=10,
+            save_to_disk=False
         )
 
         gen2 = DataGenerator(
@@ -1055,7 +1117,8 @@ class TestFlattenedDataset:
             b_bounds=(0.0, 3.0),
             sim_batch_size=16,
             T=5,
-            n_sim_batches=10
+            n_sim_batches=10,
+            save_to_disk=False
         )
 
         flat1 = gen1.get_flattened_training_dataset()
@@ -1105,7 +1168,8 @@ class TestFlattenedDataset:
             b_bounds=(0.0, 3.0),
             sim_batch_size=16,
             T=5,
-            n_sim_batches=10
+            n_sim_batches=10,
+            save_to_disk=False
         )
 
         # Get flattened data
