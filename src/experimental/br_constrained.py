@@ -15,7 +15,7 @@ import tensorflow as tf
 
 from src.networks.network_basic import BasicPolicyNetwork, BasicValueNetwork
 from src.economy.parameters import EconomicParams, ShockParams
-from src.trainers.basic_trainers import BasicTrainerBRRegression
+from src.experimental.br_multitask import BasicTrainerBRRegression
 
 
 class BasicTrainerBRConstrainedExperimental(BasicTrainerBRRegression):

@@ -223,64 +223,6 @@ def compute_k_bounds_levels(
     return k_bounds, k_star
 
 
-# Legacy function for backward compatibility
-def compute_natural_k_bounds(
-    theta: float,
-    r: float,
-    delta: float,
-    log_z_bounds: Tuple[float, float],
-    k_min_multiplier: float,
-    k_max_multiplier: float
-) -> Tuple[float, float]:
-    """
-    [DEPRECATED] Compute natural bounds for capital k based on steady-state logic.
-
-    NOTE: This function is deprecated. Use compute_k_bounds_levels() instead.
-    The new approach computes k* at the stationary mean z=e^μ and returns
-    bounds directly in LEVELS.
-
-    This legacy function computes k* at z_min and z_max separately, which
-    gives different bounds than the recommended anchoring to stationary k*.
-
-    Args:
-        theta: Production elasticity
-        r: Risk-free rate
-        delta: Depreciation rate
-        log_z_bounds: (min_log_z, max_log_z)
-        k_min_multiplier: Factor for lower bound
-        k_max_multiplier: Factor for upper bound
-
-    Returns:
-        (k_min, k_max) in LEVEL space
-    """
-    warnings.warn(
-        "compute_natural_k_bounds is deprecated. Use compute_k_bounds_levels() "
-        "which anchors bounds to stationary k* at z=e^μ.",
-        DeprecationWarning,
-        stacklevel=2
-    )
-
-    min_log_z, max_log_z = log_z_bounds
-
-    z_min = np.exp(min_log_z)
-    z_max = np.exp(max_log_z)
-
-    # Helper for steady state k given z
-    def get_k_star(z_val):
-        denom = r + delta
-        if denom <= 0:
-            return 1.0  # Fallback
-        return ((z_val * theta) / denom) ** (1 / (1 - theta))
-
-    k_star_low = get_k_star(z_min)
-    k_star_high = get_k_star(z_max)
-
-    k_min = k_min_multiplier * k_star_low
-    k_max = k_max_multiplier * k_star_high
-
-    return float(k_min), float(k_max)
-
-
 def compute_b_bound_levels(
     theta: float,
     k_max: float,
@@ -325,42 +267,6 @@ def compute_b_bound_levels(
     b_max = (1 - tax) * pi_worst + tax * delta * k_max + frac_liquid * k_max
 
     return float(b_max)
-
-
-# Legacy function for backward compatibility
-def compute_natural_b_bound(
-    theta: float,
-    k_max: float,
-    z_max: float
-) -> float:
-    """
-    [DEPRECATED] Compute natural borrowing limit (B_max) in level space.
-
-    NOTE: This function is deprecated and uses the OLD formula.
-    Use compute_b_bound_levels() instead, which implements the tighter
-    collateral constraint from report_brief.md.
-
-    OLD formula: B_max = z_max * (k_max)^theta + k_max
-    NEW formula: B_max = (1-τ) π(k_max, z_min) + τ δ k_max + s_liquid · k_max
-
-    The new formula is much tighter and prevents excessive leverage.
-
-    Args:
-        theta: Production elasticity
-        k_max: Maximum capital bound in LEVELS
-        z_max: Maximum productivity (level, not log)
-
-    Returns:
-        b_max (float) in LEVEL space (using OLD formula)
-    """
-    warnings.warn(
-        "compute_natural_b_bound is deprecated and uses the OLD formula. "
-        "Use compute_b_bound_levels() with collateral constraint parameters instead.",
-        DeprecationWarning,
-        stacklevel=2
-    )
-    prod = z_max * (k_max ** theta)
-    return float(prod + k_max)
 
 
 def generate_states_bounds(

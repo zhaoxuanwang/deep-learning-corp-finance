@@ -309,7 +309,7 @@ def evaluate_policy(
         ... )
     """
     import tensorflow as tf
-    import inspect
+    from src.trainers.io_transforms import build_inference_helper_from_result
 
     # Extract policy network from result
     if '_policy_net' not in result:
@@ -317,23 +317,8 @@ def evaluate_policy(
             "Result dictionary must contain '_policy_net' key. "
             "Expected output from train_basic_* or train_risky_* functions."
         )
-    policy_net = result['_policy_net']
-
-    # Detect model type by inspecting policy network signature
-    # Basic model: policy_net(k, z) -> k_next
-    # Risky model: policy_net(k, b, z) -> (k_next, b_next)
-    try:
-        sig = inspect.signature(policy_net.call)
-        n_args = len([
-            p for p in sig.parameters.values()
-            if p.default == inspect.Parameter.empty and p.name != 'self'
-        ])
-    except (ValueError, AttributeError):
-        # Fallback: try calling with dummy inputs
-        n_args = None
-
-    # Alternative detection: check if risky networks exist in result
-    is_risky_model = '_price_net' in result or (n_args is not None and n_args >= 3)
+    infer = build_inference_helper_from_result(result)
+    is_risky_model = infer.model == "risky"
 
     if is_risky_model and b_bounds is None:
         raise ValueError("b_bounds is required for risky debt model evaluation.")
@@ -398,8 +383,8 @@ def evaluate_policy(
         tensor_b = tf.constant(flat_b, dtype=tf.float32)
         tensor_z = tf.constant(flat_z, dtype=tf.float32)
 
-        # Predict: risky policy returns (k_next, b_next)
-        k_next_tensor, b_next_tensor = policy_net(tensor_k, tensor_b, tensor_z)
+        # Predict in level space via inference helper.
+        k_next_tensor, b_next_tensor = infer.policy(tensor_k, tensor_b, tensor_z)
 
         k_next_np = k_next_tensor.numpy().reshape(len(k_vals), len(z_vals), len(b_vals))
         b_next_np = b_next_tensor.numpy().reshape(len(k_vals), len(z_vals), len(b_vals))
@@ -446,8 +431,8 @@ def evaluate_policy(
         tensor_k = tf.constant(flat_k, dtype=tf.float32)
         tensor_z = tf.constant(flat_z, dtype=tf.float32)
 
-        # Predict: basic policy returns k_next only
-        k_next_tensor = policy_net(tensor_k, tensor_z)
+        # Predict in level space via inference helper.
+        k_next_tensor = infer.policy(tensor_k, tensor_z)
         k_next_np = k_next_tensor.numpy().reshape(len(k_vals), len(z_vals))
 
         return {
@@ -535,7 +520,7 @@ def get_steady_state_policy(
         ... )
     """
     import tensorflow as tf
-    import inspect
+    from src.trainers.io_transforms import build_inference_helper_from_result
 
     # Extract policy network
     if '_policy_net' not in result:
@@ -543,25 +528,9 @@ def get_steady_state_policy(
             "Result dictionary must contain '_policy_net' key. "
             "Expected output from train_basic_* or train_risky_* functions."
         )
-    policy_net = result['_policy_net']
-
-    # Detect model type
-    try:
-        sig = inspect.signature(policy_net.call)
-        n_args = len([
-            p for p in sig.parameters.values()
-            if p.default == inspect.Parameter.empty and p.name != 'self'
-        ])
-    except (ValueError, AttributeError):
-        n_args = None
-
-    # Detect risky model: check for _price_net, signature args, OR if b_bounds is provided
-    # (user providing b_bounds is a strong hint they want risky model behavior)
-    is_risky_model = (
-        '_price_net' in result or
-        (n_args is not None and n_args >= 3) or
-        b_bounds is not None
-    )
+    infer = build_inference_helper_from_result(result)
+    # Keep b_bounds override behavior for compatibility.
+    is_risky_model = infer.model == "risky" or b_bounds is not None
 
     if is_risky_model and b_bounds is None:
         raise ValueError("b_bounds is required for risky debt model.")
@@ -656,7 +625,7 @@ def get_steady_state_policy(
         tensor_b = tf.constant(np.full((len(k_vals), 1), b_mid_val), dtype=tf.float32)
         tensor_z = tf.constant(np.full((len(k_vals), 1), z_mid_val), dtype=tf.float32)
 
-        k_next_tensor, _ = policy_net(tensor_k, tensor_b, tensor_z)
+        k_next_tensor, _ = infer.policy(tensor_k, tensor_b, tensor_z)
         k_next_vals = k_next_tensor.numpy().flatten()
 
         k_star_idx, k_star_val = find_crossing(k_vals, k_next_vals, k_outlier_threshold)
@@ -667,7 +636,7 @@ def get_steady_state_policy(
         tensor_b_all = tf.constant(b_vals.reshape(-1, 1), dtype=tf.float32)
         tensor_z_mid = tf.constant(np.full((len(b_vals), 1), z_mid_val), dtype=tf.float32)
 
-        _, b_next_tensor = policy_net(tensor_k_star, tensor_b_all, tensor_z_mid)
+        _, b_next_tensor = infer.policy(tensor_k_star, tensor_b_all, tensor_z_mid)
         b_next_vals = b_next_tensor.numpy().flatten()
 
         b_star_idx, b_star_val = find_crossing(b_vals, b_next_vals, b_outlier_threshold)
@@ -692,7 +661,7 @@ def get_steady_state_policy(
         tensor_k = tf.constant(k_vals.reshape(-1, 1), dtype=tf.float32)
         tensor_z = tf.constant(np.full((len(k_vals), 1), z_mid_val), dtype=tf.float32)
 
-        k_next_tensor = policy_net(tensor_k, tensor_z)
+        k_next_tensor = infer.policy(tensor_k, tensor_z)
         k_next_vals = k_next_tensor.numpy().flatten()
 
         k_star_idx, k_star_val = find_crossing(k_vals, k_next_vals, k_outlier_threshold)

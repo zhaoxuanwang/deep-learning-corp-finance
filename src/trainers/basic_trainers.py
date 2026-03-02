@@ -5,22 +5,64 @@ Trainer implementations for the Basic Model (Sec. 1).
 import tensorflow as tf
 import numpy as np
 import logging
-from typing import Dict, List
+from typing import Dict, List, Any, Optional, Tuple
 
 from src.economy.parameters import EconomicParams, ShockParams
 from src.economy.logic import compute_cash_flow_basic, euler_chi, euler_m, compute_terminal_value
 
 from src.networks.network_basic import BasicPolicyNetwork, BasicValueNetwork
+from src.trainers.io_transforms import (
+    forward_basic_policy_levels,
+    forward_basic_value_levels,
+    compute_k_clip_diagnostics,
+    build_legacy_basic_transform_spec_from_networks,
+)
 from src.trainers.losses import (
     compute_lr_loss,
     compute_er_loss_aio,
+    compute_er_loss_huber,
     compute_er_loss_mse,
     compute_br_critic_loss_aio,
+    compute_br_critic_loss_huber,
     compute_br_critic_loss_mse,
     compute_br_critic_diagnostics,
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _inference_clip_k(
+    k_preclip: tf.Tensor,
+    *,
+    transform_spec: Dict[str, Any],
+) -> tf.Tensor:
+    cfg = transform_spec["outputs"]["policy_k"]
+    out = k_preclip
+    clip_min = cfg.get("clip_min")
+    clip_max = cfg.get("clip_max")
+    if clip_min is not None:
+        out = tf.maximum(out, tf.constant(float(clip_min), dtype=out.dtype))
+    if clip_max is not None:
+        out = tf.minimum(out, tf.constant(float(clip_max), dtype=out.dtype))
+    return out
+
+
+def _ensure_finite_scalar(name: str, value: tf.Tensor) -> None:
+    if not bool(tf.reduce_all(tf.math.is_finite(value))):
+        raise FloatingPointError(f"Non-finite scalar encountered for '{name}'.")
+
+
+def _ensure_finite_gradients(name: str, grads: List[Optional[tf.Tensor]]) -> None:
+    bad_indices = []
+    for idx, grad in enumerate(grads):
+        if grad is None:
+            continue
+        if not bool(tf.reduce_all(tf.math.is_finite(grad))):
+            bad_indices.append(idx)
+    if bad_indices:
+        raise FloatingPointError(
+            f"Non-finite gradients encountered for '{name}' at indices {bad_indices}."
+        )
 
 
 # =============================================================================
@@ -42,7 +84,8 @@ class BasicTrainerLR:
         shock_params: ShockParams,
         T: int,
         logit_clip: float,
-        optimizer: tf.keras.optimizers.Optimizer
+        optimizer: tf.keras.optimizers.Optimizer,
+        transform_spec: Optional[Dict[str, Any]] = None,
     ):
         """
         Initialize LR trainer.
@@ -56,6 +99,9 @@ class BasicTrainerLR:
             optimizer: Configured optimizer (use create_optimizer() from config).
         """
         self.policy_net = policy_net
+        self.transform_spec = transform_spec or build_legacy_basic_transform_spec_from_networks(
+            policy_net=policy_net
+        )
         self.params = params
         self.shock_params = shock_params
         self.optimizer = optimizer
@@ -86,6 +132,7 @@ class BasicTrainerLR:
             Dict[str, float]: Loss and metrics.
         """
         rewards_list = []
+        k_preclip_list = []
         with tf.GradientTape() as tape:
             k = tf.reshape(k, [-1, 1])
             # Use pre-computed path. z_path is (Batch, T+1)
@@ -94,7 +141,16 @@ class BasicTrainerLR:
             for t in range(self.T):
                 z_curr = tf.reshape(z_path[:, t], [-1, 1])
 
-                k_next = self.policy_net(k, z_curr)
+                k_next, k_preclip = forward_basic_policy_levels(
+                    policy_net=self.policy_net,
+                    k=k,
+                    z=z_curr,
+                    transform_spec=self.transform_spec,
+                    training=True,
+                    apply_output_clips=False,
+                    return_preclip=True,
+                )
+                k_preclip_list.append(k_preclip)
 
                 # k and k_next are in LEVELS - pass directly to economic functions
                 reward = compute_cash_flow_basic(k, k_next, z_curr, self.params, temperature=temperature, logit_clip=self.logit_clip)
@@ -119,11 +175,23 @@ class BasicTrainerLR:
         grads = tape.gradient(loss, self.policy_net.trainable_variables)
         self.optimizer.apply_gradients(zip(grads, self.policy_net.trainable_variables))
 
+        k_preclip_all = tf.concat(k_preclip_list, axis=0)
+        k_postclip_all = _inference_clip_k(
+            k_preclip_all,
+            transform_spec=self.transform_spec,
+        )
+        clip_diag = compute_k_clip_diagnostics(
+            k_postclip=k_postclip_all,
+            k_preclip=k_preclip_all,
+        )
+
         terminal_states = tf.concat([k, z_terminal], axis=1).numpy()
         return {
             "loss_LR": float(loss),
             "mean_reward": float(tf.reduce_mean(rewards)),
-            "terminal_states": terminal_states
+            "terminal_states": terminal_states,
+            "clip_fraction_k": clip_diag["clip_fraction_k"],
+            "preclip_max_k": clip_diag["preclip_max_k"],
         }
 
     def evaluate(
@@ -146,11 +214,21 @@ class BasicTrainerLR:
             Dict[str, float]: Loss and metrics.
         """
         rewards_list = []
+        k_preclip_list = []
         k = tf.reshape(k, [-1, 1])
 
         for t in range(self.T):
             z_curr = tf.reshape(z_path[:, t], [-1, 1])
-            k_next = self.policy_net(k, z_curr)
+            k_next, k_preclip = forward_basic_policy_levels(
+                policy_net=self.policy_net,
+                k=k,
+                z=z_curr,
+                transform_spec=self.transform_spec,
+                training=False,
+                apply_output_clips=False,
+                return_preclip=True,
+            )
+            k_preclip_list.append(k_preclip)
 
             # k and k_next are in LEVELS - pass directly to economic functions
             reward = compute_cash_flow_basic(k, k_next, z_curr, self.params, temperature=temperature, logit_clip=self.logit_clip)
@@ -169,9 +247,21 @@ class BasicTrainerLR:
 
         loss = compute_lr_loss(rewards, self.beta, terminal_value=v_terminal)
 
+        k_preclip_all = tf.concat(k_preclip_list, axis=0)
+        k_postclip_all = _inference_clip_k(
+            k_preclip_all,
+            transform_spec=self.transform_spec,
+        )
+        clip_diag = compute_k_clip_diagnostics(
+            k_postclip=k_postclip_all,
+            k_preclip=k_preclip_all,
+        )
+
         return {
             "loss_LR": float(loss),
             "mean_reward": float(tf.reduce_mean(rewards)),
+            "clip_fraction_k": clip_diag["clip_fraction_k"],
+            "preclip_max_k": clip_diag["preclip_max_k"],
         }
 
 
@@ -201,7 +291,8 @@ class BasicTrainerER:
         shock_params: ShockParams,
         optimizer: tf.keras.optimizers.Optimizer,
         polyak_tau: float,
-        loss_type: str = "crossprod"
+        loss_type: str = "crossprod",
+        transform_spec: Optional[Dict[str, Any]] = None,
     ):
         """
         Initialize ER trainer.
@@ -215,10 +306,14 @@ class BasicTrainerER:
                 Use MethodConfig.polyak_tau (default: DEFAULT_POLYAK_TAU = 0.995).
             loss_type: Loss computation method for Euler residual:
                 - "mse": Mean Squared Error E[f²], biased but stable
+                - "huber": Huber loss, robust to outlier residuals
                 - "crossprod": AiO cross-product E[f₁·f₂], unbiased (default)
                 Use MethodConfig.loss_type (default: "crossprod").
         """
         self.policy_net = policy_net
+        self.transform_spec = transform_spec or build_legacy_basic_transform_spec_from_networks(
+            policy_net=policy_net
+        )
         self.params = params
         self.shock_params = shock_params
         self.optimizer = optimizer
@@ -227,7 +322,7 @@ class BasicTrainerER:
         self.loss_type = loss_type
 
         # Validate loss_type
-        valid_loss_types = {"mse", "crossprod"}
+        valid_loss_types = {"mse", "huber", "crossprod", "fork_mean_square"}
         if loss_type not in valid_loss_types:
             raise ValueError(f"loss_type must be one of {valid_loss_types}, got '{loss_type}'")
 
@@ -235,10 +330,9 @@ class BasicTrainerER:
         # Reference: report_brief.md line 491 "Initiate target policy"
         self.target_policy_net = tf.keras.models.clone_model(policy_net)
 
-        # Build target network by calling it with dummy data
-        dummy_k = tf.constant([[1.0]], dtype=tf.float32)
-        dummy_z = tf.constant([[1.0]], dtype=tf.float32)
-        _ = self.target_policy_net(dummy_k, dummy_z)
+        # Build target network by calling it with normalized dummy features.
+        dummy_x = tf.constant([[0.0, 0.0]], dtype=tf.float32)
+        _ = self.target_policy_net(dummy_x, training=False)
 
         # Now set weights from source network
         self.target_policy_net.set_weights(policy_net.get_weights())
@@ -260,8 +354,8 @@ class BasicTrainerER:
         update_magnitudes = []
 
         for target_var, source_var in zip(
-            self.target_policy_net.trainable_variables,
-            self.policy_net.trainable_variables
+            self.target_policy_net.variables,
+            self.policy_net.variables
         ):
             # Compute update magnitude before applying
             delta = (1.0 - self.polyak_tau) * (source_var - target_var)
@@ -322,18 +416,40 @@ class BasicTrainerER:
 
             # === CURRENT STEP (Trainable) ===
             # Compute k' using current policy
-            k_next = self.policy_net(k, z)
+            k_next, k_preclip = forward_basic_policy_levels(
+                policy_net=self.policy_net,
+                k=k,
+                z=z,
+                transform_spec=self.transform_spec,
+                training=True,
+                apply_output_clips=False,
+                return_preclip=True,
+            )
 
             # k and k_next are in LEVELS - pass directly to Euler primitives
             chi = euler_chi(k, k_next, self.params)
 
             # === FUTURE STEP - MAIN FORK (Target Policy) ===
             # Compute k'' using TARGET policy for stability (DDPG-style)
-            k_next_next_main = self.target_policy_net(k_next, z_next_main)
+            k_next_next_main = forward_basic_policy_levels(
+                policy_net=self.target_policy_net,
+                k=k_next,
+                z=z_next_main,
+                transform_spec=self.transform_spec,
+                training=False,
+                apply_output_clips=False,
+            )
             m_main = euler_m(k_next, k_next_next_main, z_next_main, self.params)
 
             # === FUTURE STEP - FORK PATH (Target Policy) ===
-            k_next_next_fork = self.target_policy_net(k_next, z_next_fork)
+            k_next_next_fork = forward_basic_policy_levels(
+                policy_net=self.target_policy_net,
+                k=k_next,
+                z=z_next_fork,
+                transform_spec=self.transform_spec,
+                training=False,
+                apply_output_clips=False,
+            )
             m_fork = euler_m(k_next, k_next_next_fork, z_next_fork, self.params)
 
             # === UNIT-FREE EULER RESIDUALS ===
@@ -347,6 +463,8 @@ class BasicTrainerER:
             # Reference: report_brief.md lines 599-600
             if self.loss_type == "mse":
                 loss = compute_er_loss_mse(f_main, f_fork)
+            elif self.loss_type == "huber":
+                loss = compute_er_loss_huber(f_main, f_fork)
             else:  # "crossprod"
                 loss = compute_er_loss_aio(f_main, f_fork)
 
@@ -359,9 +477,17 @@ class BasicTrainerER:
         # Reference: report_brief.md line 519
         target_update_mag = self._update_target_network()
 
+        k_postclip = _inference_clip_k(k_preclip, transform_spec=self.transform_spec)
+        clip_diag = compute_k_clip_diagnostics(
+            k_postclip=k_postclip,
+            k_preclip=k_preclip,
+        )
+
         return {
             "loss_ER": float(loss),
-            "target_policy_update": target_update_mag
+            "target_policy_update": target_update_mag,
+            "clip_fraction_k": clip_diag["clip_fraction_k"],
+            "preclip_max_k": clip_diag["preclip_max_k"],
         }
 
     def evaluate(
@@ -392,16 +518,38 @@ class BasicTrainerER:
         z_next_fork = tf.reshape(z_next_fork, [-1, 1])
 
         # Current step
-        k_next = self.policy_net(k, z)
+        k_next, k_preclip = forward_basic_policy_levels(
+            policy_net=self.policy_net,
+            k=k,
+            z=z,
+            transform_spec=self.transform_spec,
+            training=False,
+            apply_output_clips=False,
+            return_preclip=True,
+        )
 
         # k and k_next are in LEVELS - pass directly to Euler primitives
         chi = euler_chi(k, k_next, self.params)
 
         # Future step (target policy)
-        k_next_next_main = self.target_policy_net(k_next, z_next_main)
+        k_next_next_main = forward_basic_policy_levels(
+            policy_net=self.target_policy_net,
+            k=k_next,
+            z=z_next_main,
+            transform_spec=self.transform_spec,
+            training=False,
+            apply_output_clips=False,
+        )
         m_main = euler_m(k_next, k_next_next_main, z_next_main, self.params)
 
-        k_next_next_fork = self.target_policy_net(k_next, z_next_fork)
+        k_next_next_fork = forward_basic_policy_levels(
+            policy_net=self.target_policy_net,
+            k=k_next,
+            z=z_next_fork,
+            transform_spec=self.transform_spec,
+            training=False,
+            apply_output_clips=False,
+        )
         m_fork = euler_m(k_next, k_next_next_fork, z_next_fork, self.params)
 
         # Unit-free Euler residuals: f = 1 - β * m / χ
@@ -411,10 +559,21 @@ class BasicTrainerER:
 
         if self.loss_type == "mse":
             loss = compute_er_loss_mse(f_main, f_fork)
+        elif self.loss_type == "huber":
+            loss = compute_er_loss_huber(f_main, f_fork)
         else:  # "crossprod"
             loss = compute_er_loss_aio(f_main, f_fork)
 
-        return {"loss_ER": float(loss)}
+        k_postclip = _inference_clip_k(k_preclip, transform_spec=self.transform_spec)
+        clip_diag = compute_k_clip_diagnostics(
+            k_postclip=k_postclip,
+            k_preclip=k_preclip,
+        )
+        return {
+            "loss_ER": float(loss),
+            "clip_fraction_k": clip_diag["clip_fraction_k"],
+            "preclip_max_k": clip_diag["preclip_max_k"],
+        }
 
 
 class BasicTrainerBR:
@@ -452,6 +611,7 @@ class BasicTrainerBR:
         polyak_tau: float,
         loss_type: str = "crossprod",
         br_scale: float = 1.0,
+        transform_spec: Optional[Dict[str, Any]] = None,
     ):
         """
         Initialize BR (Actor-Critic) trainer.
@@ -471,6 +631,7 @@ class BasicTrainerBR:
                 Use MethodConfig.polyak_tau (default: DEFAULT_POLYAK_TAU = 0.995).
             loss_type: Loss computation method for Bellman residual:
                 - "mse": Mean Squared Error E[f²], biased but stable
+                - "huber": Huber TD loss, robust to outlier residuals
                 - "crossprod": AiO cross-product E[f₁·f₂], unbiased (default)
                 Use MethodConfig.loss_type (default: "crossprod").
             br_scale: Positive scalar used to normalize BR residuals before
@@ -478,6 +639,10 @@ class BasicTrainerBR:
         """
         self.policy_net = policy_net
         self.value_net = value_net
+        self.transform_spec = transform_spec or build_legacy_basic_transform_spec_from_networks(
+            policy_net=policy_net,
+            value_net=value_net,
+        )
         self.params = params
         self.shock_params = shock_params
         self.optimizer_policy = optimizer_actor
@@ -490,7 +655,7 @@ class BasicTrainerBR:
         self.br_scale = float(br_scale)
 
         # Validate loss_type
-        valid_loss_types = {"mse", "crossprod"}
+        valid_loss_types = {"mse", "huber", "crossprod", "fork_mean_square"}
         if loss_type not in valid_loss_types:
             raise ValueError(f"loss_type must be one of {valid_loss_types}, got '{loss_type}'")
         if self.br_scale <= 0:
@@ -501,11 +666,10 @@ class BasicTrainerBR:
         self.target_policy_net = tf.keras.models.clone_model(policy_net)
         self.target_value_net = tf.keras.models.clone_model(value_net)
 
-        # Build target networks by calling them with dummy data
-        dummy_k = tf.constant([[1.0]], dtype=tf.float32)
-        dummy_z = tf.constant([[1.0]], dtype=tf.float32)
-        _ = self.target_policy_net(dummy_k, dummy_z)
-        _ = self.target_value_net(dummy_k, dummy_z)
+        # Build target networks by calling them with normalized dummy features.
+        dummy_x = tf.constant([[0.0, 0.0]], dtype=tf.float32)
+        _ = self.target_policy_net(dummy_x, training=False)
+        _ = self.target_value_net(dummy_x, training=False)
 
         # Now set weights from source networks
         self.target_policy_net.set_weights(policy_net.get_weights())
@@ -526,8 +690,8 @@ class BasicTrainerBR:
         update_magnitudes = []
 
         for target_var, source_var in zip(
-            self.target_value_net.trainable_variables,
-            self.value_net.trainable_variables
+            self.target_value_net.variables,
+            self.value_net.variables
         ):
             # Compute update magnitude before applying
             delta = (1.0 - self.polyak_tau) * (source_var - target_var)
@@ -556,8 +720,8 @@ class BasicTrainerBR:
         update_magnitudes = []
 
         for target_var, source_var in zip(
-            self.target_policy_net.trainable_variables,
-            self.policy_net.trainable_variables
+            self.target_policy_net.variables,
+            self.policy_net.variables
         ):
             # Compute update magnitude before applying
             delta = (1.0 - self.polyak_tau) * (source_var - target_var)
@@ -636,12 +800,33 @@ class BasicTrainerBR:
                 # === Compute Action using TARGET Policy ===
                 # Reference: report_brief.md line 600
                 # "Compute next action using the Target Policy"
-                k_next = self.target_policy_net(k, z)
+                k_next = forward_basic_policy_levels(
+                    policy_net=self.target_policy_net,
+                    k=k,
+                    z=z,
+                    transform_spec=self.transform_spec,
+                    training=False,
+                    apply_output_clips=False,
+                )
 
                 # === Compute Continuation Values using TARGET Value Network ===
                 # Reference: report_brief.md line 602-603
-                V_next_main = self.target_value_net(k_next, z_next_main)
-                V_next_fork = self.target_value_net(k_next, z_next_fork)
+                V_next_main = forward_basic_value_levels(
+                    value_net=self.target_value_net,
+                    k=k_next,
+                    z=z_next_main,
+                    transform_spec=self.transform_spec,
+                    training=False,
+                    apply_output_clips=False,
+                )
+                V_next_fork = forward_basic_value_levels(
+                    value_net=self.target_value_net,
+                    k=k_next,
+                    z=z_next_fork,
+                    transform_spec=self.transform_spec,
+                    training=False,
+                    apply_output_clips=False,
+                )
 
                 # === Compute Critic Targets (Detached) ===
                 # Reference: report_brief.md line 605-606
@@ -659,7 +844,14 @@ class BasicTrainerBR:
 
                 # === Compute Current Value (Trainable) ===
                 # Reference: report_brief.md line 609
-                V_curr = self.value_net(k, z)
+                V_curr = forward_basic_value_levels(
+                    value_net=self.value_net,
+                    k=k,
+                    z=z,
+                    transform_spec=self.transform_spec,
+                    training=True,
+                    apply_output_clips=False,
+                )
                 V_curr_norm = V_curr / self.br_scale
                 y1_norm = y1 / self.br_scale
                 y2_norm = y2 / self.br_scale
@@ -668,12 +860,16 @@ class BasicTrainerBR:
                 # Reference: report_brief.md line 611-612
                 if self.loss_type == "mse":
                     loss_critic = compute_br_critic_loss_mse(V_curr_norm, y1_norm, y2_norm)
+                elif self.loss_type == "huber":
+                    loss_critic = compute_br_critic_loss_huber(V_curr_norm, y1_norm, y2_norm)
                 else:  # "crossprod"
                     loss_critic = compute_br_critic_loss_aio(V_curr_norm, y1_norm, y2_norm)
+                _ensure_finite_scalar("basic_br/loss_critic", loss_critic)
 
             # Update critic (value network)
             # Reference: report_brief.md line 613
             grads_critic = tape_critic.gradient(loss_critic, self.value_net.trainable_variables)
+            _ensure_finite_gradients("basic_br/critic", grads_critic)
             self.optimizer_value.apply_gradients(zip(grads_critic, self.value_net.trainable_variables))
 
             # Track metrics
@@ -697,13 +893,28 @@ class BasicTrainerBR:
             # === Compute Action using CURRENT Policy (gradients flow) ===
             # Reference: report_brief.md line 622-623
             # "Compute next action using the Current Policy"
-            k_next = self.policy_net(k, z)
+            k_next, k_preclip = forward_basic_policy_levels(
+                policy_net=self.policy_net,
+                k=k,
+                z=z,
+                transform_spec=self.transform_spec,
+                training=True,
+                apply_output_clips=False,
+                return_preclip=True,
+            )
 
             # === Compute Continuation Value using CURRENT Value Network ===
             # Reference: report_brief.md line 626-627
             # "Predict continuation value using the Current Value network"
             # Note: We freeze value weights by not including them in gradients
-            V_next_main = self.value_net(k_next, z_next_main)
+            V_next_main = forward_basic_value_levels(
+                value_net=self.value_net,
+                k=k_next,
+                z=z_next_main,
+                transform_spec=self.transform_spec,
+                training=False,
+                apply_output_clips=False,
+            )
 
             # === Compute Cash Flow ===
             # k and k_next are already in LEVELS - pass directly to economic functions
@@ -719,15 +930,23 @@ class BasicTrainerBR:
             # "Define Loss (negative expected value of Bellman RHS)"
             # Note: We use only main fork for actor (not AiO form)
             loss_actor = -tf.reduce_mean(e + self.beta * V_next_main)
+            _ensure_finite_scalar("basic_br/loss_actor", loss_actor)
 
         # Update actor (policy network)
         # Reference: report_brief.md line 632
         grads_actor = tape_actor.gradient(loss_actor, self.policy_net.trainable_variables)
+        _ensure_finite_gradients("basic_br/actor", grads_actor)
         self.optimizer_policy.apply_gradients(zip(grads_actor, self.policy_net.trainable_variables))
 
         # Update target policy network with Polyak averaging
         # Reference: report_brief.md line 633
         target_policy_update = self._update_target_policy()
+
+        k_postclip = _inference_clip_k(k_preclip, transform_spec=self.transform_spec)
+        clip_diag = compute_k_clip_diagnostics(
+            k_postclip=k_postclip,
+            k_preclip=k_preclip,
+        )
 
         return {
             "loss_critic": float(np.mean(critic_losses)),
@@ -737,7 +956,9 @@ class BasicTrainerBR:
             "rel_mae": last_diagnostics.get("rel_mae", 0.0),
             "mean_value_scale": last_diagnostics.get("mean_value_scale", 0.0),
             "target_value_update": target_value_update,
-            "target_policy_update": target_policy_update
+            "target_policy_update": target_policy_update,
+            "clip_fraction_k": clip_diag["clip_fraction_k"],
+            "preclip_max_k": clip_diag["preclip_max_k"],
         }
 
     def evaluate(
@@ -770,9 +991,30 @@ class BasicTrainerBR:
         z_next_fork = tf.reshape(z_next_fork, [-1, 1])
 
         # Critic evaluation (using target networks)
-        k_next = self.target_policy_net(k, z)
-        V_next_main = self.target_value_net(k_next, z_next_main)
-        V_next_fork = self.target_value_net(k_next, z_next_fork)
+        k_next = forward_basic_policy_levels(
+            policy_net=self.target_policy_net,
+            k=k,
+            z=z,
+            transform_spec=self.transform_spec,
+            training=False,
+            apply_output_clips=False,
+        )
+        V_next_main = forward_basic_value_levels(
+            value_net=self.target_value_net,
+            k=k_next,
+            z=z_next_main,
+            transform_spec=self.transform_spec,
+            training=False,
+            apply_output_clips=False,
+        )
+        V_next_fork = forward_basic_value_levels(
+            value_net=self.target_value_net,
+            k=k_next,
+            z=z_next_fork,
+            transform_spec=self.transform_spec,
+            training=False,
+            apply_output_clips=False,
+        )
 
         # k and k_next are already in LEVELS - pass directly to economic functions
         e = compute_cash_flow_basic(k, k_next, z, self.params, temperature=temperature, logit_clip=self.logit_clip)
@@ -780,273 +1022,64 @@ class BasicTrainerBR:
         y1 = e + self.beta * V_next_main
         y2 = e + self.beta * V_next_fork
 
-        V_curr = self.value_net(k, z)
+        V_curr = forward_basic_value_levels(
+            value_net=self.value_net,
+            k=k,
+            z=z,
+            transform_spec=self.transform_spec,
+            training=False,
+            apply_output_clips=False,
+        )
         V_curr_norm = V_curr / self.br_scale
         y1_norm = y1 / self.br_scale
         y2_norm = y2 / self.br_scale
         if self.loss_type == "mse":
             loss_critic = compute_br_critic_loss_mse(V_curr_norm, y1_norm, y2_norm)
+        elif self.loss_type == "huber":
+            loss_critic = compute_br_critic_loss_huber(V_curr_norm, y1_norm, y2_norm)
         else:  # "crossprod"
             loss_critic = compute_br_critic_loss_aio(V_curr_norm, y1_norm, y2_norm)
 
         # Actor evaluation (using current policy)
-        k_next_actor = self.policy_net(k, z)
-        V_next_actor = self.value_net(k_next_actor, z_next_main)
+        k_next_actor, k_preclip = forward_basic_policy_levels(
+            policy_net=self.policy_net,
+            k=k,
+            z=z,
+            transform_spec=self.transform_spec,
+            training=False,
+            apply_output_clips=False,
+            return_preclip=True,
+        )
+        V_next_actor = forward_basic_value_levels(
+            value_net=self.value_net,
+            k=k_next_actor,
+            z=z_next_main,
+            transform_spec=self.transform_spec,
+            training=False,
+            apply_output_clips=False,
+        )
         # k and k_next_actor are already in LEVELS - pass directly to economic functions
         e_actor = compute_cash_flow_basic(k, k_next_actor, z, self.params, temperature=temperature, logit_clip=self.logit_clip)
         loss_actor = -tf.reduce_mean(e_actor + self.beta * V_next_actor)
 
+        k_postclip = _inference_clip_k(k_preclip, transform_spec=self.transform_spec)
+        clip_diag = compute_k_clip_diagnostics(
+            k_postclip=k_postclip,
+            k_preclip=k_preclip,
+        )
+
         return {
             "loss_critic": float(loss_critic),
-            "loss_actor": float(loss_actor)
+            "loss_actor": float(loss_actor),
+            "clip_fraction_k": clip_diag["clip_fraction_k"],
+            "preclip_max_k": clip_diag["preclip_max_k"],
         }
 
 
-class BasicTrainerBRRegression:
-    """
-    Method 4: Bellman Residual Regression with FOC/Envelope regularization.
-
-    This trainer uses the non-linear regression formulation:
-        L = L_BR + w_foc * L_FOC + w_env * L_Env
-
-    Key design choices:
-    - Uses existing economic primitives and smooth gates from logic.py.
-    - Uses the shared annealing temperature passed by execute_training_loop().
-    - Computes FOC/Envelope derivatives with TensorFlow autodiff (no hard-coded formulas).
-    - Assumes interior solutions for bounded actions (no KKT terms in this version).
-    """
-
-    def __init__(
-        self,
-        policy_net: BasicPolicyNetwork,
-        value_net: BasicValueNetwork,
-        params: EconomicParams,
-        shock_params: ShockParams,
-        optimizer_policy: tf.keras.optimizers.Optimizer,
-        optimizer_value: tf.keras.optimizers.Optimizer,
-        logit_clip: float,
-        loss_type: str = "crossprod",
-        br_scale: float = 1.0,
-        weight_foc: float = 1.0,
-        weight_env: float = 1.0,
-        use_foc: bool = True,
-        use_env: bool = True,
-    ):
-        self.policy_net = policy_net
-        self.value_net = value_net
-        self.params = params
-        self.shock_params = shock_params
-        self.optimizer_policy = optimizer_policy
-        self.optimizer_value = optimizer_value
-        self.logit_clip = logit_clip
-        self.beta = 1.0 / (1.0 + params.r_rate)
-        self.loss_type = loss_type
-        self.br_scale = float(br_scale)
-        self.weight_foc = weight_foc
-        self.weight_env = weight_env
-        self.use_foc = use_foc
-        self.use_env = use_env
-
-        valid_loss_types = {"mse", "crossprod"}
-        if loss_type not in valid_loss_types:
-            raise ValueError(f"loss_type must be one of {valid_loss_types}, got '{loss_type}'")
-        if self.br_scale <= 0:
-            raise ValueError(f"br_scale must be > 0, got {self.br_scale}")
-        if weight_foc < 0:
-            raise ValueError(f"weight_foc must be >= 0, got {weight_foc}")
-        if weight_env < 0:
-            raise ValueError(f"weight_env must be >= 0, got {weight_env}")
-        if not (use_foc or use_env):
-            logger.warning("BasicTrainerBRRegression initialized with use_foc=False and use_env=False (pure BR residual).")
-
-        if params.cost_fixed > 0:
-            logger.warning(
-                "BR regression with cost_fixed > 0: FOC/Envelope rely on smoothed indicators and "
-                "approximate interior conditions near the inaction kink."
-            )
-
-    @staticmethod
-    def _safe_gradient(
-        tape: tf.GradientTape,
-        target: tf.Tensor,
-        source: tf.Tensor
-    ) -> tf.Tensor:
-        """
-        Compute d(target)/d(source), falling back to zeros when disconnected.
-        """
-        grad = tape.gradient(target, source)
-        if grad is None:
-            return tf.zeros_like(source)
-        return grad
-
-    @staticmethod
-    def _apply_gradients(
-        optimizer: tf.keras.optimizers.Optimizer,
-        grads: List[tf.Tensor],
-        vars_: List[tf.Variable]
-    ) -> None:
-        pairs = [(g, v) for g, v in zip(grads, vars_) if g is not None]
-        if pairs:
-            optimizer.apply_gradients(pairs)
-
-    def _compute_objective_terms(
-        self,
-        k: tf.Tensor,
-        z: tf.Tensor,
-        z_next_main: tf.Tensor,
-        z_next_fork: tf.Tensor,
-        temperature: float,
-    ) -> Dict[str, tf.Tensor]:
-        """
-        Compute BR, FOC, Envelope losses and aggregate objective.
-
-        Note: This must run inside the outer optimization tape so that gradients through
-        autodiff-derived terms (FOC/Envelope) reach network parameters.
-        """
-        with tf.GradientTape(persistent=True) as tape_inner:
-            # Trainable policy action
-            k_next = self.policy_net(k, z)
-
-            # We need state/action derivatives for FOC and envelope terms
-            tape_inner.watch(k)
-            tape_inner.watch(k_next)
-
-            # Economic and value terms
-            e = compute_cash_flow_basic(
-                k,
-                k_next,
-                z,
-                self.params,
-                temperature=temperature,
-                logit_clip=self.logit_clip,
-            )
-            V_curr = self.value_net(k, z)
-            V_next_main = self.value_net(k_next, z_next_main)
-            V_next_fork = self.value_net(k_next, z_next_fork)
-
-        # Bellman residuals (no detached targets in BR-reg formulation)
-        y_main = e + self.beta * V_next_main
-        y_fork = e + self.beta * V_next_fork
-        V_curr_norm = V_curr / self.br_scale
-        y_main_norm = y_main / self.br_scale
-        y_fork_norm = y_fork / self.br_scale
-        if self.loss_type == "mse":
-            loss_br = compute_br_critic_loss_mse(V_curr_norm, y_main_norm, y_fork_norm)
-        else:
-            loss_br = compute_br_critic_loss_aio(V_curr_norm, y_main_norm, y_fork_norm)
-
-        # FOC residual:
-        #   d e(k,k',z) / d k' + beta * d V(k',z') / d k' = 0
-        de_dk_next = self._safe_gradient(tape_inner, e, k_next)
-        dV_next_main_dk_next = self._safe_gradient(tape_inner, V_next_main, k_next)
-        dV_next_fork_dk_next = self._safe_gradient(tape_inner, V_next_fork, k_next)
-        foc_main = de_dk_next + self.beta * dV_next_main_dk_next
-        foc_fork = de_dk_next + self.beta * dV_next_fork_dk_next
-
-        if self.use_foc:
-            if self.loss_type == "mse":
-                loss_foc = compute_er_loss_mse(foc_main, foc_fork)
-            else:
-                loss_foc = compute_er_loss_aio(foc_main, foc_fork)
-        else:
-            loss_foc = tf.constant(0.0, dtype=tf.float32)
-
-        # Envelope residual:
-        #   d e(k,k',z) / d k - d V(k,z) / d k = 0
-        de_dk = self._safe_gradient(tape_inner, e, k)
-        dV_curr_dk = self._safe_gradient(tape_inner, V_curr, k)
-        env_residual = de_dk - dV_curr_dk
-        if self.use_env:
-            loss_env = tf.reduce_mean(tf.square(env_residual))
-        else:
-            loss_env = tf.constant(0.0, dtype=tf.float32)
-
-        del tape_inner
-
-        loss_total = loss_br + self.weight_foc * loss_foc + self.weight_env * loss_env
-
-        # Diagnostics (always non-negative proxies for monitoring)
-        bellman_res_main = V_curr - y_main
-        bellman_res_fork = V_curr - y_fork
-        mse_br_proxy = tf.reduce_mean(0.5 * (tf.square(bellman_res_main) + tf.square(bellman_res_fork)))
-        mse_foc_proxy = tf.reduce_mean(0.5 * (tf.square(foc_main) + tf.square(foc_fork)))
-        mse_env_proxy = tf.reduce_mean(tf.square(env_residual))
-
-        return {
-            "loss_total": loss_total,
-            "loss_br": loss_br,
-            "loss_foc": loss_foc,
-            "loss_env": loss_env,
-            "mse_br_proxy": mse_br_proxy,
-            "mse_foc_proxy": mse_foc_proxy,
-            "mse_env_proxy": mse_env_proxy,
-            "mean_abs_foc": tf.reduce_mean(0.5 * (tf.abs(foc_main) + tf.abs(foc_fork))),
-            "mean_abs_env": tf.reduce_mean(tf.abs(env_residual)),
-        }
-
-    def train_step(
-        self,
-        k: tf.Tensor,
-        z: tf.Tensor,
-        z_next_main: tf.Tensor,
-        z_next_fork: tf.Tensor,
-        temperature: float,
-    ) -> Dict[str, float]:
-        k = tf.reshape(k, [-1, 1])
-        z = tf.reshape(z, [-1, 1])
-        z_next_main = tf.reshape(z_next_main, [-1, 1])
-        z_next_fork = tf.reshape(z_next_fork, [-1, 1])
-
-        with tf.GradientTape(persistent=True) as tape_outer:
-            terms = self._compute_objective_terms(
-                k, z, z_next_main, z_next_fork, temperature
-            )
-            loss_total = terms["loss_total"]
-
-        grads_policy = tape_outer.gradient(loss_total, self.policy_net.trainable_variables)
-        grads_value = tape_outer.gradient(loss_total, self.value_net.trainable_variables)
-        del tape_outer
-
-        self._apply_gradients(self.optimizer_policy, grads_policy, self.policy_net.trainable_variables)
-        self._apply_gradients(self.optimizer_value, grads_value, self.value_net.trainable_variables)
-
-        return {
-            "loss_BR_reg": float(terms["loss_total"]),
-            "loss_BR": float(terms["loss_br"]),
-            "loss_FOC": float(terms["loss_foc"]),
-            "loss_Env": float(terms["loss_env"]),
-            "mse_BR_proxy": float(terms["mse_br_proxy"]),
-            "mse_FOC_proxy": float(terms["mse_foc_proxy"]),
-            "mse_Env_proxy": float(terms["mse_env_proxy"]),
-            "mean_abs_foc": float(terms["mean_abs_foc"]),
-            "mean_abs_env": float(terms["mean_abs_env"]),
-        }
-
-    def evaluate(
-        self,
-        k: tf.Tensor,
-        z: tf.Tensor,
-        z_next_main: tf.Tensor,
-        z_next_fork: tf.Tensor,
-        temperature: float,
-    ) -> Dict[str, float]:
-        k = tf.reshape(k, [-1, 1])
-        z = tf.reshape(z, [-1, 1])
-        z_next_main = tf.reshape(z_next_main, [-1, 1])
-        z_next_fork = tf.reshape(z_next_fork, [-1, 1])
-
-        terms = self._compute_objective_terms(
-            k, z, z_next_main, z_next_fork, temperature
-        )
-        return {
-            "loss_BR_reg": float(terms["loss_total"]),
-            "loss_BR": float(terms["loss_br"]),
-            "loss_FOC": float(terms["loss_foc"]),
-            "loss_Env": float(terms["loss_env"]),
-            "mse_BR_proxy": float(terms["mse_br_proxy"]),
-            "mse_FOC_proxy": float(terms["mse_foc_proxy"]),
-            "mse_Env_proxy": float(terms["mse_env_proxy"]),
-            "mean_abs_foc": float(terms["mean_abs_foc"]),
-            "mean_abs_env": float(terms["mean_abs_env"]),
-        }
-
+# BasicTrainerBRRegression has been moved to src/experimental/br_multitask.py.
+# The BR-multitask formulation has a structural identification failure
+# (see report/br_multitask_structural_issues.md). Use ER for production.
+#
+# To use the experimental trainer:
+#   from src.experimental.br_multitask import BasicTrainerBRRegression
+_BR_MULTITASK_MOVED = True  # sentinel for grep/search

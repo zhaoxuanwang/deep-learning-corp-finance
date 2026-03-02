@@ -37,7 +37,7 @@ def test_train_dispatch_returns_training_result(monkeypatch):
     warm_start_token = object()
     captured = {}
 
-    def fake_train_basic_br(**kwargs):
+    def fake_train_basic_br_actor_critic(**kwargs):
         captured["warm_start_policy"] = kwargs.get("warm_start_policy")
         return {
             "history": {"loss_critic": [1.0]},
@@ -47,7 +47,11 @@ def test_train_dispatch_returns_training_result(monkeypatch):
             "_params": kwargs["params"],
         }
 
-    monkeypatch.setattr(trainer_api, "train_basic_br", fake_train_basic_br)
+    monkeypatch.setattr(
+        trainer_api,
+        "train_basic_br_actor_critic",
+        fake_train_basic_br_actor_critic,
+    )
 
     result = train(
         model="basic",
@@ -63,34 +67,6 @@ def test_train_dispatch_returns_training_result(monkeypatch):
     assert result.artifacts["policy_net"] == "policy"
     assert result.artifacts["value_net"] == "value"
     assert captured["warm_start_policy"] is warm_start_token
-
-
-def test_train_dispatch_basic_br_reg_returns_training_result(monkeypatch):
-    cfg = _make_experiment_config("basic_br_reg")
-
-    def fake_train_basic_br_reg(**kwargs):
-        return {
-            "history": {"loss_BR_reg": [0.5]},
-            "_policy_net": "policy",
-            "_value_net": "value",
-            "_configs": {"method": kwargs["method_config"]},
-            "_params": kwargs["params"],
-        }
-
-    monkeypatch.setattr(trainer_api, "train_basic_br_reg", fake_train_basic_br_reg)
-
-    result = train(
-        model="basic",
-        method="br_reg",
-        config=cfg,
-        train_data={},
-        bounds={"k": (0.1, 1.0), "log_z": (-0.1, 0.1)},
-    )
-
-    assert isinstance(result, TrainingResult)
-    assert result.history["loss_BR_reg"] == [0.5]
-    assert result.artifacts["policy_net"] == "policy"
-    assert result.artifacts["value_net"] == "value"
 
 
 def test_train_can_return_legacy_dict(monkeypatch):
@@ -156,6 +132,36 @@ def test_train_rejects_warm_start_for_non_br_method(monkeypatch):
         )
 
 
+def test_train_forwards_training_seed_from_metadata(monkeypatch):
+    cfg = _make_experiment_config("basic_er")
+    captured = {}
+
+    def fake_train_basic_er(**kwargs):
+        captured["training_seed"] = kwargs.get("training_seed")
+        return {
+            "history": {"loss_ER": [0.1]},
+            "_policy_net": "policy",
+            "_configs": {"method": kwargs["method_config"]},
+            "_params": kwargs["params"],
+        }
+
+    monkeypatch.setattr(trainer_api, "train_basic_er", fake_train_basic_er)
+
+    result = train(
+        model="basic",
+        method="er",
+        config=cfg,
+        train_data={},
+        dataset_metadata={
+            "bounds": {"k": [0.1, 1.0], "log_z": [-0.1, 0.1], "b": [0.0, 1.0]},
+            "master_seed": [7, 11],
+        },
+    )
+
+    assert isinstance(result, TrainingResult)
+    assert captured["training_seed"] == (7, 11)
+
+
 def test_basic_wrapper_rejects_method_config_mismatch():
     with pytest.raises(ValueError, match="does not match requested method"):
         basic_api.train_basic_br(
@@ -163,20 +169,6 @@ def test_basic_wrapper_rejects_method_config_mismatch():
             net_config=NetworkConfig(),
             opt_config=OptimizationConfig(n_iter=1, batch_size=2),
             method_config=MethodConfig(name="basic_er"),
-            anneal_config=AnnealingConfig(),
-            params=EconomicParams(),
-            shock_params=ShockParams(),
-            bounds={"k": (0.1, 1.0), "log_z": (-0.1, 0.1)},
-        )
-
-
-def test_basic_br_reg_wrapper_rejects_method_config_mismatch():
-    with pytest.raises(ValueError, match="does not match requested method"):
-        basic_api.train_basic_br_reg(
-            dataset={},
-            net_config=NetworkConfig(),
-            opt_config=OptimizationConfig(n_iter=1, batch_size=2),
-            method_config=MethodConfig(name="basic_br"),
             anneal_config=AnnealingConfig(),
             params=EconomicParams(),
             shock_params=ShockParams(),

@@ -18,7 +18,6 @@ from src.ddp.ddp_config import (
     DDPGridConfig,
     estimate_transition_matrix_from_dataset,
     extract_bounds_from_metadata,
-    initialize_markov_process,
 )
 from src.economy import logic
 
@@ -70,30 +69,24 @@ class BasicModelDDP:
         self.beta = tf.constant(1 / (1 + params.r_rate), dtype=tf.float32)
         self.reward_fn = reward_fn or logic.compute_cash_flow_basic
 
-        if dataset is not None and dataset_metadata is not None:
-            self.dataset = dataset
-            self.dataset_metadata = dataset_metadata
-            bounds = extract_bounds_from_metadata(dataset_metadata)
-            delta_val = float(params.delta if delta is None else delta)
-
-            # Build grids and data-estimated Markov transition.
-            k_grid_np, _, _ = self.grid_config.generate_grids(bounds, delta=delta_val)
-            z_grid_np, prob_matrix_np = estimate_transition_matrix_from_dataset(
-                dataset,
-                bounds,
-                z_size=self.grid_config.z_size,
+        if dataset is None or dataset_metadata is None:
+            raise ValueError(
+                "BasicModelDDP requires dataset + dataset_metadata for offline construction. "
+                "Use BasicModelDDP.from_dataset_bundle(...) for metadata-first workflows."
             )
-        else:
-            # Backward-compatible legacy path.
-            if shock_params is None:
-                raise ValueError(
-                    "Offline path requires dataset + dataset_metadata. "
-                    "Legacy path requires shock_params."
-                )
-            z_grid_np, prob_matrix_np = initialize_markov_process(shock_params, self.grid_config.z_size)
-            k_grid_np = self.grid_config.generate_capital_grid(params)
-            self.dataset = None
-            self.dataset_metadata = None
+
+        self.dataset = dataset
+        self.dataset_metadata = dataset_metadata
+        bounds = extract_bounds_from_metadata(dataset_metadata)
+        delta_val = float(params.delta if delta is None else delta)
+
+        # Build grids and data-estimated Markov transition.
+        k_grid_np, _, _ = self.grid_config.generate_grids(bounds, delta=delta_val)
+        z_grid_np, prob_matrix_np = estimate_transition_matrix_from_dataset(
+            dataset,
+            bounds,
+            z_size=self.grid_config.z_size,
+        )
 
         # Convert to TensorFlow Constants
         self.z_grid, self.prob_matrix, self.k_grid = convert_to_tf(

@@ -13,15 +13,12 @@ from src.economy.data import DatasetBundle, canonicalize_bounds
 from src.trainers.basic_api import (
     train_basic_lr,
     train_basic_er,
-    train_basic_br,
-    train_basic_br_reg,
     train_basic_br_actor_critic,
-    train_basic_br_multitask,
 )
 from src.trainers.config import ExperimentConfig
 from src.trainers.method_names import canonicalize_method_name
 from src.trainers.results import TrainingResult
-from src.trainers.risky_api import train_risky_br, train_risky_br_actor_critic
+from src.trainers.risky_api import train_risky_br_actor_critic
 
 
 _MODEL_ALIASES = {
@@ -51,6 +48,92 @@ def _canonicalize_model(model: str) -> str:
     return _MODEL_ALIASES[normalized]
 
 
+def _coerce_seed_pair(
+    raw_seed: Any,
+    *,
+    seed_label: str,
+) -> Tuple[int, int]:
+    """
+    Coerce seed input to a 2-int stateless seed pair.
+    """
+    if isinstance(raw_seed, bool):
+        raise ValueError(f"{seed_label} must be int or length-2 seed pair; got bool.")
+
+    if isinstance(raw_seed, int):
+        return int(raw_seed), 0
+
+    if isinstance(raw_seed, (list, tuple)) and len(raw_seed) == 2:
+        return int(raw_seed[0]), int(raw_seed[1])
+
+    raise ValueError(
+        f"{seed_label} must be int or length-2 list/tuple, got {raw_seed!r}."
+    )
+
+
+def _seed_pair_to_global_int(seed_pair: Tuple[int, int]) -> int:
+    """
+    Mix a 2-int seed pair into a deterministic non-negative 31-bit integer.
+    """
+    s0, s1 = int(seed_pair[0]), int(seed_pair[1])
+    mixed = ((s0 & 0xFFFFFFFF) * 1_000_003 + (s1 & 0xFFFFFFFF) + 0x9E3779B9) & 0x7FFFFFFF
+    return int(mixed)
+
+
+def _resolve_training_seed(
+    *,
+    config: ExperimentConfig,
+    dataset_metadata: Optional[Dict[str, Any]],
+) -> Optional[Tuple[int, int]]:
+    """
+    Resolve runtime training seed with explicit precedence:
+    1) config.optimization.training_seed
+    2) dataset_metadata['training_seed']
+    3) dataset_metadata['master_seed'] (backward-compatible fallback)
+    """
+    config_seed = config.optimization.training_seed
+    if config_seed is not None:
+        return _coerce_seed_pair(
+            config_seed,
+            seed_label="config.optimization.training_seed",
+        )
+
+    if dataset_metadata is None:
+        return None
+
+    if "training_seed" in dataset_metadata and dataset_metadata["training_seed"] is not None:
+        return _coerce_seed_pair(
+            dataset_metadata["training_seed"],
+            seed_label="dataset_metadata['training_seed']",
+        )
+
+    if "master_seed" in dataset_metadata and dataset_metadata["master_seed"] is not None:
+        return _coerce_seed_pair(
+            dataset_metadata["master_seed"],
+            seed_label="dataset_metadata['master_seed']",
+        )
+
+    return None
+
+
+def _configure_runtime_seed(
+    *,
+    config: ExperimentConfig,
+    training_seed: Optional[Tuple[int, int]],
+) -> None:
+    """
+    Configure framework-level runtime seed and deterministic-op mode.
+    """
+    if training_seed is not None:
+        tf.keras.utils.set_random_seed(_seed_pair_to_global_int(training_seed))
+
+    if config.optimization.deterministic_ops:
+        try:
+            tf.config.experimental.enable_op_determinism()
+        except Exception:
+            # Best effort only: some environments/devices may not support full determinism.
+            pass
+
+
 def train(
     *,
     model: str,
@@ -73,8 +156,9 @@ def train(
         train_data: Training dataset dictionary.
         bounds: Optional manual bounds dictionary.
             Prefer metadata-driven bounds extraction via dataset_metadata.
-        dataset_metadata: Optional metadata dictionary containing 'bounds'.
-            If provided, bounds are auto-extracted and used as source of truth.
+        dataset_metadata: Optional metadata dictionary containing 'bounds' and
+            optional seed fields ('training_seed' / 'master_seed'). If provided,
+            bounds are auto-extracted and used as source of truth.
         validation_data: Optional validation dataset dictionary.
         warm_start_policy: Optional policy source used to initialize BR policy
             networks. Supported only for basic BR methods.
@@ -133,13 +217,17 @@ def train(
         if config.method.name != configured_method
         else config.method
     )
+    training_seed = _resolve_training_seed(
+        config=config,
+        dataset_metadata=dataset_metadata,
+    )
+    _configure_runtime_seed(config=config, training_seed=training_seed)
 
     dispatch = {
         ("basic", "basic_lr"): train_basic_lr,
         ("basic", "basic_er"): train_basic_er,
-        ("basic", "basic_br_actor_critic"): train_basic_br,
-        ("basic", "basic_br_multitask"): train_basic_br_reg,
-        ("risky", "risky_br_actor_critic"): train_risky_br,
+        ("basic", "basic_br_actor_critic"): train_basic_br_actor_critic,
+        ("risky", "risky_br_actor_critic"): train_risky_br_actor_critic,
     }
     key = (canonical_model, requested_method)
     if key not in dispatch:
@@ -158,17 +246,17 @@ def train(
         shock_params=config.shock_params,
         bounds=resolved_bounds,
         validation_data=validation_data,
+        training_seed=training_seed,
     )
 
     if warm_start_policy is not None:
         warm_start_methods = {
             ("basic", "basic_br_actor_critic"),
-            ("basic", "basic_br_multitask"),
         }
         if key not in warm_start_methods:
             raise ValueError(
                 "warm_start_policy is only supported for basic BR methods: "
-                "basic_br_actor_critic, basic_br_multitask."
+                "basic_br_actor_critic."
             )
         call_kwargs["warm_start_policy"] = warm_start_policy
 

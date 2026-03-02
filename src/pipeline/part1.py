@@ -39,7 +39,12 @@ from src.trainers import (
     DataConfig,
     train,
 )
-from src.trainers.config import OptimizerConfig
+from src.trainers.io_transforms import build_inference_helper_from_result
+from src.trainers.config import (
+    OptimizerConfig,
+    ObservationNormalizationConfig,
+    InferenceClipConfig,
+)
 from src.utils.checkpointing import save_training_result, load_training_result
 
 
@@ -108,6 +113,21 @@ def _build_method_config(raw: Mapping[str, Any]) -> MethodConfig:
     if risky is not None:
         payload["risky"] = RiskyDebtConfig(**dict(risky))
     return MethodConfig(**payload)
+
+
+def _build_network_config(raw: Mapping[str, Any]) -> NetworkConfig:
+    payload = dict(raw)
+    payload.pop("use_batch_norm", None)
+    payload.pop("allow_unsafe_heads", None)
+    obs_raw = payload.get("observation_normalization")
+    if obs_raw is not None:
+        payload["observation_normalization"] = ObservationNormalizationConfig(
+            **dict(obs_raw)
+        )
+    clip_raw = payload.get("inference_clips")
+    if clip_raw is not None:
+        payload["inference_clips"] = InferenceClipConfig(**dict(clip_raw))
+    return NetworkConfig(**payload)
 
 
 def _mk_experiment_config(
@@ -756,7 +776,7 @@ def run_train_nn(
     shock_params = ShockParams(**dict(config["shock_params"]))
 
     nn_cfg = dict(config["nn"])
-    net_cfg = NetworkConfig(**dict(nn_cfg["network"]))
+    net_cfg = _build_network_config(nn_cfg["network"])
     basic_opt = _build_optimization_config(nn_cfg["basic_optimization"])
     basic_anneal = AnnealingConfig(**dict(nn_cfg["basic_annealing"]))
     risky_opt = _build_optimization_config(nn_cfg["risky_optimization"])
@@ -787,10 +807,7 @@ def run_train_nn(
     )
 
     # Train LR/ER from random init first, then warm-start supported BR variants from ER.
-    method_order = [m for m in ("lr", "er", "br", "br_multitask", "br_reg") if m in basic_methods]
-    if "br_multitask" in method_order and "br_reg" in method_order:
-        # Avoid training duplicate aliases for the same multitask BR method.
-        method_order = [m for m in method_order if m != "br_reg"]
+    method_order = [m for m in ("lr", "er", "br") if m in basic_methods]
 
     basic_results: Dict[str, Dict[str, Any]] = {}
 
@@ -815,7 +832,7 @@ def run_train_nn(
             metadata = train_flat.metadata
 
         warm_start_policy = None
-        if method_alias in {"br", "br_multitask", "br_reg"}:
+        if method_alias == "br":
             warm_start_policy = basic_results.get("er")
             if warm_start_policy is None:
                 raise RuntimeError(
@@ -961,10 +978,10 @@ def run_compare(
             load_target_nets=False,
             verbose=False,
         )
-        policy_net = nn_result["_policy_net"]
+        infer = build_inference_helper_from_result(nn_result)
         k_in = tf.constant(k_basic.reshape(-1, 1), dtype=tf.float32)
         z_in = tf.constant(np.full((len(k_basic), 1), z_fixed_basic), dtype=tf.float32)
-        k_next = policy_net(k_in, z_in).numpy().reshape(-1)
+        k_next = infer.policy(k_in, z_in).numpy().reshape(-1)
         basic_rmse[method] = float(np.sqrt(np.mean((k_next - basic_slice_pfi) ** 2)))
         plt.plot(k_basic, k_next, label=f"NN {method.upper()}")
 
@@ -1006,11 +1023,11 @@ def run_compare(
         load_target_nets=False,
         verbose=False,
     )
-    risky_net = risky_nn["_policy_net"]
+    risky_infer = build_inference_helper_from_result(risky_nn)
     k_in = tf.constant(np.full((len(b_risky), 1), k_fixed), dtype=tf.float32)
     b_in = tf.constant(b_risky.reshape(-1, 1), dtype=tf.float32)
     z_in = tf.constant(np.full((len(b_risky), 1), z_fixed), dtype=tf.float32)
-    k_next_nn, b_next_nn = risky_net(k_in, b_in, z_in)
+    k_next_nn, b_next_nn = risky_infer.policy(k_in, b_in, z_in)
     k_next_nn = k_next_nn.numpy().reshape(-1)
     b_next_nn = b_next_nn.numpy().reshape(-1)
 

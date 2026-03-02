@@ -9,7 +9,7 @@ import tensorflow as tf
 from src.economy.data_generator import DataGenerator
 from src.economy.parameters import EconomicParams, ShockParams
 from src.networks.network_basic import build_basic_networks
-from src.trainers.basic import BasicTrainerBRRegression
+from src.experimental.br_multitask import BasicTrainerBRRegression
 
 
 @pytest.fixture
@@ -59,7 +59,9 @@ def networks():
         logz_max=0.5,
         n_layers=2,
         n_neurons=16,
-        activation="swish",
+        hidden_activation="swish",
+        policy_head="bounded_sigmoid",
+        value_head="linear",
     )
     return policy_net, value_net
 
@@ -161,3 +163,4 @@ class TestBasicBRRegressionTrainer:
         assert "loss_BR" in metrics
         assert "loss_FOC" in metrics
         assert "loss_Env" in metrics
+

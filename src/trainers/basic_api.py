@@ -6,17 +6,17 @@ from __future__ import annotations
 
 from dataclasses import replace
 from typing import Any, Dict, Optional, Tuple, Union
-import warnings
 
 import tensorflow as tf
 
 from src.economy.parameters import EconomicParams, ShockParams
 from src.networks.network_basic import build_basic_networks
+from src.networks.observation_normalization import build_observation_normalizer
+from src.trainers.io_transforms import build_basic_transform_spec
 from src.trainers.basic_trainers import (
     BasicTrainerLR,
     BasicTrainerER,
     BasicTrainerBR,
-    BasicTrainerBRRegression,
 )
 from src.trainers.config import (
     NetworkConfig,
@@ -59,15 +59,6 @@ def _batch_adapter_br(batch: Dict[str, tf.Tensor]) -> Dict[str, tf.Tensor]:
     }
 
 
-def _batch_adapter_br_reg(batch: Dict[str, tf.Tensor]) -> Dict[str, tf.Tensor]:
-    return {
-        "k": batch["k"],
-        "z": batch["z"],
-        "z_next_main": batch["z_next_main"],
-        "z_next_fork": batch["z_next_fork"],
-    }
-
-
 def _make_validation_fn_lr(trainer: BasicTrainerLR):
     def validation_fn(trainer, batch, temperature):
         return trainer.evaluate(batch["k0"], batch["z_path"], temperature)
@@ -88,19 +79,6 @@ def _make_validation_fn_er(trainer: BasicTrainerER):
 
 
 def _make_validation_fn_br(trainer: BasicTrainerBR):
-    def validation_fn(trainer, batch, temperature):
-        return trainer.evaluate(
-            batch["k"],
-            batch["z"],
-            batch["z_next_main"],
-            batch["z_next_fork"],
-            temperature,
-        )
-
-    return validation_fn
-
-
-def _make_validation_fn_br_reg(trainer: BasicTrainerBRRegression):
     def validation_fn(trainer, batch, temperature):
         return trainer.evaluate(
             batch["k"],
@@ -161,6 +139,27 @@ def _maybe_apply_policy_warm_start(
     }
 
 
+def _build_basic_observation_normalizer(
+    *,
+    dataset: Dict[str, tf.Tensor],
+    net_config: NetworkConfig,
+    bounds: Dict[str, Tuple[float, float]],
+) -> Dict[str, Any]:
+    # TODO: upgrade to one shared calibration sample across methods for
+    # fully consistent LR/ER/BR normalization stats.
+    obs_cfg = net_config.observation_normalization
+    return build_observation_normalizer(
+        dataset=dataset,
+        bounds=bounds,
+        k_scheme=obs_cfg.k_scheme,
+        z_scheme=obs_cfg.z_scheme,
+        b_scheme=obs_cfg.b_scheme,
+        z_input_space=obs_cfg.z_input_space,
+        epsilon=obs_cfg.epsilon,
+        include_debt=False,
+    )
+
+
 def train_basic_lr(
     dataset: Dict[str, tf.Tensor],
     net_config: NetworkConfig,
@@ -171,6 +170,7 @@ def train_basic_lr(
     shock_params: ShockParams,
     bounds: Dict[str, Tuple[float, float]],
     validation_data: Optional[Dict[str, tf.Tensor]] = None,
+    training_seed: Optional[Tuple[int, int]] = None,
 ) -> Union[Dict[str, Any], TrainingResult]:
     method_config = _coerce_method_config(method_config, expected_name="basic_lr")
     spec = get_method_spec("basic_lr")
@@ -183,11 +183,28 @@ def train_basic_lr(
     data_iter = build_training_iterator(
         dataset,
         batch_size=opt_config.batch_size,
-        shuffle_key=spec.shuffle_key or "k0",
+        batch_order=spec.batch_order,
+        permutation_seed=training_seed if spec.batch_order == "fixed_permutation" else None,
     )
 
     k_bounds = bounds["k"]
     logz_bounds = bounds["log_z"]
+    observation_normalizer = _build_basic_observation_normalizer(
+        dataset=dataset,
+        net_config=net_config,
+        bounds=bounds,
+    )
+    clip_cfg = net_config.inference_clips
+    transform_spec = build_basic_transform_spec(
+        normalizer=observation_normalizer,
+        k_bounds=k_bounds,
+        policy_head=net_config.basic_policy_head,
+        value_head=net_config.basic_value_head,
+        clip_policy_k_min=clip_cfg.basic_policy_k.clip_min,
+        clip_policy_k_max=clip_cfg.basic_policy_k.clip_max,
+        clip_value_min=clip_cfg.basic_value.clip_min,
+        clip_value_max=clip_cfg.basic_value.clip_max,
+    )
     policy_net, _ = build_basic_networks(
         k_min=k_bounds[0],
         k_max=k_bounds[1],
@@ -195,12 +212,13 @@ def train_basic_lr(
         logz_max=logz_bounds[1],
         n_layers=net_config.n_layers,
         n_neurons=net_config.n_neurons,
-        activation=net_config.activation,
+        hidden_activation=net_config.hidden_activation,
     )
 
     optimizer = create_optimizer(opt_config.learning_rate, opt_config.optimizer)
     trainer = BasicTrainerLR(
         policy_net=policy_net,
+        transform_spec=transform_spec,
         params=params,
         shock_params=shock_params,
         optimizer=optimizer,
@@ -233,7 +251,12 @@ def train_basic_lr(
             "annealing": anneal_config,
         },
         params=params,
-        meta={"model": "basic", "method": "basic_lr"},
+        meta={
+            "model": "basic",
+            "method": "basic_lr",
+            "io_transforms": transform_spec,
+            "training_seed": list(training_seed) if training_seed is not None else None,
+        },
     )
     return result.to_legacy_dict()
 
@@ -248,6 +271,7 @@ def train_basic_er(
     shock_params: ShockParams,
     bounds: Dict[str, Tuple[float, float]],
     validation_data: Optional[Dict[str, tf.Tensor]] = None,
+    training_seed: Optional[Tuple[int, int]] = None,
 ) -> Union[Dict[str, Any], TrainingResult]:
     method_config = _coerce_method_config(method_config, expected_name="basic_er")
     spec = get_method_spec("basic_er")
@@ -256,11 +280,28 @@ def train_basic_er(
     data_iter = build_training_iterator(
         dataset,
         batch_size=opt_config.batch_size,
-        shuffle_key=spec.shuffle_key or "k",
+        batch_order=spec.batch_order,
+        permutation_seed=training_seed if spec.batch_order == "fixed_permutation" else None,
     )
 
     k_bounds = bounds["k"]
     logz_bounds = bounds["log_z"]
+    observation_normalizer = _build_basic_observation_normalizer(
+        dataset=dataset,
+        net_config=net_config,
+        bounds=bounds,
+    )
+    clip_cfg = net_config.inference_clips
+    transform_spec = build_basic_transform_spec(
+        normalizer=observation_normalizer,
+        k_bounds=k_bounds,
+        policy_head=net_config.basic_policy_head,
+        value_head=net_config.basic_value_head,
+        clip_policy_k_min=clip_cfg.basic_policy_k.clip_min,
+        clip_policy_k_max=clip_cfg.basic_policy_k.clip_max,
+        clip_value_min=clip_cfg.basic_value.clip_min,
+        clip_value_max=clip_cfg.basic_value.clip_max,
+    )
     policy_net, _ = build_basic_networks(
         k_min=k_bounds[0],
         k_max=k_bounds[1],
@@ -268,12 +309,13 @@ def train_basic_er(
         logz_max=logz_bounds[1],
         n_layers=net_config.n_layers,
         n_neurons=net_config.n_neurons,
-        activation=net_config.activation,
+        hidden_activation=net_config.hidden_activation,
     )
 
     optimizer = create_optimizer(opt_config.learning_rate, opt_config.optimizer)
     trainer = BasicTrainerER(
         policy_net=policy_net,
+        transform_spec=transform_spec,
         params=params,
         shock_params=shock_params,
         optimizer=optimizer,
@@ -307,7 +349,12 @@ def train_basic_er(
             "annealing": anneal_config,
         },
         params=params,
-        meta={"model": "basic", "method": "basic_er"},
+        meta={
+            "model": "basic",
+            "method": "basic_er",
+            "io_transforms": transform_spec,
+            "training_seed": list(training_seed) if training_seed is not None else None,
+        },
     )
     return result.to_legacy_dict()
 
@@ -323,6 +370,7 @@ def train_basic_br_actor_critic(
     bounds: Dict[str, Tuple[float, float]],
     validation_data: Optional[Dict[str, tf.Tensor]] = None,
     warm_start_policy: Optional[Any] = None,
+    training_seed: Optional[Tuple[int, int]] = None,
 ) -> Union[Dict[str, Any], TrainingResult]:
     method_config = _coerce_method_config(
         method_config, expected_name="basic_br_actor_critic"
@@ -333,11 +381,28 @@ def train_basic_br_actor_critic(
     data_iter = build_training_iterator(
         dataset,
         batch_size=opt_config.batch_size,
-        shuffle_key=spec.shuffle_key or "k",
+        batch_order=spec.batch_order,
+        permutation_seed=training_seed if spec.batch_order == "fixed_permutation" else None,
     )
 
     k_bounds = bounds["k"]
     logz_bounds = bounds["log_z"]
+    observation_normalizer = _build_basic_observation_normalizer(
+        dataset=dataset,
+        net_config=net_config,
+        bounds=bounds,
+    )
+    clip_cfg = net_config.inference_clips
+    transform_spec = build_basic_transform_spec(
+        normalizer=observation_normalizer,
+        k_bounds=k_bounds,
+        policy_head=net_config.basic_policy_head,
+        value_head=net_config.basic_value_head,
+        clip_policy_k_min=clip_cfg.basic_policy_k.clip_min,
+        clip_policy_k_max=clip_cfg.basic_policy_k.clip_max,
+        clip_value_min=clip_cfg.basic_value.clip_min,
+        clip_value_max=clip_cfg.basic_value.clip_max,
+    )
     policy_net, value_net = build_basic_networks(
         k_min=k_bounds[0],
         k_max=k_bounds[1],
@@ -345,7 +410,7 @@ def train_basic_br_actor_critic(
         logz_max=logz_bounds[1],
         n_layers=net_config.n_layers,
         n_neurons=net_config.n_neurons,
-        activation=net_config.activation,
+        hidden_activation=net_config.hidden_activation,
     )
     warm_start_meta = _maybe_apply_policy_warm_start(policy_net, warm_start_policy)
 
@@ -362,6 +427,7 @@ def train_basic_br_actor_critic(
     trainer = BasicTrainerBR(
         policy_net=policy_net,
         value_net=value_net,
+        transform_spec=transform_spec,
         params=params,
         shock_params=shock_params,
         optimizer_actor=optimizer_actor,
@@ -391,6 +457,8 @@ def train_basic_br_actor_critic(
         "method": "basic_br_actor_critic",
         "br_scale": br_scale,
         "warm_start_applied": warm_start_meta["warm_start_applied"],
+        "io_transforms": transform_spec,
+        "training_seed": list(training_seed) if training_seed is not None else None,
     }
     if warm_start_meta["warm_start_source"] is not None:
         meta["warm_start_source"] = warm_start_meta["warm_start_source"]
@@ -415,138 +483,6 @@ def train_basic_br_actor_critic(
     return result.to_legacy_dict()
 
 
-def train_basic_br_multitask(
-    dataset: Dict[str, tf.Tensor],
-    net_config: NetworkConfig,
-    opt_config: OptimizationConfig,
-    method_config: MethodConfig,
-    anneal_config: AnnealingConfig,
-    params: EconomicParams,
-    shock_params: ShockParams,
-    bounds: Dict[str, Tuple[float, float]],
-    validation_data: Optional[Dict[str, tf.Tensor]] = None,
-    warm_start_policy: Optional[Any] = None,
-) -> Union[Dict[str, Any], TrainingResult]:
-    method_config = _coerce_method_config(
-        method_config, expected_name="basic_br_multitask"
-    )
-    spec = get_method_spec("basic_br_multitask")
-    validate_dataset_keys(dataset, spec.required_keys, method_name="basic_br_multitask")
-
-    data_iter = build_training_iterator(
-        dataset,
-        batch_size=opt_config.batch_size,
-        shuffle_key=spec.shuffle_key or "k",
-    )
-
-    k_bounds = bounds["k"]
-    logz_bounds = bounds["log_z"]
-    policy_net, value_net = build_basic_networks(
-        k_min=k_bounds[0],
-        k_max=k_bounds[1],
-        logz_min=logz_bounds[0],
-        logz_max=logz_bounds[1],
-        n_layers=net_config.n_layers,
-        n_neurons=net_config.n_neurons,
-        activation=net_config.activation,
-    )
-    warm_start_meta = _maybe_apply_policy_warm_start(policy_net, warm_start_policy)
-
-    actor_lr = opt_config.learning_rate
-    critic_lr = (
-        opt_config.learning_rate_critic
-        if opt_config.learning_rate_critic
-        else opt_config.learning_rate
-    )
-    optimizer_policy = create_optimizer(actor_lr, opt_config.optimizer)
-    optimizer_value = create_optimizer(critic_lr, opt_config.optimizer)
-    br_scale = _resolve_br_scale(method_config, params, shock_params)
-
-    trainer = BasicTrainerBRRegression(
-        policy_net=policy_net,
-        value_net=value_net,
-        params=params,
-        shock_params=shock_params,
-        optimizer_policy=optimizer_policy,
-        optimizer_value=optimizer_value,
-        logit_clip=anneal_config.logit_clip,
-        loss_type=method_config.loss_type,
-        br_scale=br_scale,
-        weight_foc=method_config.br_reg_weight_foc,
-        weight_env=method_config.br_reg_weight_env,
-        use_foc=method_config.br_reg_use_foc,
-        use_env=method_config.br_reg_use_env,
-    )
-
-    validation_fn = _make_validation_fn_br_reg(trainer) if validation_data is not None else None
-    history = execute_training_loop(
-        trainer,
-        data_iter,
-        opt_config,
-        anneal_config,
-        method_name="basic_br_multitask",
-        validation_data=validation_data,
-        validation_fn=validation_fn,
-        required_batch_keys=set(spec.required_keys),
-        batch_adapter=_batch_adapter_br_reg,
-    )
-
-    meta = {
-        "model": "basic",
-        "method": "basic_br_multitask",
-        "br_scale": br_scale,
-        "warm_start_applied": warm_start_meta["warm_start_applied"],
-    }
-    if warm_start_meta["warm_start_source"] is not None:
-        meta["warm_start_source"] = warm_start_meta["warm_start_source"]
-
-    result = TrainingResult(
-        history=history,
-        artifacts={
-            "policy_net": policy_net,
-            "value_net": value_net,
-        },
-        config={
-            "network": net_config,
-            "optimization": opt_config,
-            "method": method_config,
-            "annealing": anneal_config,
-        },
-        params=params,
-        meta=meta,
-    )
-    return result.to_legacy_dict()
-
-
-def train_basic_br_constrained(
-    dataset: Dict[str, tf.Tensor],
-    net_config: NetworkConfig,
-    opt_config: OptimizationConfig,
-    method_config: MethodConfig,
-    anneal_config: AnnealingConfig,
-    params: EconomicParams,
-    shock_params: ShockParams,
-    bounds: Dict[str, Tuple[float, float]],
-    validation_data: Optional[Dict[str, tf.Tensor]] = None,
-    warm_start_policy: Optional[Any] = None,
-) -> Union[Dict[str, Any], TrainingResult]:
-    """
-    Disabled production entrypoint for experimental BR-constrained training.
-
-    This method is intentionally de-scoped from public APIs.
-    """
-    warnings.warn(
-        "basic_br_constrained is experimental and disabled in production APIs. "
-        "See src.experimental.br_constrained for research-only usage.",
-        RuntimeWarning,
-        stacklevel=2,
-    )
-    raise RuntimeError(
-        "basic_br_constrained is disabled in production APIs. "
-        "Use src.experimental.br_constrained for research-only experiments."
-    )
-
-
 def train_basic_br(
     dataset: Dict[str, tf.Tensor],
     net_config: NetworkConfig,
@@ -558,6 +494,7 @@ def train_basic_br(
     bounds: Dict[str, Tuple[float, float]],
     validation_data: Optional[Dict[str, tf.Tensor]] = None,
     warm_start_policy: Optional[Any] = None,
+    training_seed: Optional[Tuple[int, int]] = None,
 ) -> Union[Dict[str, Any], TrainingResult]:
     """Backward-compatible alias for BR actor-critic."""
     return train_basic_br_actor_critic(
@@ -571,31 +508,7 @@ def train_basic_br(
         bounds=bounds,
         validation_data=validation_data,
         warm_start_policy=warm_start_policy,
+        training_seed=training_seed,
     )
 
 
-def train_basic_br_reg(
-    dataset: Dict[str, tf.Tensor],
-    net_config: NetworkConfig,
-    opt_config: OptimizationConfig,
-    method_config: MethodConfig,
-    anneal_config: AnnealingConfig,
-    params: EconomicParams,
-    shock_params: ShockParams,
-    bounds: Dict[str, Tuple[float, float]],
-    validation_data: Optional[Dict[str, tf.Tensor]] = None,
-    warm_start_policy: Optional[Any] = None,
-) -> Union[Dict[str, Any], TrainingResult]:
-    """Backward-compatible alias for BR weighted multi-objective trainer."""
-    return train_basic_br_multitask(
-        dataset=dataset,
-        net_config=net_config,
-        opt_config=opt_config,
-        method_config=method_config,
-        anneal_config=anneal_config,
-        params=params,
-        shock_params=shock_params,
-        bounds=bounds,
-        validation_data=validation_data,
-        warm_start_policy=warm_start_policy,
-    )

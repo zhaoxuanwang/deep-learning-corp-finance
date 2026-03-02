@@ -88,14 +88,15 @@ def networks():
         k_min=0.1, k_max=10.0,
         logz_min=-0.5, logz_max=0.5,
         n_layers=2, n_neurons=16,
-        activation='swish'
+        hidden_activation='swish',
+        policy_head="bounded_sigmoid",
+        value_head="linear",
     )
 
-    # Build networks by calling once
-    dummy_k = tf.constant([[1.0]], dtype=tf.float32)
-    dummy_z = tf.constant([[1.0]], dtype=tf.float32)
-    _ = policy_net(dummy_k, dummy_z)
-    _ = value_net(dummy_k, dummy_z)
+    # Build raw networks with normalized feature tensors.
+    dummy_x = tf.constant([[0.0, 0.0]], dtype=tf.float32)
+    _ = policy_net(dummy_x)
+    _ = value_net(dummy_x)
 
     return policy_net, value_net
 
@@ -172,14 +173,33 @@ class TestBasicERIgnoresDebt:
     ):
         """ER trainer produces identical loss whether data has 'b' or not."""
         # Build two identical networks
-        policy_net1, _ = build_basic_networks(k_min=0.1, k_max=10.0, logz_min=-0.5, logz_max=0.5, n_layers=2, n_neurons=16, activation='swish')
-        policy_net2, _ = build_basic_networks(k_min=0.1, k_max=10.0, logz_min=-0.5, logz_max=0.5, n_layers=2, n_neurons=16, activation='swish')
+        policy_net1, _ = build_basic_networks(
+            k_min=0.1,
+            k_max=10.0,
+            logz_min=-0.5,
+            logz_max=0.5,
+            n_layers=2,
+            n_neurons=16,
+            hidden_activation='swish',
+            policy_head="bounded_sigmoid",
+            value_head="linear",
+        )
+        policy_net2, _ = build_basic_networks(
+            k_min=0.1,
+            k_max=10.0,
+            logz_min=-0.5,
+            logz_max=0.5,
+            n_layers=2,
+            n_neurons=16,
+            hidden_activation='swish',
+            policy_head="bounded_sigmoid",
+            value_head="linear",
+        )
 
-        # Build them
-        dummy_k = tf.constant([[1.0]], dtype=tf.float32)
-        dummy_z = tf.constant([[1.0]], dtype=tf.float32)
-        _ = policy_net1(dummy_k, dummy_z)
-        _ = policy_net2(dummy_k, dummy_z)
+        # Build raw networks
+        dummy_x = tf.constant([[0.0, 0.0]], dtype=tf.float32)
+        _ = policy_net1(dummy_x)
+        _ = policy_net2(dummy_x)
 
         # Set identical weights
         policy_net2.set_weights(policy_net1.get_weights())

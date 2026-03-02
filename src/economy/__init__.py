@@ -35,6 +35,7 @@ from src.economy.logic import (
     euler_m,
     # Pricing
     pricing_residual_zero_profit,
+    pricing_residual_bond_price,
     # AutoDiff helper
     take_derivative,
 )
@@ -85,6 +86,7 @@ __all__ = [
     "euler_m",
     # Pricing
     "pricing_residual_zero_profit",
+    "pricing_residual_bond_price",
     # AutoDiff
     "take_derivative",
     # RNG & Reproducibility

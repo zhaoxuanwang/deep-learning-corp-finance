@@ -149,6 +149,30 @@ def compute_er_loss_mse(
     return tf.reduce_mean(0.5 * (f1**2 + f2**2))
 
 
+def compute_er_loss_huber(
+    f1: tf.Tensor,
+    f2: tf.Tensor,
+    delta: float = 1.0,
+) -> tf.Tensor:
+    """
+    Compute Euler Residual loss using Huber penalty.
+    """
+    return tf.reduce_mean(0.5 * (_huber(f1, delta) + _huber(f2, delta)))
+
+
+def _huber(residual: tf.Tensor, delta: float = 1.0) -> tf.Tensor:
+    """
+    Element-wise Huber penalty.
+
+    L_delta(r) = 0.5 * r^2                    if |r| <= delta
+               = delta * (|r| - 0.5 * delta)  otherwise
+    """
+    abs_res = tf.abs(residual)
+    quad = tf.minimum(abs_res, tf.cast(delta, residual.dtype))
+    lin = abs_res - quad
+    return 0.5 * tf.square(quad) + tf.cast(delta, residual.dtype) * lin
+
+
 def compute_lifetime_er_loss_aio(
     f1_path: tf.Tensor,
     f2_path: tf.Tensor
@@ -236,6 +260,23 @@ def compute_br_critic_loss_mse(
     delta2 = V_curr - y2
     # Average the squared errors from both forks
     return tf.reduce_mean(0.5 * (delta1**2 + delta2**2))
+
+
+def compute_br_critic_loss_huber(
+    V_curr: tf.Tensor,
+    y1: tf.Tensor,
+    y2: tf.Tensor,
+    delta: float = 1.0,
+) -> tf.Tensor:
+    """
+    Compute Bellman Residual critic loss using Huber penalty.
+
+    This is a robust TD loss widely used to reduce sensitivity to outliers
+    while retaining MSE-like behavior near zero residual.
+    """
+    delta1 = V_curr - y1
+    delta2 = V_curr - y2
+    return tf.reduce_mean(0.5 * (_huber(delta1, delta) + _huber(delta2, delta)))
 
 
 def compute_br_critic_diagnostics(
@@ -406,6 +447,17 @@ def compute_price_loss_mse(
         Scalar loss (always >= 0)
     """
     return tf.reduce_mean(0.5 * (f1**2 + f2**2))
+
+
+def compute_price_loss_huber(
+    f1: tf.Tensor,
+    f2: tf.Tensor,
+    delta: float = 1.0,
+) -> tf.Tensor:
+    """
+    Compute pricing loss using Huber penalty.
+    """
+    return tf.reduce_mean(0.5 * (_huber(f1, delta) + _huber(f2, delta)))
 
 
 def compute_price_residual(

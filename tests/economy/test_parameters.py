@@ -55,73 +55,66 @@ def test_input_validation_logic():
         replace(base, cost_convex=-5.0)
 
 
-# --- 2. Capital Grid Generation Tests ---
+# --- 2. Grid Generation Tests ---
 
-def test_grid_delta_rule_structure(default_params):
+def test_grid_multiplicative_capital_structure(default_params):
     """
-    Test the 'delta_rule' grid generation strategy.
+    Multiplicative capital grid should use geometric spacing tied to depreciation.
     """
-    # Use DDPGridConfig with delta_rule
     params = replace(default_params, delta=0.10)
-    grid_config = DDPGridConfig(grid_type="delta_rule")
-    
-    k_grid = grid_config.generate_capital_grid(params)
+    grid_config = DDPGridConfig(capital_grid_type="multiplicative", z_size=7, b_size=9)
+    bounds = {"k": (0.5, 5.0), "log_z": (-0.3, 0.3), "b": (0.0, 2.0)}
 
-    # Check 1: Geometric spacing consistency
+    k_grid, z_grid, b_grid = grid_config.generate_grids(bounds, delta=params.delta)
+
     ratios = k_grid[1:] / k_grid[:-1]
-    expected_multiplier = (1 / (1 - params.delta)) ** (1 / 4)
+    expected_multiplier = 1.0 / (1.0 - params.delta)
 
-    assert np.allclose(ratios, expected_multiplier, rtol=1e-4), \
-        "Delta rule grid is not geometrically spaced as expected."
+    # Final step can be clipped to k_max, so check interior ratios.
+    assert np.allclose(ratios[:-1], expected_multiplier, rtol=1e-4), \
+        "Multiplicative grid is not geometrically spaced as expected."
+    assert len(z_grid) == 7
+    assert len(b_grid) == 9
 
-    # Check 2: Dynamic Sizing
-    assert len(k_grid) > 2, "Grid generation failed to produce points."
-    assert k_grid[-1] > k_grid[0], "Grid is not increasing."
 
-
-def test_grid_power_grid_structure(default_params):
+def test_grid_linear_capital_structure():
     """
-    Test the 'power_grid' generation strategy.
+    Linear capital grid should respect k_size exactly via linspace.
     """
     target_size = 50
-    grid_config = DDPGridConfig(grid_type="power_grid", k_size=target_size)
+    grid_config = DDPGridConfig(capital_grid_type="linear", k_size=target_size)
+    bounds = {"k": (1.0, 3.0), "log_z": (-0.2, 0.2), "b": (0.0, 1.0)}
 
-    k_grid = grid_config.generate_capital_grid(default_params)
+    k_grid, _, _ = grid_config.generate_grids(bounds, delta=0.1)
 
-    # Check 1: Exact size match
-    assert len(k_grid) == target_size, \
-        f"Power grid did not respect k_size. Expected {target_size}, got {len(k_grid)}."
-
-    # Check 2: Monotonicity
-    assert np.all(np.diff(k_grid) > 0), "Power grid is not strictly increasing."
+    assert len(k_grid) == target_size
+    assert np.allclose(k_grid, np.linspace(1.0, 3.0, target_size))
+    assert np.all(np.diff(k_grid) > 0), "Linear capital grid is not strictly increasing."
 
 
-def test_grid_unknown_type(default_params):
-    """Test that specifying an unknown grid type raises a ValueError."""
+def test_grid_unknown_type():
+    """Test that specifying an unknown capital grid type raises a ValueError."""
     with pytest.raises(ValueError):
-        DDPGridConfig(grid_type="magic_grid")  # Should fail validation
+        DDPGridConfig(capital_grid_type="magic_grid")  # Should fail validation
 
 
-# --- 3. Bond Grid Tests ---
-
-def test_bond_grid_scaling(default_params):
+def test_z_and_b_linear_spacing_invariant_to_capital_grid_type():
     """
-    Test that the bond grid scales automatically with the economy size.
+    z (log-linear in levels) and b (linear) are fixed conventions regardless of capital grid type.
     """
-    grid_config = DDPGridConfig()
-    
-    k_max_small = 10.0
-    k_max_large = 1000.0
-    z_min = 0.5
+    bounds = {"k": (0.8, 2.4), "log_z": (-0.3, 0.3), "b": (0.0, 4.0)}
+    grid_mult = DDPGridConfig(capital_grid_type="multiplicative", z_size=5, b_size=6)
+    grid_lin = DDPGridConfig(capital_grid_type="linear", z_size=5, b_size=6, k_size=9)
 
-    b_grid_small = grid_config.generate_bond_grid(default_params, k_max=k_max_small, z_min=z_min)
-    b_grid_large = grid_config.generate_bond_grid(default_params, k_max=k_max_large, z_min=z_min)
+    _, z_mult, b_mult = grid_mult.generate_grids(bounds, delta=0.1)
+    _, z_lin, b_lin = grid_lin.generate_grids(bounds, delta=0.1)
 
-    # The upper bound of the large economy should be substantially higher
-    scale_factor = b_grid_large[-1] / b_grid_small[-1]
-
-    assert scale_factor > 10.0, \
-        "Bond grid did not scale up when capital stock increased."
+    expected_z = np.exp(np.linspace(-0.3, 0.3, 5))
+    expected_b = np.linspace(0.0, 4.0, 6)
+    assert np.allclose(z_mult, expected_z)
+    assert np.allclose(z_lin, expected_z)
+    assert np.allclose(b_mult, expected_b)
+    assert np.allclose(b_lin, expected_b)
 
 
 # --- 4. Stochastic Process Tests (Moved to test_shocks.py) ---

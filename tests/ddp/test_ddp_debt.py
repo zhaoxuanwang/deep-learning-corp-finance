@@ -5,64 +5,47 @@ import dataclasses
 
 # Import key models
 from src.ddp import DDPGridConfig, RiskyModelDDP
-from src.economy.parameters import EconomicParams, ShockParams
+from src.economy.parameters import EconomicParams
 
 
-def test_generate_bond_grid_refined():
+def _make_synthetic_dataset_and_metadata(n=500, seed=42):
+    """Build a minimal synthetic dataset mimicking flattened training data."""
+    rng = np.random.default_rng(seed)
+
+    mu, rho, sigma = 0.0, 0.8, 0.1
+    log_z = rng.normal(mu, sigma / np.sqrt(1 - rho**2), size=n)
+    log_z_next = rho * log_z + rng.normal(0, sigma, size=n)
+    z = np.exp(log_z).astype(np.float32)
+    z_next = np.exp(log_z_next).astype(np.float32)
+    k = rng.uniform(0.5, 5.0, size=n).astype(np.float32)
+
+    dataset = {
+        "z": tf.constant(z),
+        "z_next_main": tf.constant(z_next),
+        "k": tf.constant(k),
+    }
+    metadata = {
+        "bounds": {
+            "k": (float(k.min()), float(k.max())),
+            "log_z": (float(log_z.min()), float(log_z.max())),
+            "b": (0.0, 50.0),
+        }
+    }
+    return dataset, metadata
+
+
+def test_generate_grids_uses_linear_b_from_bounds():
     """
-    Verifies the bond grid generation uses the correct economic scaling
-    and components (collateral, tax shield, profit).
+    Debt grid is always linear from bounds regardless of capital grid type.
     """
-    # 1. SETUP: Define parameters explicitly
-    params = EconomicParams(
-        r_rate=0.05,
-        delta=0.1,
-        theta=0.5,
-        tax=0.2,
-        frac_liquid=0.9
-    )
-    grid_config = DDPGridConfig(b_size=5)
+    bounds = {"k": (1.0, 4.0), "log_z": (-0.2, 0.2), "b": (0.0, 96.0)}
+    grid_config = DDPGridConfig(z_size=5, k_size=10, b_size=5, capital_grid_type="multiplicative")
+    _, _, b_grid = grid_config.generate_grids(bounds, delta=0.1)
 
-    # Define Economy Scale
-    k_max = 100.0
-    z_min = 0.5
-
-    # 2. EXECUTE
-    b_grid = grid_config.generate_bond_grid(params, k_max=k_max, z_min=z_min)
-
-    # 3. VERIFY: LOWER BOUND (Borrowing-only)
-    # Formula: b_min = 0
-    expected_b_min = 0.0
-    assert np.isclose(b_grid[0], expected_b_min), \
-        f"Lower Bound (Borrowing-only) incorrect. Expected {expected_b_min}, Got {b_grid[0]}"
-
-    # 4. VERIFY: UPPER BOUND (Max Debt Capacity)
-    # Formula components check:
-
-    # A. Worst-state Output (y_min)
-    # y = z_min * k^theta = 0.5 * 100^0.5 = 0.5 * 10 = 5.0
-    y_min = 5.0
-
-    # B. After-Tax Cash Flow
-    # (1 - tax) * y_min = 0.8 * 5 = 4.0
-    term_profit = (1 - 0.2) * y_min
-
-    # C. Tax Shield
-    # tax * delta * k = 0.2 * 0.1 * 100 = 2.0
-    term_shield = 2.0
-
-    # D. Collateral / Liquidation Value
-    # frac_liquid * k = 0.9 * 100 = 90.0
-    term_collateral = 90.0
-
-    expected_b_max = term_profit + term_shield + term_collateral  # 4 + 2 + 90 = 96
-
-    assert np.isclose(b_grid[-1], expected_b_max), \
-        f"Upper Bound (Max Debt) incorrect. Expected {expected_b_max}, Got {b_grid[-1]}"
-
-    # 5. VERIFY: Structure
+    assert np.isclose(b_grid[0], 0.0)
+    assert np.isclose(b_grid[-1], 96.0)
     assert len(b_grid) == grid_config.b_size
-    assert np.all(np.diff(b_grid) > 0), "Grid must be strictly increasing"
+    assert np.allclose(b_grid, np.linspace(0.0, 96.0, grid_config.b_size))
 
 
 # --- 1. FIXTURE ---
@@ -73,9 +56,19 @@ def model_risky():
     Uses small grids for speed, but real parameters.
     """
     params = EconomicParams(r_rate=0.04)
-    shock_params = ShockParams()
-    grid_config = DDPGridConfig(z_size=2, k_size=5, b_size=4, grid_type="log_linear")
-    return RiskyModelDDP(params, shock_params, grid_config)
+    dataset, metadata = _make_synthetic_dataset_and_metadata()
+    grid_config = DDPGridConfig(
+        z_size=2,
+        k_size=5,
+        b_size=4,
+        capital_grid_type="linear",
+    )
+    return RiskyModelDDP(
+        params,
+        grid_config=grid_config,
+        dataset=dataset,
+        dataset_metadata=metadata,
+    )
 
 
 # --- 2. INITIALIZATION TESTS ---
@@ -105,26 +98,42 @@ def test_initialization_shapes_and_types(model_risky):
 
 def test_initialization_dynamic_grid_size():
     """
-    Verifies that self.nk correctly adapts when 'delta_rule' generates
-    a different number of grid points than requested.
+    Verifies that:
+    - linear capital grid preserves requested k_size
+    - multiplicative capital grid uses delta-implied dynamic size
     """
     params = EconomicParams()
-    shock_params = ShockParams()
+    dataset, metadata = _make_synthetic_dataset_and_metadata(seed=123)
     
-    # Case A: Log Linear (Fixed Request)
-    grid_fixed = DDPGridConfig(k_size=10, grid_type="log_linear")
-    model_fixed = RiskyModelDDP(params, shock_params, grid_fixed)
-    assert model_fixed.nk == 10, "Log_linear should preserve requested k_size"
+    # Case A: Linear (fixed size)
+    grid_fixed = DDPGridConfig(k_size=10, capital_grid_type="linear")
+    model_fixed = RiskyModelDDP(
+        params,
+        grid_config=grid_fixed,
+        dataset=dataset,
+        dataset_metadata=metadata,
+    )
+    assert model_fixed.nk == 10, "Linear capital grid should preserve requested k_size"
 
-    # Case B: Delta Rule (Dynamic Request)
-    grid_dynamic = DDPGridConfig(k_size=10, grid_type="delta_rule")
-    model_dynamic = RiskyModelDDP(params, shock_params, grid_dynamic)
+    # Case B: Multiplicative (delta-implied dynamic size)
+    grid_dynamic = DDPGridConfig(k_size=10, capital_grid_type="multiplicative")
+    model_dynamic = RiskyModelDDP(
+        params,
+        grid_config=grid_dynamic,
+        dataset=dataset,
+        dataset_metadata=metadata,
+    )
 
-    actual_tensor_len = model_dynamic.k_grid.shape[0]
+    k_min, k_max = metadata["bounds"]["k"]
+    growth = 1.0 / (1.0 - params.delta)
+    expected_nk = int(np.ceil(1 + np.log(k_max / k_min) / np.log(growth)))
+    expected_nk = max(expected_nk, 2)
 
-    # The class attribute .nk must match the actual tensor length
+    actual_tensor_len = int(model_dynamic.k_grid.shape[0])
     assert model_dynamic.nk == actual_tensor_len, \
         f"Model.nk ({model_dynamic.nk}) does not match grid tensor ({actual_tensor_len})"
+    assert model_dynamic.nk == expected_nk, \
+        f"Multiplicative grid expected nk={expected_nk}, got {model_dynamic.nk}"
 
 
 # --- 3. BOND PRICING TESTS ---
@@ -293,7 +302,12 @@ def test_equity_issuance_cost_trigger(model_risky):
         cost_inject_fixed=0.1,
         cost_inject_linear=0.1
     )
-    model_costly = RiskyModelDDP(params_with_cost, model_risky.shock_params, model_risky.grid_config)
+    model_costly = RiskyModelDDP(
+        params_with_cost,
+        grid_config=model_risky.grid_config,
+        dataset=model_risky.dataset,
+        dataset_metadata=model_risky.dataset_metadata,
+    )
     
     # 1. BASELINE: Calculate rewards WITH costs
     q_mock = tf.ones((model_risky.nz, model_risky.nk, model_risky.nb))
@@ -317,7 +331,12 @@ def test_equity_issuance_cost_trigger(model_risky):
 
     # Re-initialize the model with these cheap parameters
     # (Since grids depend on params, it's safer to make a fresh instance)
-    model_cheap = RiskyModelDDP(params_no_cost, model_risky.shock_params, model_risky.grid_config)
+    model_cheap = RiskyModelDDP(
+        params_no_cost,
+        grid_config=model_risky.grid_config,
+        dataset=model_risky.dataset,
+        dataset_metadata=model_risky.dataset_metadata,
+    )
 
     rewards_no_cost = model_cheap._compute_reward_matrix(q_mock)
     reward_no_cost = rewards_no_cost[cell_idx]
@@ -578,7 +597,7 @@ def test_inner_vfi_pfi_consistency(model_risky):
     )
 
     max_val_diff = float(np.max(np.abs(v_vfi.numpy() - v_pfi.numpy())))
-    assert max_val_diff < 5e-2, f"Inner VFI/PFI value mismatch: {max_val_diff}"
+    assert max_val_diff < 1e-3, f"Inner VFI/PFI value mismatch: {max_val_diff}"
     assert pk_vfi.shape == pk_pfi.shape == (model_risky.nz, model_risky.nk, model_risky.nb)
     assert pb_vfi.shape == pb_pfi.shape == (model_risky.nz, model_risky.nk, model_risky.nb)
 

@@ -12,13 +12,9 @@ _ALIASES = {
     "basic_lifetime_reward": "basic_lr",
     "basic_euler_residual": "basic_er",
     "basic_bellman_residual": "basic_br_actor_critic",
-    "basic_bellman_residual_regression": "basic_br_multitask",
-    "basic_br_regression": "basic_br_multitask",
     "basic_br": "basic_br_actor_critic",
-    "basic_br_reg": "basic_br_multitask",
     "basic_br_actor": "basic_br_actor_critic",
     "basic_br_actor_critic": "basic_br_actor_critic",
-    "basic_br_multitask": "basic_br_multitask",
     # Risky model aliases
     "risky_bellman_residual": "risky_br_actor_critic",
     "risky_debt_bellman_residual": "risky_br_actor_critic",
@@ -39,7 +35,6 @@ def canonicalize_method_name(name: str, *, model: Optional[str] = None) -> str:
     - basic_lr
     - basic_er
     - basic_br_actor_critic
-    - basic_br_multitask
     - risky_br_actor_critic
     """
     normalized = _normalize(name)
@@ -52,16 +47,27 @@ def canonicalize_method_name(name: str, *, model: Optional[str] = None) -> str:
             "Method 'br_constrained' is experimental and disabled in production APIs. "
             "Use src.experimental.br_constrained for research-only experiments."
         )
+    if normalized in {
+        "br_multitask",
+        "br_reg",
+        "basic_br_multitask",
+        "basic_br_reg",
+        "basic_br_regression",
+        "basic_bellman_residual_regression",
+    }:
+        raise ValueError(
+            "Method 'br_multitask' has been moved to src/experimental/br_multitask.py "
+            "due to structural identification failure. "
+            "See report/br_multitask_structural_issues.md for details."
+        )
     normalized = _ALIASES.get(normalized, normalized)
 
     # Model-specific shorthand aliases.
-    if normalized in {"lr", "er", "br", "br_reg", "br_multitask"} and model is not None:
+    if normalized in {"lr", "er", "br"} and model is not None:
         model_norm = _normalize(model)
         if model_norm == "basic":
             if normalized == "br":
                 return "basic_br_actor_critic"
-            if normalized in {"br_reg", "br_multitask"}:
-                return "basic_br_multitask"
             return f"basic_{normalized}"
         if model_norm in {"risky", "risky_debt"}:
             if normalized != "br":

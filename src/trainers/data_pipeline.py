@@ -4,7 +4,7 @@ Data pipeline helpers shared by trainer entrypoints.
 
 from __future__ import annotations
 
-from typing import Dict, Iterable
+from typing import Dict, Iterable, Optional, Tuple
 
 import tensorflow as tf
 
@@ -29,12 +29,31 @@ def build_training_iterator(
     dataset: Dict[str, tf.Tensor],
     *,
     batch_size: int,
-    shuffle_key: str,
+    batch_order: str = "as_is",
+    permutation_seed: Optional[Tuple[int, int]] = None,
 ) -> tf.data.Iterator:
     """
-    Build standard shuffled/repeated TF dataset iterator.
+    Build repeated TF dataset iterator with explicit ordering semantics.
     """
-    tf_dataset = tf.data.Dataset.from_tensor_slices(dataset)
-    tf_dataset = tf_dataset.shuffle(buffer_size=dataset[shuffle_key].shape[0]).batch(batch_size).repeat()
-    return iter(tf_dataset)
+    valid_orders = {"as_is", "fixed_permutation"}
+    if batch_order not in valid_orders:
+        raise ValueError(
+            f"batch_order must be one of {valid_orders}, got '{batch_order}'"
+        )
 
+    prepared = dataset
+    if batch_order == "fixed_permutation":
+        if permutation_seed is None:
+            raise ValueError(
+                "permutation_seed is required when batch_order='fixed_permutation'."
+            )
+        seed = tf.constant([int(permutation_seed[0]), int(permutation_seed[1])], dtype=tf.int32)
+        first_key = next(iter(dataset.keys()))
+        n_obs = tf.shape(dataset[first_key])[0]
+        indices = tf.range(n_obs, dtype=tf.int32)
+        perm = tf.random.experimental.stateless_shuffle(indices, seed=seed)
+        prepared = {k: tf.gather(v, perm) for k, v in dataset.items()}
+
+    tf_dataset = tf.data.Dataset.from_tensor_slices(prepared)
+    tf_dataset = tf_dataset.batch(batch_size).repeat()
+    return iter(tf_dataset)

@@ -5,7 +5,7 @@ Hierarchical configuration system for DNN experiments.
 """
 
 from dataclasses import dataclass, field, asdict
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Literal, Tuple, Union
 from src.economy.parameters import EconomicParams, ShockParams
 
 
@@ -64,6 +64,118 @@ class OptimizerConfig:
 
 
 @dataclass
+class ObservationNormalizationConfig:
+    """
+    Observation normalization config applied at model input boundaries.
+
+    Supported schemes:
+    - "none": identity
+    - "minmax": (x - min) / (max - min)
+    - "zscore": (x - mean) / std
+    - "log": log transform only (for z: no double-log if already log-space)
+    - "log_zscore": log transform then z-score
+    """
+    # Support-based defaults:
+    # - k > 0: log + zscore
+    # - z (provided in levels): log + zscore (via z_input_space='level')
+    # - b >= 0: zscore
+    k_scheme: Literal["none", "minmax", "zscore", "log", "log_zscore"] = "log_zscore"
+    z_scheme: Literal["none", "minmax", "zscore", "log", "log_zscore"] = "zscore"
+    b_scheme: Literal["none", "minmax", "zscore", "log", "log_zscore"] = "zscore"
+    z_input_space: Literal["level", "log"] = "level"
+    epsilon: float = DEFAULT_SAFE_EPSILON
+
+    def __post_init__(self):
+        valid_schemes = {"none", "minmax", "zscore", "log", "log_zscore"}
+        if self.k_scheme not in valid_schemes:
+            raise ValueError(
+                f"k_scheme must be one of {valid_schemes}, got '{self.k_scheme}'"
+            )
+        if self.z_scheme not in valid_schemes:
+            raise ValueError(
+                f"z_scheme must be one of {valid_schemes}, got '{self.z_scheme}'"
+            )
+        if self.b_scheme not in valid_schemes:
+            raise ValueError(
+                f"b_scheme must be one of {valid_schemes}, got '{self.b_scheme}'"
+            )
+        if self.z_input_space not in {"level", "log"}:
+            raise ValueError(
+                f"z_input_space must be 'level' or 'log', got '{self.z_input_space}'"
+            )
+        if self.epsilon <= 0:
+            raise ValueError(f"epsilon must be > 0, got {self.epsilon}")
+
+
+@dataclass
+class OutputClipConfig:
+    """
+    Inference-only safety clipping for one output channel.
+
+    clip_min / clip_max may be:
+    - float (absolute level clip)
+    - "k_max" / "b_max" (resolved from model bounds at runtime)
+    - None (disabled)
+    """
+    clip_min: Optional[Union[float, str]] = None
+    clip_max: Optional[Union[float, str]] = None
+
+    def __post_init__(self):
+        valid_tokens = {"k_max", "b_max"}
+        for name, value in (("clip_min", self.clip_min), ("clip_max", self.clip_max)):
+            if value is None:
+                continue
+            if isinstance(value, str):
+                if value not in valid_tokens:
+                    raise ValueError(
+                        f"{name} token must be one of {valid_tokens}, got '{value}'"
+                    )
+                continue
+            if not isinstance(value, (int, float)):
+                raise TypeError(
+                    f"{name} must be float, token string, or None; got "
+                    f"{type(value).__name__}"
+                )
+
+
+@dataclass
+class InferenceClipConfig:
+    """
+    Inference-only clipping configuration per output variable.
+    """
+    basic_policy_k: OutputClipConfig = field(
+        default_factory=lambda: OutputClipConfig(clip_max="k_max")
+    )
+    basic_value: OutputClipConfig = field(default_factory=OutputClipConfig)
+    risky_policy_k: OutputClipConfig = field(
+        default_factory=lambda: OutputClipConfig(clip_max="k_max")
+    )
+    risky_policy_b: OutputClipConfig = field(
+        default_factory=lambda: OutputClipConfig(clip_min=0.0)
+    )
+    risky_value: OutputClipConfig = field(default_factory=OutputClipConfig)
+    risky_price_q: OutputClipConfig = field(default_factory=OutputClipConfig)
+
+    def __post_init__(self):
+        for field_name in (
+            "basic_policy_k",
+            "basic_value",
+            "risky_policy_k",
+            "risky_policy_b",
+            "risky_value",
+            "risky_price_q",
+        ):
+            value = getattr(self, field_name)
+            if isinstance(value, dict):
+                setattr(self, field_name, OutputClipConfig(**value))
+            elif not isinstance(value, OutputClipConfig):
+                raise TypeError(
+                    f"{field_name} must be OutputClipConfig or dict, got "
+                    f"{type(value).__name__}"
+                )
+
+
+@dataclass
 class NetworkConfig:
     """
     Configuration for neural network architectures.
@@ -72,7 +184,57 @@ class NetworkConfig:
     """
     n_layers: int = 2
     n_neurons: int = 16
-    activation: str = "swish"  # Default per report lines 352-354: "use SiLU (swish) to improve stability"
+    hidden_activation: str = "relu"
+
+    # Output heads
+    basic_policy_head: Literal["bounded_sigmoid", "linear", "affine_exp"] = "affine_exp"
+    basic_value_head: Literal["linear"] = "linear"
+    risky_policy_k_head: Literal["bounded_sigmoid", "linear", "affine_exp"] = "affine_exp"
+    risky_policy_b_head: Literal["bounded_sigmoid", "linear"] = "bounded_sigmoid"
+    risky_value_head: Literal["linear"] = "linear"
+    risky_price_head: Literal["bounded_sigmoid", "linear"] = "bounded_sigmoid"
+
+    observation_normalization: ObservationNormalizationConfig = field(
+        default_factory=ObservationNormalizationConfig
+    )
+    inference_clips: InferenceClipConfig = field(
+        default_factory=InferenceClipConfig
+    )
+
+    def __post_init__(self):
+        if isinstance(self.observation_normalization, dict):
+            self.observation_normalization = ObservationNormalizationConfig(
+                **self.observation_normalization
+            )
+        elif not isinstance(
+            self.observation_normalization, ObservationNormalizationConfig
+        ):
+            raise TypeError(
+                "observation_normalization must be ObservationNormalizationConfig "
+                f"or dict, got {type(self.observation_normalization).__name__}"
+            )
+        if isinstance(self.inference_clips, dict):
+            self.inference_clips = InferenceClipConfig(**self.inference_clips)
+        elif not isinstance(self.inference_clips, InferenceClipConfig):
+            raise TypeError(
+                "inference_clips must be InferenceClipConfig or dict, "
+                f"got {type(self.inference_clips).__name__}"
+            )
+
+        valid_heads_by_field = {
+            "basic_policy_head": {"bounded_sigmoid", "linear", "affine_exp"},
+            "basic_value_head": {"linear"},
+            "risky_policy_k_head": {"bounded_sigmoid", "linear", "affine_exp"},
+            "risky_policy_b_head": {"bounded_sigmoid", "linear"},
+            "risky_value_head": {"linear"},
+            "risky_price_head": {"bounded_sigmoid", "linear"},
+        }
+        for field_name, valid_heads in valid_heads_by_field.items():
+            value = getattr(self, field_name)
+            if value not in valid_heads:
+                raise ValueError(
+                    f"{field_name} must be one of {valid_heads}, got '{value}'"
+                )
 
 
 @dataclass
@@ -111,13 +273,26 @@ class EarlyStoppingConfig:
 
 @dataclass
 class OptimizationConfig:
-    """Configuration for training loop and optimizer."""
+    """
+    Configuration for training loop, optimizer, and runtime reproducibility.
+
+    Attributes:
+        training_seed: Optional runtime seed for model initialization and
+            training-time RNG. Accepts either:
+            - int: mapped to seed pair (int, 0)
+            - Tuple[int, int]: explicit stateless seed pair
+            If None, train() falls back to dataset metadata seeds when available.
+        deterministic_ops: If True, train() will request deterministic TensorFlow
+            kernels when supported by the runtime.
+    """
     learning_rate: float = DEFAULT_LEARNING_RATE
     learning_rate_critic: Optional[float] = None  # If None, use learning_rate
     batch_size: int = DEFAULT_BATCH_SIZE
     n_iter: int = DEFAULT_N_ITER
     log_every: int = DEFAULT_LOG_EVERY
     early_stopping: Optional[EarlyStoppingConfig] = None  # None = disabled
+    training_seed: Optional[Union[int, Tuple[int, int]]] = None
+    deterministic_ops: bool = False
     optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)  # Optimizer settings including gradient clipping
 
 
@@ -141,6 +316,7 @@ class RiskyDebtConfig:
 
     # Loss computation method for critic:
     # - "mse": Mean Squared Error, L = E[f²], biased but stable (default)
+    # - "huber": Huber TD loss, robust to outlier residuals
     # - "crossprod": AiO cross-product, L = E[f₁·f₂], unbiased
     loss_type: str = "mse"
 
@@ -156,7 +332,7 @@ class RiskyDebtConfig:
     # Use AnnealingConfig in train_risky_br() for temperature annealing
 
     def __post_init__(self):
-        valid_loss_types = {"mse", "crossprod"}
+        valid_loss_types = {"mse", "huber", "crossprod"}
         if self.loss_type not in valid_loss_types:
             raise ValueError(
                 f"loss_type must be one of {valid_loss_types}, got '{self.loss_type}'"
@@ -170,13 +346,15 @@ class MethodConfig:
 
     Attributes:
         name: Method identifier (e.g., "basic_lr", "basic_er",
-            "basic_br_actor_critic", "basic_br_multitask",
-            "risky_br_actor_critic")
+            "basic_br_actor_critic", "risky_br_actor_critic")
         n_critic: Number of critic updates per actor update (BR methods only)
         polyak_tau: Polyak averaging coefficient for target networks (ER/BR methods)
         loss_type: Loss computation method for ER/BR critic updates:
             - "mse": Mean Squared Error E[f²], biased but stable
+            - "huber": Huber loss (BR-family only), robust to outliers
             - "crossprod": AiO cross-product E[f₁·f₂], unbiased (default)
+            - "fork_mean_square": BR-multitask only, uses
+              E[(mean_k f_k)^2] with O(1/K) positive bias vs. E[f]^2
             For risky debt, configure via RiskyDebtConfig.loss_type instead.
         br_normalization: BR normalization mode for BR-family losses:
             - "frictionless": Normalize by frictionless steady-state value scale (default)
@@ -184,37 +362,110 @@ class MethodConfig:
             - "custom": Use br_normalizer_value
         br_normalizer_value: Custom normalizer value when br_normalization="custom"
         br_normalizer_epsilon: Lower bound for absolute normalizer value
+        br_reg_weight_br: Weight on BR term for basic BR regression method
         br_reg_weight_foc: Weight on FOC regularization term for basic BR regression method
         br_reg_weight_env: Weight on envelope regularization term for basic BR regression method
         br_reg_use_foc: Whether to include FOC term in basic BR regression method
         br_reg_use_env: Whether to include envelope term in basic BR regression method
+        br_reg_weighting_mode: Regularizer-weight mode for BR multitask:
+            - "fixed": use static BR/FOC/env weights (default)
+            - "adaptive": dynamically rebalance active BR/FOC/env weights
+              from gradient norms while preserving a total weight budget
+        br_reg_adaptive_alpha: Exponent for adaptive weight updates (higher => more aggressive)
+        br_reg_adaptive_ema_decay: EMA decay for gradient-norm smoothing in adaptive mode
+        br_reg_adaptive_update_every: Update adaptive weights every N train steps
+        br_reg_adaptive_warmup_steps: Keep fixed weights for initial steps before adaptation
+        br_reg_adaptive_max_step_change: Max relative per-update weight change (e.g., 0.1 = ±10%)
+        br_reg_adaptive_grad_floor: Positive floor to avoid division by tiny gradient norms
+        br_reg_adaptive_total_weight_budget: Optional total budget used to
+            renormalize active adaptive weights (e.g., 2 for BR+FOC).
+            If None, uses the sum of initial active weights.
+        br_reg_weight_br_min: Lower bound for adaptive BR weight
+        br_reg_weight_br_max: Upper bound for adaptive BR weight
+        br_reg_weight_foc_min: Lower bound for adaptive FOC weight
+        br_reg_weight_foc_max: Upper bound for adaptive FOC weight
+        br_reg_weight_env_min: Lower bound for adaptive envelope weight
+        br_reg_weight_env_max: Upper bound for adaptive envelope weight
+        br_reg_env_derivative_mode: Envelope derivative mode in BR multitask:
+            - "total": total derivative d e(k, k'(k,z), z) / d k (current behavior)
+            - "partial_stopgrad_policy": partial derivative wrt k holding k' fixed
+            - "hardcoded_frictionless": closed-form partial for frictionless baseline only
+        br_reg_num_forks: Number of independent z' forks used in BR/FOC losses.
+            Use 2 for legacy behavior; >2 uses pairwise unbiased cross-product.
         risky: Optional configuration for risky debt model
     """
     name: str  # e.g., "basic_lr", "basic_er", "risky_br", etc.
     n_critic: int = DEFAULT_N_CRITIC  # Critic updates per actor update (BR methods)
     polyak_tau: float = DEFAULT_POLYAK_TAU  # Polyak averaging coefficient for target networks (ER/BR methods)
-    loss_type: str = "mse"  # "mse" (default, stable) or "crossprod" (unbiased)
+    loss_type: str = "mse"  # "mse", "huber", "crossprod", or "fork_mean_square" (BR-multitask only)
     br_normalization: str = "frictionless"  # "frictionless" (default), "none", "custom"
     br_normalizer_value: Optional[float] = None
     br_normalizer_epsilon: float = 1e-8
+    br_reg_weight_br: float = 1.0
     br_reg_weight_foc: float = 1.0
     br_reg_weight_env: float = 1.0
     br_reg_use_foc: bool = True
     br_reg_use_env: bool = True
+    br_reg_weighting_mode: str = "fixed"  # "fixed" or "adaptive"
+    br_reg_adaptive_alpha: float = 1.0
+    br_reg_adaptive_ema_decay: float = 0.9
+    br_reg_adaptive_update_every: int = 1
+    br_reg_adaptive_warmup_steps: int = 0
+    br_reg_adaptive_max_step_change: float = 0.1
+    br_reg_adaptive_grad_floor: float = 1e-8
+    br_reg_adaptive_total_weight_budget: Optional[float] = None
+    br_reg_weight_br_min: float = 0.05
+    br_reg_weight_br_max: float = 20.0
+    br_reg_weight_foc_min: float = 0.05
+    br_reg_weight_foc_max: float = 20.0
+    br_reg_weight_env_min: float = 0.05
+    br_reg_weight_env_max: float = 20.0
+    br_reg_env_derivative_mode: str = "total"
+    br_reg_num_forks: int = 2
     risky: Optional[RiskyDebtConfig] = None
 
     def __post_init__(self):
         self.br_normalization = self.br_normalization.strip().lower().replace("-", "_")
-        valid_loss_types = {"mse", "crossprod"}
+        self.br_reg_weighting_mode = self.br_reg_weighting_mode.strip().lower().replace("-", "_")
+        self.br_reg_env_derivative_mode = (
+            self.br_reg_env_derivative_mode.strip().lower().replace("-", "_")
+        )
+        valid_loss_types = {"mse", "huber", "crossprod", "fork_mean_square"}
         if self.loss_type not in valid_loss_types:
             raise ValueError(
                 f"loss_type must be one of {valid_loss_types}, got '{self.loss_type}'"
             )
+        if self.loss_type == "fork_mean_square":
+            if self.name.strip().lower().replace("-", "_") != "basic_br_multitask":
+                raise ValueError(
+                    "loss_type='fork_mean_square' is supported only for "
+                    "MethodConfig(name='basic_br_multitask')."
+                )
 
+        if self.br_reg_weight_br < 0:
+            raise ValueError(f"br_reg_weight_br must be >= 0, got {self.br_reg_weight_br}")
         if self.br_reg_weight_foc < 0:
             raise ValueError(f"br_reg_weight_foc must be >= 0, got {self.br_reg_weight_foc}")
         if self.br_reg_weight_env < 0:
             raise ValueError(f"br_reg_weight_env must be >= 0, got {self.br_reg_weight_env}")
+        if self.br_reg_weight_br_min < 0:
+            raise ValueError(f"br_reg_weight_br_min must be >= 0, got {self.br_reg_weight_br_min}")
+        if self.br_reg_weight_foc_min < 0:
+            raise ValueError(f"br_reg_weight_foc_min must be >= 0, got {self.br_reg_weight_foc_min}")
+        if self.br_reg_weight_env_min < 0:
+            raise ValueError(f"br_reg_weight_env_min must be >= 0, got {self.br_reg_weight_env_min}")
+        if self.br_reg_weight_br_max < self.br_reg_weight_br_min:
+            raise ValueError(
+                "br_reg_weight_br_max must be >= br_reg_weight_br_min"
+            )
+        if self.br_reg_weight_foc_max < self.br_reg_weight_foc_min:
+            raise ValueError(
+                "br_reg_weight_foc_max must be >= br_reg_weight_foc_min"
+            )
+        if self.br_reg_weight_env_max < self.br_reg_weight_env_min:
+            raise ValueError(
+                "br_reg_weight_env_max must be >= br_reg_weight_env_min"
+            )
         valid_norm_modes = {"none", "frictionless", "custom"}
         if self.br_normalization not in valid_norm_modes:
             raise ValueError(
@@ -227,6 +478,80 @@ class MethodConfig:
         if self.br_normalizer_epsilon <= 0:
             raise ValueError(
                 f"br_normalizer_epsilon must be > 0, got {self.br_normalizer_epsilon}"
+            )
+        valid_weight_modes = {"fixed", "adaptive"}
+        if self.br_reg_weighting_mode not in valid_weight_modes:
+            raise ValueError(
+                f"br_reg_weighting_mode must be one of {valid_weight_modes}, got "
+                f"'{self.br_reg_weighting_mode}'"
+            )
+        if self.br_reg_adaptive_alpha <= 0:
+            raise ValueError(
+                f"br_reg_adaptive_alpha must be > 0, got {self.br_reg_adaptive_alpha}"
+            )
+        if not (0 <= self.br_reg_adaptive_ema_decay < 1):
+            raise ValueError(
+                "br_reg_adaptive_ema_decay must be in [0, 1), got "
+                f"{self.br_reg_adaptive_ema_decay}"
+            )
+        if self.br_reg_adaptive_update_every <= 0:
+            raise ValueError(
+                "br_reg_adaptive_update_every must be >= 1, got "
+                f"{self.br_reg_adaptive_update_every}"
+            )
+        if self.br_reg_adaptive_warmup_steps < 0:
+            raise ValueError(
+                "br_reg_adaptive_warmup_steps must be >= 0, got "
+                f"{self.br_reg_adaptive_warmup_steps}"
+            )
+        if not (0 < self.br_reg_adaptive_max_step_change <= 1):
+            raise ValueError(
+                "br_reg_adaptive_max_step_change must be in (0, 1], got "
+                f"{self.br_reg_adaptive_max_step_change}"
+            )
+        if self.br_reg_adaptive_grad_floor <= 0:
+            raise ValueError(
+                f"br_reg_adaptive_grad_floor must be > 0, got "
+                f"{self.br_reg_adaptive_grad_floor}"
+            )
+        if self.br_reg_adaptive_total_weight_budget is not None and self.br_reg_adaptive_total_weight_budget <= 0:
+            raise ValueError(
+                "br_reg_adaptive_total_weight_budget must be > 0 when provided, "
+                f"got {self.br_reg_adaptive_total_weight_budget}"
+            )
+        if self.br_reg_weighting_mode == "adaptive":
+            if not (self.br_reg_weight_br_min <= self.br_reg_weight_br <= self.br_reg_weight_br_max):
+                raise ValueError(
+                    "br_reg_weight_br must lie within "
+                    "[br_reg_weight_br_min, br_reg_weight_br_max] in adaptive mode."
+                )
+            if self.br_reg_use_foc and not (
+                self.br_reg_weight_foc_min <= self.br_reg_weight_foc <= self.br_reg_weight_foc_max
+            ):
+                raise ValueError(
+                    "br_reg_weight_foc must lie within "
+                    "[br_reg_weight_foc_min, br_reg_weight_foc_max] in adaptive mode."
+                )
+            if self.br_reg_use_env and not (
+                self.br_reg_weight_env_min <= self.br_reg_weight_env <= self.br_reg_weight_env_max
+            ):
+                raise ValueError(
+                    "br_reg_weight_env must lie within "
+                    "[br_reg_weight_env_min, br_reg_weight_env_max] in adaptive mode."
+                )
+        valid_env_modes = {
+            "total",
+            "partial_stopgrad_policy",
+            "hardcoded_frictionless",
+        }
+        if self.br_reg_env_derivative_mode not in valid_env_modes:
+            raise ValueError(
+                "br_reg_env_derivative_mode must be one of "
+                f"{valid_env_modes}, got '{self.br_reg_env_derivative_mode}'"
+            )
+        if self.br_reg_num_forks < 2:
+            raise ValueError(
+                f"br_reg_num_forks must be >= 2, got {self.br_reg_num_forks}"
             )
 
 # =============================================================================
@@ -367,7 +692,7 @@ class DataConfig:
 
     IMPORTANT: All bounds are ultimately expressed in LEVELS (actual values).
     The multiplier notation is just a convenient way to specify bounds relative
-    to economic steady-state. Networks internally normalize to [0,1] for stability.
+    to economic steady-state. Observation normalization is configured separately.
 
     Bounds Constraints (for auto-compute mode):
         - std_dev_multiplier (m): Must be in (2, 5)

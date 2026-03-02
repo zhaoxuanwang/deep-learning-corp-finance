@@ -74,14 +74,15 @@ def networks():
         k_min=0.1, k_max=10.0,
         logz_min=-0.5, logz_max=0.5,
         n_layers=2, n_neurons=16,
-        activation='relu'
+        hidden_activation='relu',
+        policy_head="bounded_sigmoid",
+        value_head="linear",
     )
 
-    # Build networks by calling them once with dummy data
-    dummy_k = tf.constant([[1.0]], dtype=tf.float32)
-    dummy_z = tf.constant([[1.0]], dtype=tf.float32)
-    _ = policy_net(dummy_k, dummy_z)
-    _ = value_net(dummy_k, dummy_z)
+    # Build raw networks with normalized feature tensors.
+    dummy_x = tf.constant([[0.0, 0.0]], dtype=tf.float32)
+    _ = policy_net(dummy_x)
+    _ = value_net(dummy_x)
 
     return policy_net, value_net
 
@@ -291,14 +292,15 @@ class TestBRTargetNetworks:
             k_min=0.1, k_max=10.0,
             logz_min=-0.5, logz_max=0.5,
             n_layers=2, n_neurons=16,
-            activation='relu'
+            hidden_activation='relu',
+            policy_head="bounded_sigmoid",
+            value_head="linear",
         )
 
-        # Build networks
-        dummy_k = tf.constant([[1.0]], dtype=tf.float32)
-        dummy_z = tf.constant([[1.0]], dtype=tf.float32)
-        _ = policy_net2(dummy_k, dummy_z)
-        _ = value_net2(dummy_k, dummy_z)
+        # Build raw networks
+        dummy_x = tf.constant([[0.0, 0.0]], dtype=tf.float32)
+        _ = policy_net2(dummy_x)
+        _ = value_net2(dummy_x)
 
         policy_net2.set_weights(policy_net.get_weights())
         value_net2.set_weights(value_net.get_weights())
@@ -373,14 +375,15 @@ class TestBRCriticUpdate:
             k_min=0.1, k_max=10.0,
             logz_min=-0.5, logz_max=0.5,
             n_layers=2, n_neurons=16,
-            activation='relu'
+            hidden_activation='relu',
+            policy_head="bounded_sigmoid",
+            value_head="linear",
         )
 
-        # Build networks
-        dummy_k = tf.constant([[1.0]], dtype=tf.float32)
-        dummy_z = tf.constant([[1.0]], dtype=tf.float32)
-        _ = policy_net2(dummy_k, dummy_z)
-        _ = value_net2(dummy_k, dummy_z)
+        # Build raw networks
+        dummy_x = tf.constant([[0.0, 0.0]], dtype=tf.float32)
+        _ = policy_net2(dummy_x)
+        _ = value_net2(dummy_x)
 
         policy_net2.set_weights(policy_net.get_weights())
         value_net2.set_weights(value_net.get_weights())

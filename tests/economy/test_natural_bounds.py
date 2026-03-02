@@ -13,7 +13,6 @@ already converted to level space for direct use by networks.
 
 import pytest
 import numpy as np
-import warnings
 from src.economy.bounds import (
     BoundsConfig,
     compute_ergodic_log_z_bounds,
@@ -22,9 +21,6 @@ from src.economy.bounds import (
     compute_b_bound_levels,
     generate_states_bounds,
     generate_bounds_from_config,
-    # Legacy functions (deprecated)
-    compute_natural_k_bounds,
-    compute_natural_b_bound,
 )
 from src.economy.parameters import EconomicParams, ShockParams
 
@@ -297,34 +293,3 @@ class TestGenerateBoundsFromConfig:
         assert np.isclose(bounds["k"][1], 75.0)
 
 
-class TestLegacyFunctions:
-    """Tests for deprecated legacy functions."""
-
-    def test_compute_natural_k_bounds_deprecated(self):
-        """Legacy function emits deprecation warning."""
-        with warnings.catch_warnings(record=True) as w:
-            warnings.simplefilter("always")
-
-            k_min, k_max = compute_natural_k_bounds(
-                theta=0.5, r=0.04, delta=0.06,
-                log_z_bounds=(0.0, 0.0),
-                k_min_multiplier=0.1,
-                k_max_multiplier=2.0
-            )
-
-            # Check deprecation warning was raised
-            assert len(w) == 1
-            assert issubclass(w[0].category, DeprecationWarning)
-            assert "deprecated" in str(w[0].message).lower()
-
-    def test_compute_natural_b_bound_deprecated(self):
-        """Legacy function emits deprecation warning."""
-        with warnings.catch_warnings(record=True) as w:
-            warnings.simplefilter("always")
-
-            b_max = compute_natural_b_bound(theta=0.5, k_max=50.0, z_max=1.0)
-
-            # Check deprecation warning was raised
-            assert len(w) == 1
-            assert issubclass(w[0].category, DeprecationWarning)
-            assert "deprecated" in str(w[0].message).lower()

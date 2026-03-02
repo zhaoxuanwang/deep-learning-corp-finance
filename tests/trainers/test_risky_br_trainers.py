@@ -34,6 +34,10 @@ from src.networks.network_risky import (
     compute_effective_value
 )
 from src.trainers.risky_trainers import RiskyDebtTrainerBR
+from src.trainers.io_transforms import (
+    build_legacy_risky_transform_spec_from_networks,
+    forward_risky_price_levels,
+)
 from src.utils.annealing import AnnealingSchedule
 
 
@@ -72,16 +76,18 @@ def networks(params, bounds):
         r_risk_free=params.r_rate,
         n_layers=2,
         n_neurons=16,
-        activation='swish'
+        hidden_activation='swish',
+        policy_k_head="bounded_sigmoid",
+        policy_b_head="bounded_sigmoid",
+        value_head="linear",
+        price_head="bounded_sigmoid",
     )
 
-    # Build networks by calling them once with dummy data
-    dummy_k = tf.constant([[1.0]], dtype=tf.float32)
-    dummy_b = tf.constant([[0.5]], dtype=tf.float32)
-    dummy_z = tf.constant([[1.0]], dtype=tf.float32)
-    _ = policy_net(dummy_k, dummy_b, dummy_z)
-    _ = value_net(dummy_k, dummy_b, dummy_z)
-    _ = price_net(dummy_k, dummy_b, dummy_z)
+    # Build raw networks with normalized feature tensors.
+    dummy_x = tf.constant([[0.0, 0.0, 0.0]], dtype=tf.float32)
+    _ = policy_net(dummy_x)
+    _ = value_net(dummy_x)
+    _ = price_net(dummy_x)
 
     return policy_net, value_net, price_net
 
@@ -204,29 +210,57 @@ class TestPriceNetworkOutput:
 
     def test_price_network_output_range(self, networks, params):
         """Test bond price q is in [0, 1/(1+r)]."""
-        _, _, price_net = networks
+        policy_net, value_net, price_net = networks
+        transform_spec = build_legacy_risky_transform_spec_from_networks(
+            policy_net=policy_net,
+            value_net=value_net,
+            price_net=price_net,
+            r_risk_free=params.r_rate,
+        )
 
         # Generate random inputs
         k = tf.random.uniform([32, 1], 0.1, 10.0)
         b = tf.random.uniform([32, 1], 0.0, 5.0)
         z = tf.random.uniform([32, 1], 0.5, 2.0)
 
-        q = price_net(k, b, z)
+        q = forward_risky_price_levels(
+            price_net=price_net,
+            k_next=k,
+            b_next=b,
+            z=z,
+            transform_spec=transform_spec,
+            training=False,
+            apply_output_clips=False,
+        )
 
         # q should be in [0, 1/(1+r)]
         q_max = 1.0 / (1.0 + params.r_rate)
         assert tf.reduce_all(q >= 0.0)
         assert tf.reduce_all(q <= q_max + 1e-6)  # Small tolerance for numerical precision
 
-    def test_price_network_output_shape(self, networks):
+    def test_price_network_output_shape(self, networks, params):
         """Test bond price q has correct shape."""
-        _, _, price_net = networks
+        policy_net, value_net, price_net = networks
+        transform_spec = build_legacy_risky_transform_spec_from_networks(
+            policy_net=policy_net,
+            value_net=value_net,
+            price_net=price_net,
+            r_risk_free=params.r_rate,
+        )
 
         k = tf.random.uniform([32], 0.1, 10.0)
         b = tf.random.uniform([32], 0.0, 5.0)
         z = tf.random.uniform([32], 0.5, 2.0)
 
-        q = price_net(k, b, z)
+        q = forward_risky_price_levels(
+            price_net=price_net,
+            k_next=k,
+            b_next=b,
+            z=z,
+            transform_spec=transform_spec,
+            training=False,
+            apply_output_clips=False,
+        )
         assert q.shape == (32, 1)
 
 
@@ -486,7 +520,7 @@ class TestRiskyBRIntegration:
         assert "loss_actor" in metrics
 
     def test_evaluate_respects_loss_type(self, networks, params, shock_params, flat_data, monkeypatch):
-        """evaluate() should use configured critic loss family (mse/crossprod)."""
+        """evaluate() should use configured critic loss family (mse/huber/crossprod)."""
         policy_net, value_net, price_net = networks
 
         trainer_mse = RiskyDebtTrainerBR(
@@ -520,8 +554,24 @@ class TestRiskyBRIntegration:
             logit_clip=20.0,
             loss_type="crossprod",
         )
+        trainer_huber = RiskyDebtTrainerBR(
+            policy_net=policy_net,
+            value_net=value_net,
+            price_net=price_net,
+            params=params,
+            shock_params=shock_params,
+            optimizer_actor=tf.keras.optimizers.Adam(learning_rate=1e-3),
+            optimizer_critic=tf.keras.optimizers.Adam(learning_rate=1e-3),
+            weight_br=0.1,
+            n_critic_steps=1,
+            polyak_tau=0.9,
+            smoothing=AnnealingSchedule(init_temp=1.0, min_temp=0.01, decay_rate=0.9),
+            logit_clip=20.0,
+            loss_type="huber",
+        )
 
         monkeypatch.setattr(risky_trainers_module, "compute_br_critic_loss_mse", lambda *args, **kwargs: tf.constant(111.0))
+        monkeypatch.setattr(risky_trainers_module, "compute_br_critic_loss_huber", lambda *args, **kwargs: tf.constant(333.0))
         monkeypatch.setattr(risky_trainers_module, "compute_br_critic_loss_aio", lambda *args, **kwargs: tf.constant(222.0))
 
         metrics_mse = trainer_mse.evaluate(
@@ -534,6 +584,12 @@ class TestRiskyBRIntegration:
             flat_data["z_next_main"], flat_data["z_next_fork"],
             temperature=0.1
         )
+        metrics_huber = trainer_huber.evaluate(
+            flat_data["k"], flat_data["b"], flat_data["z"],
+            flat_data["z_next_main"], flat_data["z_next_fork"],
+            temperature=0.1
+        )
 
         assert np.isclose(metrics_mse["loss_critic"], 111.0)
         assert np.isclose(metrics_cross["loss_critic"], 222.0)
+        assert np.isclose(metrics_huber["loss_critic"], 333.0)

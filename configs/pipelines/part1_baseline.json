@@ -58,7 +58,7 @@
     "network": {
       "n_layers": 2,
       "n_neurons": 32,
-      "activation": "swish"
+      "hidden_activation": "swish"
     },
     "basic_optimization": {
       "learning_rate": 0.001,
@@ -104,14 +104,6 @@
         "polyak_tau": 0.95,
         "loss_type": "crossprod"
       },
-      "br_multitask": {
-        "name": "basic_br_multitask",
-        "loss_type": "crossprod",
-        "br_reg_weight_foc": 1.0,
-        "br_reg_weight_env": 1.0,
-        "br_reg_use_foc": true,
-        "br_reg_use_env": true
-      }
     },
     "risky_optimization": {
       "learning_rate": 0.0001,
@@ -155,13 +147,13 @@
       "z_size": 7,
       "k_size": 40,
       "b_size": 2,
-      "grid_type": "multiplicative"
+      "capital_grid_type": "multiplicative"
     },
     "grid_risky": {
       "z_size": 7,
       "k_size": 40,
       "b_size": 25,
-      "grid_type": "multiplicative"
+      "capital_grid_type": "multiplicative"
     },
     "basic_vfi": {
       "tol": 1e-06,

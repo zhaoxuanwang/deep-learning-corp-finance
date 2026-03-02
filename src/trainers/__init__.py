@@ -7,7 +7,6 @@ This package implements three solution methods:
 - LR (Lifetime Reward): Maximizes discounted lifetime rewards
 - ER (Euler Residual): Minimizes Euler equation residuals
 - BR Actor-Critic (Bellman Residual): Actor-critic framework
-- BR Multitask (Maliar-style): Joint BR + FOC/Envelope weighted objective
 
 Modules:
     basic: LR, ER, and BR trainers for basic investment model
@@ -23,6 +22,9 @@ References:
 
 from src.trainers.config import (
     NetworkConfig,
+    ObservationNormalizationConfig,
+    OutputClipConfig,
+    InferenceClipConfig,
     OptimizationConfig,
     AnnealingConfig,
     EarlyStoppingConfig,
@@ -42,9 +44,7 @@ from src.trainers.basic import (
     train_basic_lr,
     train_basic_er,
     train_basic_br,
-    train_basic_br_reg,
     train_basic_br_actor_critic,
-    train_basic_br_multitask,
 )
 
 from src.trainers.risky import (
@@ -57,6 +57,9 @@ from src.trainers.results import TrainingResult
 __all__ = [
     # Configuration
     "NetworkConfig",
+    "ObservationNormalizationConfig",
+    "OutputClipConfig",
+    "InferenceClipConfig",
     "OptimizationConfig",
     "AnnealingConfig",
     "EarlyStoppingConfig",
@@ -72,9 +75,7 @@ __all__ = [
     "train_basic_lr",
     "train_basic_er",
     "train_basic_br",
-    "train_basic_br_reg",
     "train_basic_br_actor_critic",
-    "train_basic_br_multitask",
     "train_risky_br",
     "train_risky_br_actor_critic",
     "train",

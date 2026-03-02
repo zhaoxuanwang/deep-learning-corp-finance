@@ -20,11 +20,15 @@ format:
 
 # Introduction
 
+Solving for a dynamic programming problem is central to modern 
+
+In this paper, I introduce a new open source package 
+
 This report documents the implementation of deep learning methods for solving dynamic corporate finance models. The core problem is to find optimal investment and financing policies for firms facing adjustment costs, stochastic productivity shocks, and (in the extended model) risky debt with endogenous default and equilibrium risky interest rates [see @strebulaev_dynamic_2012, section 3].
 
 The conventional solution to this dynamic programming/optimal control problem is to discretize the state space and iterate on value function or policy function until convergence. However, this approach suffers from the curse of dimensionality and is computationally expensive. It is less accurate due to approximiation on discrete grids, and it quickly becomes intractable as the number of state variables and sample size increases. 
 
-In this report, I explore and apply the deep learning methods introduced in @maliar_deep_2021 to solve this problem. The approach casts economic models into trainable objectives and uses deep neural networks to parametrize policy and value functions, trained via three complementary methods:
+In this study, I implement, refine, and extend the deep learning methods introduced in @maliar_deep_2021 to solve this problem. The approach casts economic models into trainable objectives and uses deep neural networks to parametrize policy and value functions, trained via three complementary methods:
 
 1. **Lifetime Reward (LR)**: Maximize discounted cumulative cash flows over $T$ periods
 2. **Euler Residual (ER)**: Minimize violations of the first-order optimality conditions

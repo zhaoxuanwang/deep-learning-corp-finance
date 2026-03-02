@@ -68,13 +68,14 @@ def policy_net():
         k_min=0.1, k_max=10.0,
         logz_min=-0.5, logz_max=0.5,
         n_layers=2, n_neurons=16,
-        activation='swish'
+        hidden_activation='swish',
+        policy_head="bounded_sigmoid",
+        value_head="linear",
     )
 
-    # Build network by calling it once with dummy data
-    dummy_k = tf.constant([[1.0]], dtype=tf.float32)
-    dummy_z = tf.constant([[1.0]], dtype=tf.float32)
-    _ = policy(dummy_k, dummy_z)
+    # Build raw network with normalized feature tensor.
+    dummy_x = tf.constant([[0.0, 0.0]], dtype=tf.float32)
+    _ = policy(dummy_x)
 
     return policy
 
@@ -226,7 +227,9 @@ class TestTargetNetwork:
             k_min=0.1, k_max=10.0,
             logz_min=-0.5, logz_max=0.5,
             n_layers=2, n_neurons=16,
-            activation='swish'
+            hidden_activation='swish',
+            policy_head="bounded_sigmoid",
+            value_head="linear",
         )
         policy_net2.set_weights(policy_net.get_weights())  # Start with same weights
 

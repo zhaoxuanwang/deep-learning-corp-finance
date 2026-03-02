@@ -23,7 +23,9 @@ def _build_basic_policy_value(
         logz_max=logz_max,
         n_layers=n_layers,
         n_neurons=n_neurons,
-        activation="swish",
+        hidden_activation="swish",
+        policy_head="bounded_sigmoid",
+        value_head="linear",
     )
 
 
@@ -82,4 +84,3 @@ def test_copy_policy_weights_reports_shape_mismatch():
 
     message = str(exc_info.value)
     assert "weight shape mismatch" in message or "config mismatch 'n_neurons'" in message
-

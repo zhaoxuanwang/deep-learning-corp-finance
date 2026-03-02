@@ -14,12 +14,15 @@ from src.trainers.losses import (
     compute_lr_loss,
     compute_lr_loss_risky,
     compute_er_loss_aio,
+    compute_er_loss_huber,
     compute_er_loss_mse,
     compute_br_critic_loss_aio,
+    compute_br_critic_loss_huber,
     compute_br_critic_loss_mse,
     compute_br_actor_loss,
     compute_br_actor_loss_risky,
     compute_price_loss_aio,
+    compute_price_loss_huber,
     compute_price_loss_mse,
     compute_critic_objective,
 )
@@ -93,6 +96,16 @@ class TestERLoss:
 
         expected = (0.5 * (1.0**2 + 3.0**2) + 0.5 * (2.0**2 + 4.0**2)) / 2.0
         assert np.isclose(loss.numpy(), expected)
+
+    def test_er_huber_loss(self):
+        """ER Huber loss matches element-wise Huber average."""
+        f1 = tf.constant([[2.0], [0.5]])
+        f2 = tf.constant([[0.5], [2.0]])
+
+        loss = compute_er_loss_huber(f1, f2, delta=1.0)
+        # huber(2)=1.5, huber(0.5)=0.125
+        expected = (0.5 * (1.5 + 0.125) + 0.5 * (0.125 + 1.5)) / 2.0
+        assert np.isclose(loss.numpy(), expected)
     
     def test_euler_chi(self):
         """euler_chi = 1 + psi_I where psi_I = phi_0 * I / k."""
@@ -140,6 +153,16 @@ class TestBRLoss:
         loss = compute_br_critic_loss_mse(V, y1, y2)
         expected = (0.5 * ((0.2**2 + 0.1**2)) + 0.5 * ((0.2**2 + 0.1**2))) / 2.0
         assert np.isclose(loss.numpy(), expected)
+
+    def test_critic_loss_huber(self):
+        """Critic Huber loss is robust and finite for large residuals."""
+        V = tf.constant([[3.0], [0.0]])
+        y1 = tf.constant([[0.0], [0.0]])
+        y2 = tf.constant([[1.0], [0.0]])
+
+        loss = compute_br_critic_loss_huber(V, y1, y2, delta=1.0)
+        assert np.isfinite(loss.numpy())
+        assert loss.numpy() > 0.0
     
     def test_actor_loss_main_shock_only(self):
         """Actor loss uses only main shock continuation value."""
@@ -195,6 +218,15 @@ class TestPriceLoss:
         loss = compute_price_loss_mse(f1, f2)
         expected = (0.5 * (0.1**2 + 0.3**2) + 0.5 * (0.2**2 + 0.4**2)) / 2.0
         assert np.isclose(loss.numpy(), expected)
+
+    def test_price_loss_huber(self):
+        """Price Huber loss is finite and positive."""
+        f1 = tf.constant([[0.1], [5.0]])
+        f2 = tf.constant([[0.2], [4.0]])
+
+        loss = compute_price_loss_huber(f1, f2, delta=1.0)
+        assert np.isfinite(loss.numpy())
+        assert loss.numpy() > 0.0
     
     def test_pricing_residual_formula(self):
         """f = b'(1+r) - [p^D*R + (1-p^D)*b'*(1+r_tilde)]."""

@@ -5,7 +5,7 @@ Trainer implementations for the Risky Debt model.
 import tensorflow as tf
 import numpy as np
 import logging
-from typing import Dict, Optional
+from typing import Dict, Optional, Any, Tuple, List
 
 from src.economy.parameters import EconomicParams, ShockParams
 from src.economy.logic import (
@@ -19,16 +19,67 @@ from src.networks.network_risky import (
     RiskyValueNetwork,
     RiskyPriceNetwork,
 )
+from src.trainers.io_transforms import (
+    forward_risky_policy_levels,
+    forward_risky_value_levels,
+    forward_risky_price_levels,
+    compute_k_clip_diagnostics,
+    build_legacy_risky_transform_spec_from_networks,
+)
 from src.trainers.losses import (
     compute_price_loss_aio,
+    compute_price_loss_huber,
     compute_price_loss_mse,
     compute_br_critic_loss_aio,
+    compute_br_critic_loss_huber,
     compute_br_critic_loss_mse,
     compute_br_critic_diagnostics,
 )
 from src.utils.annealing import AnnealingSchedule
 
 logger = logging.getLogger(__name__)
+
+
+def _inference_clip_k(
+    k_preclip: tf.Tensor,
+    *,
+    transform_spec: Dict[str, Any],
+) -> tf.Tensor:
+    cfg = transform_spec["outputs"]["policy_k"]
+    out = k_preclip
+    clip_min = cfg.get("clip_min")
+    clip_max = cfg.get("clip_max")
+    if clip_min is not None:
+        out = tf.maximum(out, tf.constant(float(clip_min), dtype=out.dtype))
+    if clip_max is not None:
+        out = tf.minimum(out, tf.constant(float(clip_max), dtype=out.dtype))
+    return out
+
+
+def _ensure_finite_scalar(name: str, value: tf.Tensor) -> None:
+    if not bool(tf.reduce_all(tf.math.is_finite(value))):
+        raise FloatingPointError(f"Non-finite scalar encountered for '{name}'.")
+
+
+def _ensure_finite_gradients(name: str, grads: List[Optional[tf.Tensor]]) -> None:
+    bad_indices = []
+    for idx, grad in enumerate(grads):
+        if grad is None:
+            continue
+        if not bool(tf.reduce_all(tf.math.is_finite(grad))):
+            bad_indices.append(idx)
+    if bad_indices:
+        raise FloatingPointError(
+            f"Non-finite gradients encountered for '{name}' at indices {bad_indices}."
+        )
+
+
+def _coerce_seed_pair(seed: Optional[Tuple[int, int]]) -> tf.Tensor:
+    if seed is None:
+        seed = (1729, 31337)
+    if len(seed) != 2:
+        raise ValueError(f"training_seed must have length 2, got {seed!r}")
+    return tf.constant([int(seed[0]), int(seed[1])], dtype=tf.int32)
 
 
 
@@ -65,8 +116,11 @@ class RiskyDebtTrainerBR:
         logit_clip: float,
         smoothing: Optional[AnnealingSchedule] = None,
         b_max: float = None,
+        b_empirical_max: Optional[float] = None,
         loss_type: str = "crossprod",
         br_scale: float = 1.0,
+        training_seed: Optional[Tuple[int, int]] = None,
+        transform_spec: Optional[Dict[str, Any]] = None,
     ):
         """
         Initialize the BR trainer with target networks.
@@ -96,14 +150,23 @@ class RiskyDebtTrainerBR:
                 If None, diagnostics related to constraint binding are skipped.
             loss_type: Loss computation method for critic.
                 - "mse": Mean Squared Error (biased but stable)
+                - "huber": Huber TD loss, robust to outlier residuals
                 - "crossprod": AiO cross-product (unbiased, default)
                 Use RiskyDebtConfig.loss_type (default: "crossprod").
             br_scale: Positive scalar used to normalize BR residuals before
                 computing critic loss. Set to 1.0 to disable normalization.
+            training_seed: Optional stateless base seed for training-time
+                exploration noise. If None, uses a fixed default seed.
         """
         self.policy_net = policy_net
         self.value_net = value_net
         self.price_net = price_net
+        self.transform_spec = transform_spec or build_legacy_risky_transform_spec_from_networks(
+            policy_net=policy_net,
+            value_net=value_net,
+            price_net=price_net,
+            r_risk_free=params.r_rate,
+        )
         self.params = params
         self.shock_params = shock_params
         self.weight_br = weight_br
@@ -113,12 +176,15 @@ class RiskyDebtTrainerBR:
         self.logit_clip = logit_clip
         self.beta = 1.0 / (1.0 + params.r_rate)
         self.b_max = b_max  # For constraint binding diagnostics
-        self.loss_type = loss_type  # "mse" or "crossprod"
+        self.b_empirical_max = b_empirical_max
+        self.loss_type = loss_type  # "mse", "huber", or "crossprod"
         self.br_scale = float(br_scale)
+        self.training_seed = training_seed
+        self._rng_base_seed = _coerce_seed_pair(training_seed)
         self._rng_step = 0  # Stateless noise seed step counter for reproducible exploration
 
         # Validate loss_type
-        valid_loss_types = {"mse", "crossprod"}
+        valid_loss_types = {"mse", "huber", "crossprod"}
         if loss_type not in valid_loss_types:
             raise ValueError(f"loss_type must be one of {valid_loss_types}, got '{loss_type}'")
         if self.br_scale <= 0:
@@ -135,12 +201,10 @@ class RiskyDebtTrainerBR:
         self.optimizer_critic = optimizer_critic
 
         # Build original networks first (required before cloning/copying weights)
-        dummy_k = tf.constant([[1.0]], dtype=tf.float32)
-        dummy_b = tf.constant([[0.5]], dtype=tf.float32)
-        dummy_z = tf.constant([[1.0]], dtype=tf.float32)
-        _ = policy_net(dummy_k, dummy_b, dummy_z)
-        _ = value_net(dummy_k, dummy_b, dummy_z)
-        _ = price_net(dummy_k, dummy_b, dummy_z)
+        dummy_x = tf.constant([[0.0, 0.0, 0.0]], dtype=tf.float32)
+        _ = policy_net(dummy_x, training=False)
+        _ = value_net(dummy_x, training=False)
+        _ = price_net(dummy_x, training=False)
 
         # Create target networks (frozen copies)
         # Reference: report_brief.md line 671: "Initiate target networks"
@@ -149,9 +213,9 @@ class RiskyDebtTrainerBR:
         self.target_price_net = tf.keras.models.clone_model(price_net)
 
         # Build target networks with dummy data
-        _ = self.target_policy_net(dummy_k, dummy_b, dummy_z)
-        _ = self.target_value_net(dummy_k, dummy_b, dummy_z)
-        _ = self.target_price_net(dummy_k, dummy_b, dummy_z)
+        _ = self.target_policy_net(dummy_x, training=False)
+        _ = self.target_value_net(dummy_x, training=False)
+        _ = self.target_price_net(dummy_x, training=False)
 
         # Initialize target networks with current network weights
         self.target_policy_net.set_weights(policy_net.get_weights())
@@ -180,8 +244,8 @@ class RiskyDebtTrainerBR:
         ]:
             mags = []
             for target_var, source_var in zip(
-                target_net.trainable_variables,
-                source_net.trainable_variables
+                target_net.variables,
+                source_net.variables
             ):
                 delta = (1.0 - self.polyak_tau) * (source_var - target_var)
                 mags.append(float(tf.reduce_mean(tf.abs(delta))))
@@ -229,8 +293,7 @@ class RiskyDebtTrainerBR:
         # Deterministic stateless seeds for Gumbel-Sigmoid exploration.
         # Using fold_in keeps seeds reproducible and independent across
         # train steps, critic repetitions, and forks.
-        base_seed = tf.constant([1729, 31337], dtype=tf.int32)
-        step_seed = tf.random.experimental.stateless_fold_in(base_seed, self._rng_step)
+        step_seed = tf.random.experimental.stateless_fold_in(self._rng_base_seed, self._rng_step)
         critic_seed = tf.random.experimental.stateless_fold_in(step_seed, critic_step_idx)
         noise_seed_main = tf.random.experimental.stateless_fold_in(critic_seed, 1)
         noise_seed_fork = tf.random.experimental.stateless_fold_in(critic_seed, 2)
@@ -238,13 +301,37 @@ class RiskyDebtTrainerBR:
         with tf.GradientTape() as tape:
             # === Compute Actions using TARGET Policy (Detached) ===
             # Reference: report_brief.md line 1044: "Get next actions"
-            k_next, b_next = self.target_policy_net(k, b, z)
+            k_next, b_next = forward_risky_policy_levels(
+                policy_net=self.target_policy_net,
+                k=k,
+                b=b,
+                z=z,
+                transform_spec=self.transform_spec,
+                training=False,
+                apply_output_clips=False,
+            )
 
             # === Compute Bond Prices ===
             # For Bellman target: use TARGET price network (stable target)
             # For pricing loss: use CURRENT price network (trainable)
-            q_target = self.target_price_net(k_next, b_next, z)  # For Bellman target
-            q = self.price_net(k_next, b_next, z)  # For pricing residual (trainable)
+            q_target = forward_risky_price_levels(
+                price_net=self.target_price_net,
+                k_next=k_next,
+                b_next=b_next,
+                z=z,
+                transform_spec=self.transform_spec,
+                training=False,
+                apply_output_clips=False,
+            )
+            q = forward_risky_price_levels(
+                price_net=self.price_net,
+                k_next=k_next,
+                b_next=b_next,
+                z=z,
+                transform_spec=self.transform_spec,
+                training=True,
+                apply_output_clips=False,
+            )
 
             # === Compute Cash Flow using TARGET price (for stable Bellman target) ===
             e = cash_flow_risky_debt_q(k, k_next, b, b_next, z, q_target, self.params,
@@ -253,8 +340,24 @@ class RiskyDebtTrainerBR:
 
             # === Compute Continuation Values using TARGET Value Network ===
             # Reference: report_brief.md lines 1045-1047
-            V_tilde_next_1 = self.target_value_net(k_next, b_next, z_next_main)
-            V_tilde_next_2 = self.target_value_net(k_next, b_next, z_next_fork)
+            V_tilde_next_1 = forward_risky_value_levels(
+                value_net=self.target_value_net,
+                k=k_next,
+                b=b_next,
+                z=z_next_main,
+                transform_spec=self.transform_spec,
+                training=False,
+                apply_output_clips=False,
+            )
+            V_tilde_next_2 = forward_risky_value_levels(
+                value_net=self.target_value_net,
+                k=k_next,
+                b=b_next,
+                z=z_next_fork,
+                transform_spec=self.transform_spec,
+                training=False,
+                apply_output_clips=False,
+            )
 
             # Apply smooth limited liability: V_eff = (1-p) * V
             # Reference: report_brief.md lines 930-941
@@ -274,7 +377,15 @@ class RiskyDebtTrainerBR:
             y2 = tf.stop_gradient(e - eta + self.beta * V_eff_2)
 
             # === Compute Current Value (Trainable) ===
-            V_curr = self.value_net(k, b, z)
+            V_curr = forward_risky_value_levels(
+                value_net=self.value_net,
+                k=k,
+                b=b,
+                z=z,
+                transform_spec=self.transform_spec,
+                training=True,
+                apply_output_clips=False,
+            )
             V_curr_norm = V_curr / self.br_scale
             y1_norm = y1 / self.br_scale
             y2_norm = y2 / self.br_scale
@@ -283,6 +394,8 @@ class RiskyDebtTrainerBR:
             # Reference: report_brief.md lines 1056-1057
             if self.loss_type == "mse":
                 loss_br = compute_br_critic_loss_mse(V_curr_norm, y1_norm, y2_norm)
+            elif self.loss_type == "huber":
+                loss_br = compute_br_critic_loss_huber(V_curr_norm, y1_norm, y2_norm)
             else:  # "crossprod"
                 loss_br = compute_br_critic_loss_aio(V_curr_norm, y1_norm, y2_norm)
 
@@ -296,6 +409,8 @@ class RiskyDebtTrainerBR:
             f_p2 = pricing_residual_bond_price(q, b_next, self.params.r_rate, p_D_2, R_2)
             if self.loss_type == "mse":
                 loss_price = compute_price_loss_mse(f_p1, f_p2)
+            elif self.loss_type == "huber":
+                loss_price = compute_price_loss_huber(f_p1, f_p2)
             else:  # "crossprod"
                 loss_price = compute_price_loss_aio(f_p1, f_p2)
 
@@ -304,10 +419,14 @@ class RiskyDebtTrainerBR:
             # Normalize to price loss for better numerical stability (BR loss is ~100x larger)
             # Reference: report_brief.md lines 1062-1063
             total_loss = self.weight_br * loss_br + loss_price
+            _ensure_finite_scalar("risky_br/loss_br", loss_br)
+            _ensure_finite_scalar("risky_br/loss_price", loss_price)
+            _ensure_finite_scalar("risky_br/loss_total", total_loss)
 
         # Update critic networks (value + price)
         critic_vars = self.value_net.trainable_variables + self.price_net.trainable_variables
         grads = tape.gradient(total_loss, critic_vars)
+        _ensure_finite_gradients("risky_br/critic", grads)
         self.optimizer_critic.apply_gradients(zip(grads, critic_vars))
 
         # Compute relative diagnostics (scale-invariant metrics for monitoring)
@@ -329,7 +448,7 @@ class RiskyDebtTrainerBR:
         z: tf.Tensor,
         z_next_main: tf.Tensor,
         temperature: float
-    ) -> Dict[str, float]:
+    ) -> Tuple[Dict[str, float], tf.Tensor]:
         """
         Execute one actor update step.
 
@@ -358,11 +477,28 @@ class RiskyDebtTrainerBR:
         with tf.GradientTape() as tape:
             # === Compute Actions using CURRENT Policy (Gradients Flow) ===
             # Reference: report_brief.md line 1069
-            k_next, b_next = self.policy_net(k, b, z)
+            (k_next, b_next), (k_preclip, _) = forward_risky_policy_levels(
+                policy_net=self.policy_net,
+                k=k,
+                b=b,
+                z=z,
+                transform_spec=self.transform_spec,
+                training=True,
+                apply_output_clips=False,
+                return_preclip=True,
+            )
 
             # === Evaluate Price using CURRENT Price Network ===
             # Reference: report_brief.md line 1071
-            q = self.price_net(k_next, b_next, z)
+            q = forward_risky_price_levels(
+                price_net=self.price_net,
+                k_next=k_next,
+                b_next=b_next,
+                z=z,
+                transform_spec=self.transform_spec,
+                training=False,
+                apply_output_clips=False,
+            )
 
             # === Compute Cash Flow ===
             e = cash_flow_risky_debt_q(k, k_next, b, b_next, z, q, self.params,
@@ -372,7 +508,15 @@ class RiskyDebtTrainerBR:
             # === Compute Continuation Value using CURRENT Value Network ===
             # Reference: report_brief.md line 1072: "Evaluate Value"
             # NOTE: We do NOT freeze value weights - gradients flow through k', b'
-            V_tilde_next = self.value_net(k_next, b_next, z_next_main)
+            V_tilde_next = forward_risky_value_levels(
+                value_net=self.value_net,
+                k=k_next,
+                b=b_next,
+                z=z_next_main,
+                transform_spec=self.transform_spec,
+                training=False,
+                apply_output_clips=False,
+            )
 
             # Apply smooth limited liability: V_eff = (1-p) * V
             # This avoids dying ReLU problem in default region
@@ -384,16 +528,18 @@ class RiskyDebtTrainerBR:
             # Reference: report_brief.md lines 1073-1074
             bellman_rhs = e - eta + self.beta * V_eff
             loss_actor = -tf.reduce_mean(bellman_rhs)
+            _ensure_finite_scalar("risky_br/loss_actor", loss_actor)
 
         # Update policy network only
         grads = tape.gradient(loss_actor, self.policy_net.trainable_variables)
+        _ensure_finite_gradients("risky_br/actor", grads)
         self.optimizer_actor.apply_gradients(zip(grads, self.policy_net.trainable_variables))
 
         return {
             "loss_actor": float(loss_actor),
             "mean_bellman_rhs": float(tf.reduce_mean(bellman_rhs)),
             "mean_p_default_actor": float(tf.reduce_mean(p_D))
-        }
+        }, k_preclip
 
     def _compute_diagnostics(
         self,
@@ -429,7 +575,15 @@ class RiskyDebtTrainerBR:
         from src.networks.network_risky import compute_effective_value
 
         # Get policy outputs (without gradients)
-        k_next, b_next = self.policy_net(k, b, z)
+        k_next, b_next = forward_risky_policy_levels(
+            policy_net=self.policy_net,
+            k=k,
+            b=b,
+            z=z,
+            transform_spec=self.transform_spec,
+            training=False,
+            apply_output_clips=False,
+        )
 
         # === 1. Constraint Binding Diagnostics ===
         constraint_metrics = {}
@@ -449,9 +603,23 @@ class RiskyDebtTrainerBR:
             )
             constraint_metrics["frac_b_near_zero"] = float(frac_at_zero)
 
+        if self.b_empirical_max is not None:
+            frac_over_empirical = tf.reduce_mean(
+                tf.cast(tf.reshape(b_next, [-1]) > float(self.b_empirical_max), tf.float32)
+            )
+            constraint_metrics["frac_b_over_train_max"] = float(frac_over_empirical)
+
         # === 2. Default Probability Diagnostics ===
         # Compute value at next state
-        V_tilde_next = self.value_net(k_next, b_next, z_next_main)
+        V_tilde_next = forward_risky_value_levels(
+            value_net=self.value_net,
+            k=k_next,
+            b=b_next,
+            z=z_next_main,
+            transform_spec=self.transform_spec,
+            training=False,
+            apply_output_clips=False,
+        )
         V_eff, p_default = compute_effective_value(
             V_tilde_next, k_next, temperature, self.logit_clip, noise=False
         )
@@ -566,7 +734,7 @@ class RiskyDebtTrainerBR:
             value_scales.append(critic_metrics["mean_value_scale"])
 
         # === B. Actor Update (Once) ===
-        actor_metrics = self._actor_step(k, b, z, z_next_main, temp)
+        actor_metrics, actor_k_preclip = self._actor_step(k, b, z, z_next_main, temp)
 
         # === Update Target Networks ===
         target_updates = self._update_target_networks()
@@ -578,6 +746,14 @@ class RiskyDebtTrainerBR:
 
         # === C. Compute Diagnostic Metrics ===
         diagnostics = self._compute_diagnostics(k, b, z, z_next_main, temp)
+        actor_k_postclip = _inference_clip_k(
+            actor_k_preclip,
+            transform_spec=self.transform_spec,
+        )
+        k_clip_diag = compute_k_clip_diagnostics(
+            k_postclip=actor_k_postclip,
+            k_preclip=actor_k_preclip,
+        )
 
         return {
             "loss_critic": float(np.mean(critic_losses)),
@@ -589,6 +765,8 @@ class RiskyDebtTrainerBR:
             "rel_mae": float(np.mean(rel_maes)),
             "mean_value_scale": float(np.mean(value_scales)),
             "temperature": temp,
+            "clip_fraction_k": k_clip_diag["clip_fraction_k"],
+            "preclip_max_k": k_clip_diag["preclip_max_k"],
             **target_updates,
             **diagnostics
         }
@@ -629,16 +807,56 @@ class RiskyDebtTrainerBR:
         z_next_fork = tf.reshape(z_next_fork, [-1, 1])
 
         # Critic evaluation (using target networks for consistent Bellman target)
-        k_next, b_next = self.target_policy_net(k, b, z)
-        q_target = self.target_price_net(k_next, b_next, z)  # Use target price for Bellman target
-        q_current = self.price_net(k_next, b_next, z)
+        k_next, b_next = forward_risky_policy_levels(
+            policy_net=self.target_policy_net,
+            k=k,
+            b=b,
+            z=z,
+            transform_spec=self.transform_spec,
+            training=False,
+            apply_output_clips=False,
+        )
+        q_target = forward_risky_price_levels(
+            price_net=self.target_price_net,
+            k_next=k_next,
+            b_next=b_next,
+            z=z,
+            transform_spec=self.transform_spec,
+            training=False,
+            apply_output_clips=False,
+        )
+        q_current = forward_risky_price_levels(
+            price_net=self.price_net,
+            k_next=k_next,
+            b_next=b_next,
+            z=z,
+            transform_spec=self.transform_spec,
+            training=False,
+            apply_output_clips=False,
+        )
 
         e = cash_flow_risky_debt_q(k, k_next, b, b_next, z, q_target, self.params,
                                     temperature=temperature, logit_clip=self.logit_clip)
         eta = external_financing_cost(e, k, self.params, temperature=temperature, logit_clip=self.logit_clip)
 
-        V_tilde_next_1 = self.target_value_net(k_next, b_next, z_next_main)
-        V_tilde_next_2 = self.target_value_net(k_next, b_next, z_next_fork)
+        V_tilde_next_1 = forward_risky_value_levels(
+            value_net=self.target_value_net,
+            k=k_next,
+            b=b_next,
+            z=z_next_main,
+            transform_spec=self.transform_spec,
+            training=False,
+            apply_output_clips=False,
+        )
+        V_tilde_next_2 = forward_risky_value_levels(
+            value_net=self.target_value_net,
+            k=k_next,
+            b=b_next,
+            z=z_next_fork,
+            transform_spec=self.transform_spec,
+            training=False,
+            apply_output_clips=False,
+        )
 
         # Use deterministic sigmoid for evaluation (no Gumbel noise)
         V_eff_1, p_D_1 = compute_effective_value(V_tilde_next_1, k_next, temperature, self.logit_clip, noise=False)
@@ -647,12 +865,22 @@ class RiskyDebtTrainerBR:
         y1 = e - eta + self.beta * V_eff_1
         y2 = e - eta + self.beta * V_eff_2
 
-        V_curr = self.value_net(k, b, z)
+        V_curr = forward_risky_value_levels(
+            value_net=self.value_net,
+            k=k,
+            b=b,
+            z=z,
+            transform_spec=self.transform_spec,
+            training=False,
+            apply_output_clips=False,
+        )
         V_curr_norm = V_curr / self.br_scale
         y1_norm = y1 / self.br_scale
         y2_norm = y2 / self.br_scale
         if self.loss_type == "mse":
             loss_critic = compute_br_critic_loss_mse(V_curr_norm, y1_norm, y2_norm)
+        elif self.loss_type == "huber":
+            loss_critic = compute_br_critic_loss_huber(V_curr_norm, y1_norm, y2_norm)
         else:  # "crossprod"
             loss_critic = compute_br_critic_loss_aio(V_curr_norm, y1_norm, y2_norm)
 
@@ -663,22 +891,72 @@ class RiskyDebtTrainerBR:
         f_p2 = pricing_residual_bond_price(q_current, b_next, self.params.r_rate, p_D_2, R_2)
         if self.loss_type == "mse":
             loss_price = compute_price_loss_mse(f_p1, f_p2)
+        elif self.loss_type == "huber":
+            loss_price = compute_price_loss_huber(f_p1, f_p2)
         else:  # "crossprod"
             loss_price = compute_price_loss_aio(f_p1, f_p2)
 
         # Actor evaluation
-        k_next_actor, b_next_actor = self.policy_net(k, b, z)
-        q_actor = self.price_net(k_next_actor, b_next_actor, z)
+        (k_next_actor, b_next_actor), (k_preclip_actor, _) = forward_risky_policy_levels(
+            policy_net=self.policy_net,
+            k=k,
+            b=b,
+            z=z,
+            transform_spec=self.transform_spec,
+            training=False,
+            apply_output_clips=False,
+            return_preclip=True,
+        )
+        q_actor = forward_risky_price_levels(
+            price_net=self.price_net,
+            k_next=k_next_actor,
+            b_next=b_next_actor,
+            z=z,
+            transform_spec=self.transform_spec,
+            training=False,
+            apply_output_clips=False,
+        )
         e_actor = cash_flow_risky_debt_q(k, k_next_actor, b, b_next_actor, z, q_actor, self.params,
                                           temperature=temperature, logit_clip=self.logit_clip)
         eta_actor = external_financing_cost(e_actor, k, self.params, temperature=temperature, logit_clip=self.logit_clip)
-        V_tilde_next_actor = self.value_net(k_next_actor, b_next_actor, z_next_main)
+        V_tilde_next_actor = forward_risky_value_levels(
+            value_net=self.value_net,
+            k=k_next_actor,
+            b=b_next_actor,
+            z=z_next_main,
+            transform_spec=self.transform_spec,
+            training=False,
+            apply_output_clips=False,
+        )
         V_eff_actor, _ = compute_effective_value(V_tilde_next_actor, k_next_actor, temperature, self.logit_clip, noise=False)
         loss_actor = -tf.reduce_mean(e_actor - eta_actor + self.beta * V_eff_actor)
+
+        actor_k_postclip = _inference_clip_k(
+            k_preclip_actor,
+            transform_spec=self.transform_spec,
+        )
+        k_clip_diag = compute_k_clip_diagnostics(
+            k_postclip=actor_k_postclip,
+            k_preclip=k_preclip_actor,
+        )
+
+        frac_b_over_train_max = 0.0
+        if self.b_empirical_max is not None:
+            frac_b_over_train_max = float(
+                tf.reduce_mean(
+                    tf.cast(
+                        tf.reshape(b_next_actor, [-1]) > float(self.b_empirical_max),
+                        tf.float32,
+                    )
+                )
+            )
 
         return {
             "loss_critic": float(loss_critic),
             "loss_actor": float(loss_actor),
             "loss_price": float(loss_price),
             "mean_p_default": float(tf.reduce_mean(0.5 * (p_D_1 + p_D_2))),
+            "clip_fraction_k": k_clip_diag["clip_fraction_k"],
+            "preclip_max_k": k_clip_diag["preclip_max_k"],
+            "frac_b_over_train_max": frac_b_over_train_max,
         }

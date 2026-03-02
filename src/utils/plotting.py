@@ -616,58 +616,6 @@ def plot_policy_slices_compare_rows(
     )
 
 
-def plot_policy_panels(
-    eval_data: Dict,
-    figsize: Optional[Tuple[int, int]] = None,
-    suptitle: Optional[str] = None,
-    show_45_line: bool = True,
-    frictionless_benchmark: Optional[Dict] = None,
-) -> plt.Figure:
-    """
-    Deprecated alias for plot_policy_slices_single().
-    """
-    warnings.warn(
-        "plot_policy_panels is deprecated; use plot_policy_slices_single.",
-        DeprecationWarning,
-        stacklevel=2,
-    )
-    return plot_policy_slices_single(
-        eval_data=eval_data,
-        figsize=figsize,
-        suptitle=suptitle,
-        show_45_line=show_45_line,
-        frictionless_benchmark=frictionless_benchmark,
-    )
-
-
-def plot_policy_comparison_panels(
-    eval_datas: List[Dict],
-    labels: List[str],
-    figsize: Optional[Tuple[int, int]] = None,
-    suptitle: Optional[str] = None,
-    show_45_line: bool = True,
-    frictionless_benchmark: Optional[Dict] = None,
-    layout: str = "overlay",
-) -> plt.Figure:
-    """
-    Deprecated alias for plot_policy_slices_compare().
-    """
-    warnings.warn(
-        "plot_policy_comparison_panels is deprecated; use plot_policy_slices_compare, "
-        "plot_policy_slices_compare_overlay, or plot_policy_slices_compare_rows.",
-        DeprecationWarning,
-        stacklevel=2,
-    )
-    return plot_policy_slices_compare(
-        eval_datas=eval_datas,
-        labels=labels,
-        figsize=figsize,
-        suptitle=suptitle,
-        show_45_line=show_45_line,
-        frictionless_benchmark=frictionless_benchmark,
-        layout=layout,
-    )
-
 
 # =============================================================================
 # 3D POLICY SURFACE PLOTTING
@@ -1493,16 +1441,26 @@ def plot_baseline_validation(
     labels = {'lr': 'LR Method', 'er': 'ER Method', 'br': 'BR Method'}
 
     # Evaluate each policy
-    for method_name, policy_net in policies.items():
-        if policy_net is None:
+    for method_name, policy_fn in policies.items():
+        if policy_fn is None:
             continue
 
         # Prepare inputs
         k_input = tf.constant([[k_fixed]] * len(z_vals), dtype=tf.float32)
         z_input = tf.constant(z_vals.reshape(-1, 1), dtype=tf.float32)
 
-        # Get policy output
-        k_next = policy_net(k_input, z_input).numpy().flatten()
+        # Get policy output in levels.
+        try:
+            k_next_tensor = policy_fn(k_input, z_input)
+        except RuntimeError as exc:
+            raise RuntimeError(
+                "Policy callable failed. Pass a level-space inference callable "
+                "(e.g., helper.policy) instead of raw network model calls."
+            ) from exc
+
+        if isinstance(k_next_tensor, tuple):
+            k_next_tensor = k_next_tensor[0]
+        k_next = k_next_tensor.numpy().flatten()
 
         color = colors.get(method_name, 'gray')
         label = labels.get(method_name, method_name.upper())
@@ -1718,38 +1676,3 @@ def plot_baseline_policy_validation(
     }
     return fig, metadata
 
-
-def plot_quick_baseline_validation(
-    results_baseline: Dict,
-    baseline_params,
-    shock_params,
-    k_bounds: Tuple[float, float],
-    logz_bounds: Tuple[float, float],
-    save_path: Optional[str] = None,
-    methods: Optional[List[str]] = None,
-    ref_method: Optional[str] = None,
-    ncols: Optional[int] = None,
-    show_missing: bool = True,
-    figsize: Optional[Tuple[int, int]] = None,
-) -> Tuple[plt.Figure, Dict[str, Union[str, float, List[str]]]]:
-    """
-    Deprecated alias for plot_baseline_policy_validation().
-    """
-    warnings.warn(
-        "plot_quick_baseline_validation is deprecated; use plot_baseline_policy_validation.",
-        DeprecationWarning,
-        stacklevel=2,
-    )
-    return plot_baseline_policy_validation(
-        results_baseline=results_baseline,
-        baseline_params=baseline_params,
-        shock_params=shock_params,
-        k_bounds=k_bounds,
-        logz_bounds=logz_bounds,
-        save_path=save_path,
-        methods=methods,
-        ref_method=ref_method,
-        ncols=ncols,
-        show_missing=show_missing,
-        figsize=figsize,
-    )

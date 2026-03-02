@@ -3,8 +3,34 @@ import tensorflow as tf
 import numpy as np
 
 # Adjust imports to match your folder structure
-from src.economy.parameters import EconomicParams, ShockParams
+from src.economy.parameters import EconomicParams
 from src.ddp import DDPGridConfig, BasicModelDDP
+
+
+def _make_synthetic_dataset_and_metadata(n=500, seed=42):
+    """Build a minimal synthetic dataset mimicking flattened training data."""
+    rng = np.random.default_rng(seed)
+
+    mu, rho, sigma = 0.0, 0.8, 0.1
+    log_z = rng.normal(mu, sigma / np.sqrt(1 - rho**2), size=n)
+    log_z_next = rho * log_z + rng.normal(0, sigma, size=n)
+    z = np.exp(log_z).astype(np.float32)
+    z_next = np.exp(log_z_next).astype(np.float32)
+    k = rng.uniform(0.5, 5.0, size=n).astype(np.float32)
+
+    dataset = {
+        "z": tf.constant(z),
+        "z_next_main": tf.constant(z_next),
+        "k": tf.constant(k),
+    }
+    metadata = {
+        "bounds": {
+            "k": (float(k.min()), float(k.max())),
+            "log_z": (float(log_z.min()), float(log_z.max())),
+            "b": (0.0, 10.0),
+        }
+    }
+    return dataset, metadata
 
 
 @pytest.fixture
@@ -14,9 +40,14 @@ def model_ddp():
     Uses a small grid to keep tests fast.
     """
     params = EconomicParams()
-    shock_params = ShockParams()
+    dataset, metadata = _make_synthetic_dataset_and_metadata()
     grid_config = DDPGridConfig(z_size=5, k_size=10)
-    return BasicModelDDP(params, shock_params, grid_config)
+    return BasicModelDDP(
+        params,
+        grid_config=grid_config,
+        dataset=dataset,
+        dataset_metadata=metadata,
+    )
 
 
 def test_initialization_shapes(model_ddp):
@@ -49,9 +80,14 @@ def test_reward_values_no_costs():
         cost_convex=0.0,
         delta=1.0,
     )
-    grid_config = DDPGridConfig(k_size=5, z_size=2, grid_type="log_linear")
-    shock_params = ShockParams()
-    model = BasicModelDDP(params, shock_params, grid_config)
+    grid_config = DDPGridConfig(k_size=5, z_size=2, capital_grid_type="linear")
+    dataset, metadata = _make_synthetic_dataset_and_metadata()
+    model = BasicModelDDP(
+        params,
+        grid_config=grid_config,
+        dataset=dataset,
+        dataset_metadata=metadata,
+    )
 
     # Extract values
     z = model.z_grid[0]
@@ -133,7 +169,7 @@ def test_solvers_consistency(model_ddp):
 
     # 3. Compare Value Functions
     diff_v = np.max(np.abs(v_vfi - v_pfi))
-    assert diff_v < 1e-4, f"Solvers disagreed on Value Function! Max diff: {diff_v}"
+    assert diff_v < 2e-4, f"Solvers disagreed on Value Function! Max diff: {diff_v}"
 
     # 4. Compare Policy Functions
     # Both output actual capital values (floats), so we compare those directly

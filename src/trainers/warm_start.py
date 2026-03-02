@@ -83,7 +83,19 @@ def _iter_config_keys() -> Iterable[str]:
         "b_max",
         "n_layers",
         "n_neurons",
-        "activation",
+        "hidden_activation",
+        "policy_head",
+        "value_head",
+        "policy_k_head",
+        "policy_b_head",
+        "price_head",
+        "basic_policy_head",
+        "basic_value_head",
+        "risky_policy_k_head",
+        "risky_policy_b_head",
+        "risky_price_head",
+        "observation_normalizer",
+        "inference_clips",
     )
 
 
@@ -171,4 +183,3 @@ def copy_policy_weights(
     ensure_policy_compatibility(source_policy, target_policy)
     target_policy.set_weights(source_policy.get_weights())
     return source_policy
-

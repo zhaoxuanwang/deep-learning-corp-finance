@@ -10,7 +10,9 @@ from typing import Any, Dict, Optional, Tuple, Union
 import tensorflow as tf
 
 from src.economy.parameters import EconomicParams, ShockParams
+from src.networks.observation_normalization import build_observation_normalizer
 from src.networks.network_risky import build_risky_networks
+from src.trainers.io_transforms import build_risky_transform_spec
 from src.trainers.config import (
     NetworkConfig,
     OptimizationConfig,
@@ -69,6 +71,25 @@ def _coerce_method_config(
     return method_config
 
 
+def _build_risky_observation_normalizer(
+    *,
+    dataset: Dict[str, tf.Tensor],
+    net_config: NetworkConfig,
+    bounds: Dict[str, Tuple[float, float]],
+) -> Dict[str, Any]:
+    obs_cfg = net_config.observation_normalization
+    return build_observation_normalizer(
+        dataset=dataset,
+        bounds=bounds,
+        k_scheme=obs_cfg.k_scheme,
+        z_scheme=obs_cfg.z_scheme,
+        b_scheme=obs_cfg.b_scheme,
+        z_input_space=obs_cfg.z_input_space,
+        epsilon=obs_cfg.epsilon,
+        include_debt=True,
+    )
+
+
 def train_risky_br_actor_critic(
     dataset: Dict[str, tf.Tensor],
     net_config: NetworkConfig,
@@ -79,6 +100,7 @@ def train_risky_br_actor_critic(
     shock_params: ShockParams,
     bounds: Dict[str, Tuple[float, float]],
     validation_data: Optional[Dict[str, tf.Tensor]] = None,
+    training_seed: Optional[Tuple[int, int]] = None,
 ) -> Union[Dict[str, Any], TrainingResult]:
     """
     Train Risky Debt Model using BR (Actor-Critic) method.
@@ -104,8 +126,34 @@ def train_risky_br_actor_critic(
     data_iter = build_training_iterator(
         dataset,
         batch_size=opt_config.batch_size,
-        shuffle_key=method_spec.shuffle_key or "k",
+        batch_order=method_spec.batch_order,
+        permutation_seed=training_seed if method_spec.batch_order == "fixed_permutation" else None,
     )
+    observation_normalizer = _build_risky_observation_normalizer(
+        dataset=dataset,
+        net_config=net_config,
+        bounds=bounds,
+    )
+    clip_cfg = net_config.inference_clips
+    transform_spec = build_risky_transform_spec(
+        normalizer=observation_normalizer,
+        k_bounds=k_bounds,
+        b_bounds=b_bounds,
+        r_risk_free=params.r_rate,
+        policy_k_head=net_config.risky_policy_k_head,
+        policy_b_head=net_config.risky_policy_b_head,
+        value_head=net_config.risky_value_head,
+        price_head=net_config.risky_price_head,
+        clip_policy_k_min=clip_cfg.risky_policy_k.clip_min,
+        clip_policy_k_max=clip_cfg.risky_policy_k.clip_max,
+        clip_policy_b_min=clip_cfg.risky_policy_b.clip_min,
+        clip_policy_b_max=clip_cfg.risky_policy_b.clip_max,
+        clip_value_min=clip_cfg.risky_value.clip_min,
+        clip_value_max=clip_cfg.risky_value.clip_max,
+        clip_price_min=clip_cfg.risky_price_q.clip_min,
+        clip_price_max=clip_cfg.risky_price_q.clip_max,
+    )
+    b_empirical_max = float(tf.reduce_max(tf.reshape(dataset["b"], [-1])))
 
     policy_net, value_net, price_net = build_risky_networks(
         k_min=k_bounds[0],
@@ -117,7 +165,7 @@ def train_risky_br_actor_critic(
         r_risk_free=params.r_rate,
         n_layers=net_config.n_layers,
         n_neurons=net_config.n_neurons,
-        activation=net_config.activation,
+        hidden_activation=net_config.hidden_activation,
     )
 
     actor_lr = opt_config.learning_rate
@@ -140,6 +188,7 @@ def train_risky_br_actor_critic(
         policy_net=policy_net,
         value_net=value_net,
         price_net=price_net,
+        transform_spec=transform_spec,
         params=params,
         shock_params=shock_params,
         optimizer_actor=optimizer_actor,
@@ -150,8 +199,10 @@ def train_risky_br_actor_critic(
         smoothing=None,
         logit_clip=anneal_config.logit_clip,
         b_max=b_bounds[1],
+        b_empirical_max=b_empirical_max,
         loss_type=risky_cfg.loss_type,
         br_scale=br_norm.scale,
+        training_seed=training_seed,
     )
 
     validation_fn = _make_validation_fn_risky_br(trainer) if validation_data is not None else None
@@ -184,7 +235,13 @@ def train_risky_br_actor_critic(
             "annealing": anneal_config,
         },
         params=params,
-        meta={"model": "risky", "method": "risky_br_actor_critic", "br_scale": br_norm.scale},
+        meta={
+            "model": "risky",
+            "method": "risky_br_actor_critic",
+            "br_scale": br_norm.scale,
+            "io_transforms": transform_spec,
+            "training_seed": list(training_seed) if training_seed is not None else None,
+        },
     )
     return result.to_legacy_dict()
 
@@ -199,6 +256,7 @@ def train_risky_br(
     shock_params: ShockParams,
     bounds: Dict[str, Tuple[float, float]],
     validation_data: Optional[Dict[str, tf.Tensor]] = None,
+    training_seed: Optional[Tuple[int, int]] = None,
 ) -> Union[Dict[str, Any], TrainingResult]:
     """Backward-compatible alias for risky BR actor-critic."""
     return train_risky_br_actor_critic(
@@ -211,4 +269,5 @@ def train_risky_br(
         shock_params=shock_params,
         bounds=bounds,
         validation_data=validation_data,
+        training_seed=training_seed,
     )

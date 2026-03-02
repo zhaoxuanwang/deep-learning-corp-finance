@@ -44,6 +44,40 @@ def _with_metric_aliases(metrics: Dict[str, Any]) -> Dict[str, Any]:
     return enriched
 
 
+def _assert_finite_scalar_metrics(
+    metrics: Dict[str, Any],
+    *,
+    method_name: str,
+    iteration: int,
+) -> None:
+    """
+    Fail fast if a scalar numeric metric becomes non-finite.
+    """
+    bad: Dict[str, float] = {}
+    for key, value in metrics.items():
+        scalar_value: Optional[float] = None
+        if isinstance(value, (int, float, np.integer, np.floating)):
+            scalar_value = float(value)
+        elif tf.is_tensor(value):
+            if value.shape.rank == 0:
+                scalar_value = float(value.numpy())
+        elif hasattr(value, "numpy"):
+            maybe = value.numpy()
+            if np.isscalar(maybe):
+                scalar_value = float(maybe)
+
+        if scalar_value is None:
+            continue
+        if not np.isfinite(scalar_value):
+            bad[key] = scalar_value
+
+    if bad:
+        raise FloatingPointError(
+            f"Non-finite metrics detected for method '{method_name}' at "
+            f"iteration {iteration}: {bad}"
+        )
+
+
 def execute_training_loop(
     trainer: Any,
     dataset: Iterator[Dict[str, tf.Tensor]],
@@ -221,6 +255,11 @@ def execute_training_loop(
         # 4. Train Step
         metrics = trainer.train_step(**filtered_args)
         metrics = _with_metric_aliases(metrics)
+        _assert_finite_scalar_metrics(
+            metrics,
+            method_name=method_name,
+            iteration=i,
+        )
         
         # 5. Logging
         if i % opt_config.log_every == 0 or i == 1:
