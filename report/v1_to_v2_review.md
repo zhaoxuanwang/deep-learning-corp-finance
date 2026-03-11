@@ -1,6 +1,6 @@
 # Comprehensive Code Review: v1 → v1.5 → v2
 
-This document provides: (A) a gap analysis of what exists in code but not in the v1 report, (B) an evaluation of the v2 design for issues/inconsistencies, and (C) a concrete migration plan with industry best practices.
+This document provides: (A) a gap analysis of what exists in code but not in the v1 report, (B) an evaluation of the v2 design with resolved decisions, and (C) a concrete migration plan.
 
 ---
 
@@ -115,366 +115,452 @@ Key functions: `build_basic_transform_spec()`, `build_risky_transform_spec()`, `
 
 ---
 
-# Part B: Evaluation of v2 Design — Issues and Inconsistencies
+# Part B: v2 Design Decisions — Resolved
 
-## B1. Normalization: symlog vs. Current log_zscore
+Each subsection records the issue, the agreed solution, rejected alternatives, and any remaining to-dos.
 
-**v2 proposes:** Uniform `symlog(x) = sign(x) · ln(1 + |x|)` for all observations, no fitted statistics.
+## B1. Input Normalization
 
-**Current v1.5:** Per-feature log_zscore / zscore with fitted μ, σ from training data.
+**Issue:** v2 proposes stateless symlog for all observations. Concerns raised: (1) symlog does not equalize cross-feature scales, (2) resolution is allocated by natural scale not information content, (3) DreamerV3 analogy is imperfect for small networks.
 
-### Assessment
+**Decision:** Offer two normalization options:
+- `"symlog"` (default) — stateless, domain-agnostic, follows DreamerV3.
+- `"running_zscore"` — exponential moving average of mean/std across batches, the standard in RL (OpenAI Baselines, Stable-Baselines3, CleanRL). Requires state (running μ, σ tensors saved in checkpoint). Stats update during training, freeze at inference.
 
-**Strengths of v2 symlog:**
-- Stateless — no fitting step, no running statistics, no warm-up issues
-- Handles negative values natively (needed for V, Q, returns)
-- Domain-agnostic: works without knowing variable ranges
-- Follows DreamerV3 which achieved SOTA across diverse environments
+LayerNorm after the first hidden layer compensates for residual scale differences between features. Concerns (1) and (2) are acknowledged by design and are minor in practice because the network adapts its first-layer weights within a few epochs.
 
-**Concerns:**
-1. **Scale mismatch across features persists.** symlog compresses large values but does NOT equalize scales across variables. If k ~ [20, 600] and z ~ [0.5, 2.0], then symlog(k) ~ [3.0, 6.4] and symlog(z) ~ [0.4, 1.1]. The 6x ratio persists. v2 relies on LayerNorm after the first hidden layer to fix this, but the first-layer weights still receive gradients at mismatched scales before LayerNorm acts. In v1.5, log_zscore brings everything to mean=0, std=1 before the network sees it — arguably better conditioning for the first layer.
+**Rejected alternatives:**
+- Per-feature `log_zscore` (v1.5 approach): domain-specific, requires knowing which variables are positive. Violates the domain-agnostic goal.
+- Per-batch z-score (compute μ, σ from current mini-batch only): noisy for small batches, not standard practice. Running z-score is strictly better.
+- `tanh` compression: saturates for |x| > 3, loses information for large variables.
 
-2. **Loss of information for small variables.** For z ~ [0.5, 2.0], symlog ≈ identity (Taylor expansion). This means z values pass through almost unchanged, while k values get log-compressed. The relative resolution allocated to each feature is determined by the accident of their natural scale, not by the information content.
+**To-do:** Update v2 report to remove the imperfect DreamerV3/image-RL analogy and replace with a direct argument about statelessness and LayerNorm compensation.
 
-3. **The DreamerV3 analogy is imperfect.** DreamerV3 normalizes observations in image-based RL where pixel values are naturally bounded [0, 255]. Economic state variables have no such natural bounding. DreamerV3 also uses very large networks (millions of parameters) that can compensate for suboptimal input conditioning. The 2-layer 32-neuron networks typical in this project have much less capacity to adapt.
+## B2. Output Head
 
-**Recommendation:** symlog is a sound default for generality, but consider offering per-feature overrides (e.g., `"symlog"` default, `"log_zscore"` available) for users who know their variable scales. The v2 report should explicitly discuss the residual scale-ratio issue and explain why LayerNorm compensates.
+**Issue:** v2 proposes universal linear output with clip. Concerns raised: (1) zero gradient outside bounds could prevent learning if optimal action is near a boundary, (2) discontinuous gradient at clip boundary may cause SGD oscillation, (3) bond price may suffer near q_max.
 
-## B2. Output Head: Linear + Clip vs. Current bounded_sigmoid / affine_exp
+**Decision:** Universal linear output + clip with user-specified generous bounds. No domain-specific output heads. The user sets bounds wide enough that the clip almost never activates during training. The zero-gradient region is far from the optimal policy and irrelevant in practice. For MVE actor updates, the DDPG convention applies: pass raw (unclipped) action to Q in the actor loss; Q's gradient handles feasibility implicitly. Clip only appears in reward computation during critic target rollouts. For LR/ER, standard `tf.clip_by_value` is used.
 
-**v2 proposes:** Universal linear output with clip for all variables.
+**Rejected alternatives:**
+- `bounded_sigmoid` / `softclip`: domain-specific, violates genericity. The vanishing gradient near bounds is a worse problem than the zero gradient outside generous bounds.
+- `affine_exp` (v1.5): requires input normalization statistics, couples input and output transforms. Domain-specific.
+- Straight-through estimator (`tf.stop_gradient` on clip): provides gradient signal when raw output is outside bounds, but the gradient direction is misleading (it reflects sensitivity at the clipped value, not the raw value). Can push raw further out of bounds. Added complexity with no clear benefit when bounds are generous.
 
-**Current v1.5:** bounded_sigmoid (for policy, price), affine_exp (for capital), linear (for value).
+**To-do:** None. Design is final.
 
-### Assessment
+## B3. LayerNorm
 
-**Strengths of v2 linear+clip:**
-- Eliminates vanishing gradient near bounds (well-argued in v2 Section on Output Head)
-- Uniform treatment — no per-variable head selection
-- Follows TD-MPC2 and PPO conventions
+**Issue:** v1.5 has no hidden-layer normalization. v2 adds LayerNorm after every hidden layer. Concerns: noisy statistics with small (32-neuron) layers; bias removal changes initialization.
 
-**Concerns:**
-1. **Zero gradient outside bounds is NOT "benign" in all cases.** v2 claims clipped samples provide "no gradient" but are harmless because interior samples provide the signal. This assumes the network has enough interior samples to learn the boundary region. In economic models with strong mean-reversion, the ergodic distribution concentrates interior to bounds, so boundary states appear rarely in training data. If the network never sees training signal near k_max, it may produce wildly wrong pre-clip values there, and the clip masks the problem during training. At inference time, the clip enforces feasibility but the underlying function approximation is poor.
+**Decision:** Adopt LayerNorm as specified in v2. Use 128 neurons per hidden layer (up from 32) to ensure stable LayerNorm statistics. Dense layers have no bias (absorbed by LN shift parameter). Bias initialization concern is deferred to empirical testing; if problems arise, fix then.
 
-2. **Gradient is discontinuous at clip boundaries.** The derivative jumps from 1 to 0 at the boundary. This can cause oscillation in SGD when the optimal action is near a bound — the gradient alternates between full and zero as the raw output crosses the clip threshold. Sigmoid at least provides a smooth transition.
+**Rejected alternatives:** None. LayerNorm is well-established and the concerns are minor.
 
-3. **For bond price q ∈ [0, q_max], clip may underperform.** The price network's output should approach q_max smoothly for low-risk firms. With clip, the network might overshoot and get clipped, losing learning signal for exactly the states where precision matters most.
+**To-do:** Verify during Phase 1 that LN + 128 neurons matches or exceeds v1.5 accuracy on the basic model.
 
-**Recommendation:** The v2 argument about gradient saturation is valid and important. A pragmatic middle ground: use linear+clip as the default but offer `bounded_sigmoid` / `softclip` as an option for users who observe boundary-learning issues. The v2 report should add a note about the "discontinuous gradient at boundary" tradeoff.
+## B4. Hidden Activation
 
-## B3. LayerNorm: Missing from v1.5, Central to v2
+**Decision:** SiLU (swish) as default. Consistent between v1.5 and v2. No change needed.
 
-**v2 proposes:** LayerNorm after every hidden layer. Dense layers have no bias (absorbed by LN).
+## B5. MVE/DDPG Method and Critic Loss
 
-**Current v1.5:** No hidden-layer normalization. Dense layers have bias.
+**Issue:** v2 introduces Q(s,a) critic with MVE multi-step targets, replacing V(s) with 1-step targets. Concerns: (1) higher input dimensionality for Q, (2) critic loss formula unspecified, (3) MVE rollout cost, (4) multitask-BR status.
 
-### Assessment
+**Decision:**
+- Adopt MVE-DDPG as the primary method. Q(s,a) critic with symlog prediction is the default.
+- **Critic loss (resolved):** MSE in symlog space. Target computed in level-space, then transformed:
+  ```
+  Q_target_symlog = symlog(Q_target_level)     # from MVE rollout in levels
+  Q_pred_symlog   = critic_network(s, a)       # linear output ≈ symlog(Q)
+  L_critic = mean((Q_pred_symlog - stop_gradient(Q_target_symlog))²)
+  Q_level = symexp(Q_pred_symlog)              # for actor loss and terminal bootstrap
+  ```
+  This is scale-invariant and follows DreamerV3. Also addresses the value normalization gap identified in v1.5 (where the value network had no output scaling).
+- **Multitask-BR:** Kept as a comparison baseline only, placed in `src/v2/experimental/`. Not a production method.
+- Concerns (1) and (3) are acknowledged tradeoffs. Concern (1) is handled by the 128-neuron network. Concern (3) is mitigated by T=1 (pure DDPG) as a fallback if MVE is too slow.
 
-**Strengths:**
-- Prevents internal covariate shift
-- Enables scale-invariant learning regardless of input preprocessing quality
-- Well-established in transformer/RL architectures
+**Rejected alternatives:**
+- Raw (un-symlog'd) critic loss: dominated by high-value states, poor scale invariance.
+- V(s) critic (v1.5 approach): requires differentiating through reward and dynamics for actor gradient, which fails for non-differentiable rewards. Q(s,a) is strictly more general.
 
-**Concerns:**
-1. **Interaction with small networks.** LayerNorm with M=32 neurons computes statistics over 32 values. The mean/variance estimates are noisy at this scale. With 2 hidden layers, adding LN doubles the parameter count of the normalization path (32 scale + 32 shift per layer). For 32-unit networks, this is non-negligible overhead.
+**To-do:** Update v2 report to explicitly specify the critic loss formula above. Discuss MVE computational cost vs 1-step BR.
 
-2. **Bias removal.** When LN absorbs bias, the preceding Dense layer's expressiveness is unchanged (LN shift parameter replaces it), but it changes the initialization story. Standard Xavier/He initialization assumes bias=0; removing bias and relying on LN shift (initialized to 0) should be equivalent, but this deserves testing.
+## B6. Missing Report Sections
 
-**Recommendation:** LayerNorm is a good addition. Test with 32-unit and 64-unit networks to verify it helps rather than hurts at this scale.
+**Issue:** v2 report has several unfinished "Section X" references and missing sections.
 
-## B4. SiLU Activation
+**Decision:** These are discussion/theory sections that do not block implementation of the basic model. Specifically:
+1. "Section X" formal analysis: does not affect implementation.
+2. Soft penalty for non-box constraints: skipped for now (no current application needs it).
+3. Training algorithms for applications: follows directly from generic framework + model definitions.
+4. Results/diagnostics: will be written after implementation.
+5. Risky debt training details: deferred entirely. Focus on basic model first; tackle risky debt after v2 basic model is validated.
 
-**v2 proposes:** SiLU as default (same as v1.5).
+**To-do:** Write missing sections during/after Phase 3, not before.
 
-**Assessment:** Consistent. No issue here. The v2 report's argument about dead ReLU neurons with LayerNorm centering is sound.
+## B7. Action Variable Convention
 
-## B5. MVE/DDPG Method: Q-function vs. V-function
+**Issue:** v1 code outputs k' directly. v2 generic framework should use the control variable (investment I) as the action, with capital accumulation built into the transition function.
 
-**v2 proposes:** A new Model-Based Value Expansion (MVE) method using Q(s,a) critic instead of V(s) critic, plus TD-k mixture targets.
+**Decision:** Policy outputs I (investment), not k'. The transition function encodes k' = (1-δ)k + I. This is consistent with the generic MDP formulation where actions are controls and transitions describe how controls affect states. For the risky debt model (later), actions would be (I, b').
 
-**Current v1.5:** BR actor-critic uses V(s) critic with 1-step Bellman targets.
+**Clip bounds on I:** Use conservative fixed bounds that are valid for all states:
+```python
+I_min = -(1 - delta) * k_max    # most negative possible disinvestment
+I_max = k_max                    # generous upper bound
+```
+These are pre-computed by the environment in `action_bounds()` and passed to the network's clip layer. The trainer is agnostic to what these bounds represent. A safety floor `k_next = max((1-δ)k + I, k_min)` is applied inside the transition function as an environment property, not a policy constraint.
 
-### Assessment
+**Rejected alternatives:**
+- Output k' directly (v1.5 approach): convenient but conflates action with next-period state. Not generic — other models may have actions that are not next-period states.
+- State-dependent clip bounds on I (dynamic bounds based on current k): correct but the moving clip boundary complicates learning. Conservative fixed bounds achieve the same result more simply.
 
-**This is the biggest algorithmic change in v2.**
+**To-do:** None. Design is final.
 
-**Strengths:**
-- Q(s,a) eliminates the need to differentiate through r(s,a) and f(s,a,ε) for the actor gradient — critical for non-differentiable rewards
-- MVE multi-step targets reduce bootstrap bias
-- Target networks on both actor and critic (four networks total)
-- Well-established in RL literature (DDPG, TD3)
+## B8. Critic Output Head Clarification
 
-**Concerns:**
-1. **Q(s,a) input dimensionality.** For the basic model, Q takes (k, z, k') = 3 inputs instead of V's (k, z) = 2. For risky model, Q takes (k, b, z, k', b') = 5 inputs. Higher-dimensional input spaces require more data/capacity.
+**Issue:** v2 architecture summary says "linear identity with clip" universally, but also says critic output is in symlog space. These appear contradictory.
 
-2. **v2 mentions symlog for critic output** (`ŷ_φ ≈ symlog(Q)`, recover via symexp). This is the DreamerV3 value prediction approach. But the v2 report does not formally specify the critic loss. Is it MSE in symlog space? `(ŷ - symlog(Q_target))²`? This needs to be specified.
+**Decision:** The linear output head is correct for all networks. For the critic, the linear output directly predicts in symlog space (i.e., the training targets are symlog-transformed). `symexp()` is applied externally to recover level-space values for the actor loss and terminal bootstrap. This is not a separate "symlog output head" — it is a linear output where the loss is computed in symlog space.
 
-3. **MVE rollout horizon T.** v2 says "moderate T (e.g., 10-25)". But this requires T forward passes through the target policy and dynamics per sample — potentially expensive. The v2 report should specify the computational cost relative to 1-step BR.
-
-4. **The multitask-BR method from v1 (Section 6 in v2).** v2 keeps multitask-BR as Algorithm 6 and then proposes MVE as Algorithm 7. The v2 report correctly identifies that multitask-BR has "fundamental architecture error" but still presents it as a method. Consider whether it should be clearly marked as a baseline/strawman for comparison only, not a recommended method.
-
-**Recommendation:** MVE is a strong methodological advance. The v2 report needs to:
-- Specify the critic loss formula explicitly (MSE in symlog space?)
-- Specify whether the critic target `Q̂_{i,t}` is computed in level-space and then symlog'd, or computed directly in symlog space
-- Discuss computational cost of MVE vs 1-step BR
-- Clarify the status of multitask-BR (baseline only?)
-
-## B6. Sections Missing from v2 Report
-
-The v2 report currently ends at line 841 (risky debt network architecture). Several sections referenced in the text are missing:
-
-1. **"Section X" (referenced 7+ times):** Formal treatment of MVE vs multitask-BR, gradient analysis, constraint handling, AiO bias proof, distribution mismatch
-2. **Constraint handling section:** Referenced in "Special case: non-box constraints" — soft penalty approach
-3. **Training algorithms for applications:** How LR/ER/BR/MVE are applied to basic and risky models (only network architecture is specified)
-4. **Results / diagnostics section**
-5. **Risky debt training details:** The nested fixed-point for price/default with MVE
-
-These missing sections are critical for implementation. Without them, the v2 spec is incomplete for the risky debt model especially.
-
-## B7. Inconsistency: Action Variable Convention
-
-**v1 report:** Action is investment I = k' - (1-δ)k. The policy maps (k,z) → I, then k' = (1-δ)k + I.
-
-**v2 report:** The general framework says action a ∈ A, but the application section says policy maps (k,z) → k' directly (network output is k', not I). The clip is on k': `clip(raw, k_min, k_max)`.
-
-**Current v1.5 code:** Network outputs k' directly (not I).
-
-**Assessment:** v2 is consistent with current code but inconsistent with v1 report's convention. This should be explicitly noted in v2: "We parameterize the policy to output k' directly, not I."
-
-## B8. Potential Issue: symlog + Linear Output for Value
-
-**v2 says:** Critic raw output ≈ symlog(Q), recovered via symexp.
-
-But the v2 architecture summary says: "linear identity with clip" as the universal output head.
-
-**Inconsistency:** If the output head is linear (identity), then the raw output IS the network's prediction. But v2 also says the raw output is in symlog space. These are contradictory unless there's an implicit "the target labels are transformed to symlog space, and the linear output predicts in that space, then symexp is applied post-network." This needs clarification.
-
-**Recommendation:** The v2 architecture summary should have an exception for critic networks: the linear output head produces symlog-scale predictions, and symexp is applied externally. Or define a "symlog" output head.
+**To-do:** Clarify this in the v2 report architecture summary.
 
 ---
 
-# Part C: Migration Plan and Industry Best Practices
+# Part C: Resolved Design Choices from Discussion
 
-## C1. Industry Best Practices for Large Refactors
+## C1. ER Method: Euler Residual Interface
 
-### The "Strangler Fig" Pattern (Recommended)
+**Decision:** Option A — user supplies `euler_residual(s, a, s_next, a_next) -> Tensor` as an optional method on `MDPEnvironment`. Models with known smooth FOCs override it. Models without (e.g., non-differentiable rewards) leave it as `NotImplementedError`, and the trainer raises a clear error if ER is attempted.
 
-The most battle-tested approach for large codebase migrations in industry is the **Strangler Fig Pattern** (coined by Martin Fowler). The idea:
+**Rejected alternative:** Automatic FOC derivation via autodiff (Option C). Theoretically elegant but practically fragile: (1) the recursive substitution from ∂V/∂s' to reward partials is model-specific and autodiff doesn't know which identity to apply, (2) non-differentiable components (fixed adjustment cost indicator) produce zero/undefined gradients silently, (3) nested gradient tapes through two policy evaluations are fragile in TensorFlow.
 
-1. **Build new modules alongside old ones** in a separate namespace/directory
-2. **Route new code paths through the new modules**, leaving old paths untouched
-3. **Gradually migrate** callers from old → new
-4. **Retire old modules** only after the new ones are fully tested and validated
+**Naming convention for Euler residual components:** Use descriptive names instead of abbreviations:
+- `marginal_cost_of_action` instead of `chi`
+- `marginal_benefit_of_action` instead of `m`
+- `adjustment_cost_action_deriv` instead of `psi_I`
+- `adjustment_cost_state_deriv` instead of `psi_k`
+- `production_state_deriv` instead of `pi_k`
 
-This is the standard at companies like Google (gradual migration tooling), Stripe (API versioning), and Netflix (canary deployments). It minimizes risk because the old system remains fully functional throughout.
+## C2. Online vs Offline Training
 
-### Applied to Your Case
+**Decision:** Default to online training with replay buffer (standard DDPG/TD3). Keep offline mode as an option.
+
+- **Online mode (default):** At each training step, generate transitions using current policy + deterministic seeds from the master seed schedule. Add transitions to a replay buffer. Sample training batches from the buffer. The replay buffer is standard for DDPG/TD3, provides sample efficiency and decorrelation.
+- **Offline mode (option):** Pre-generate a fixed dataset, train on it repeatedly. Useful for ablation studies and direct cross-method comparison on identical training data.
+- **Comparability across methods:** Achieved through a fixed evaluation dataset (val/test), not through identical training data. Different methods produce different training data in online mode (different policies generate different trajectories), but all are evaluated on the same fixed val/test set.
+- **Reproducibility:** Deterministic seeds + deterministic policy → fully deterministic replay buffer contents → identical training run given same seed. No exploration noise needed (see C4).
+
+**Rejected alternative:** Online-only without replay buffer (generate fully fresh data each step, no buffer). Simpler but less sample-efficient and loses the decorrelation benefit. Not standard practice.
+
+## C3. Multitask-BR Location
+
+**Decision:** Place in `src/v2/experimental/`. Even the baseline comparison version should be generic (not model-specific).
+
+## C4. Exploration Noise
+
+**Decision:** Not needed for the basic model. Diversity in training data comes from sampling diverse initial states and shock sequences. For the risky debt model (deferred), exploration near the default boundary is handled by the Gumbel-Sigmoid noise already built into the default probability approximation.
+
+**To-do:** Revisit when implementing the risky debt model.
+
+## C5. Target Network Polyak Rate
+
+**Decision:** Single shared Polyak rate for all target networks (actor and critic). Follows TD3 convention.
+
+## C6. Gradient Clipping
+
+**Decision:** Keep gradient norm clipping as a safety net with max_norm=100 (DreamerV3 default). LayerNorm handles most gradient conditioning; clipping is a last resort.
+
+## C7. Temperature Annealing for Non-Differentiable Rewards (Latent Issue)
+
+**Issue:** The basic model's fixed adjustment cost uses a smooth sigmoid gate controlled by a `temperature` parameter. In v1, temperature is annealed from warm (smooth) to cold (near-hard) during training so gradients flow through the gate early on. In v2, the `MDPEnvironment.reward()` interface accepts `temperature` but no trainer currently passes it — all calls use the default `temperature=1e-6` (near-hard gate).
+
+**Analysis by method:**
+- **MVE:** Not affected. MVE never differentiates through `reward()`. Reward enters only inside `stop_gradient` targets (critic rollout). MVE handles non-differentiable rewards by design.
+- **ER:** Not affected. ER differentiates through `euler_residual()` (which uses analytical FOC derivatives, not `reward()`). The `reward()` call in `collect_transitions` is outside the gradient tape.
+- **LR:** Affected when `cost_fixed > 0`. LR backpropagates through the full T-step rollout including `reward()`. A near-hard gate at `temperature=1e-6` produces zero gradients through the fixed cost indicator, blocking learning of the investment/no-investment boundary.
+
+**Decision:** Defer. The frictionless baseline (`cost_fixed=0`) is unaffected. If MVE outperforms LR and ER (as expected given its design advantages), MVE becomes the production method and LR/ER serve as comparison baselines — in which case this issue is low priority. If LR is needed on fixed-cost scenarios, add a `temperature_schedule` parameter to `LRConfig` and pass it through to `env.reward(s, a, temperature=...)` inside the training loop.
+
+**Risk:** Low. Only affects LR on non-baseline scenarios with fixed costs.
+
+---
+
+# Part D: Migration Plan
+
+## Scope
+
+**v2 initial implementation covers the basic investment model only.** Risky debt model is deferred until the basic model v2 is validated against v1.5 and DDP benchmarks.
+
+Production methods: LR, ER, MVE-DDPG.
+Comparison baseline: multitask-BR (in `src/v2/experimental/`).
+
+## Directory Structure
 
 ```
 src/
-├── economy/          # KEEP — model-agnostic, no changes needed
-├── ddp/              # KEEP — offline DDP, no changes needed
+├── economy/          # KEEP — shared, model-agnostic
+├── ddp/              # KEEP — ground-truth benchmark
 ├── networks/         # KEEP v1.5 as-is
 ├── trainers/         # KEEP v1.5 as-is
-├── experimental/     # KEEP — research prototypes
+├── experimental/     # KEEP — v1.5 research prototypes
 │
-├── v2/               # NEW — all v2 modules go here
+├── v2/
 │   ├── __init__.py
 │   ├── networks/
-│   │   ├── base.py           # symlog + LayerNorm + SiLU + linear+clip
-│   │   ├── policy.py         # Generic policy network
-│   │   ├── critic.py         # Q(s,a) critic with symlog output
-│   │   └── price.py          # Bond price network (risky model)
-│   ├── normalization.py      # symlog implementation
+│   │   ├── base.py           # symlog → [Dense(no bias) → LN → SiLU]×K → linear+clip
+│   │   ├── policy.py         # Generic policy: s → a, with clip
+│   │   └── critic.py         # Q(s,a) → symlog-space prediction
+│   ├── normalization.py      # symlog/symexp + running_zscore
 │   ├── trainers/
-│   │   ├── core.py           # Generic training loop
-│   │   ├── lr.py             # LR method (generic)
-│   │   ├── er.py             # ER method (generic)
-│   │   ├── br.py             # BR actor-critic (generic)
-│   │   ├── mve.py            # MVE-DDPG (new in v2)
+│   │   ├── core.py           # Generic training loop, replay buffer, data pipeline
+│   │   ├── lr.py             # Lifetime Reward trainer
+│   │   ├── er.py             # Euler Residual trainer
+│   │   ├── mve.py            # MVE-DDPG trainer (primary method)
 │   │   └── config.py         # v2 configuration
-│   ├── environments/         # Model-specific MDP definitions
-│   │   ├── base.py           # Abstract MDP interface
-│   │   ├── basic_investment.py
-│   │   └── risky_debt.py
+│   ├── environments/
+│   │   ├── base.py           # Abstract MDPEnvironment interface
+│   │   └── basic_investment.py  # Corporate finance basic model
+│   ├── experimental/
+│   │   └── multitask_br.py   # Generic multitask-BR baseline
 │   └── tests/
 │       └── ...
 ```
 
-**Why this is better than a separate repository or branch:**
-- v1.5 and v2 coexist, you can compare results at any time
-- Shared economy module avoids duplication
-- Tests can run both v1.5 and v2 in the same CI
-- No merge conflicts since v2 is in its own directory
+## Phases
 
-## C2. Git Worktree Explanation
+### Phase 0: Preparation (done)
+- [x] Commit and tag v1.1 baseline
+- [x] Document v1.5 delta (this document, Part A)
+- [x] Review v2 design and resolve all ambiguities (this document, Parts B-C)
 
-### What is a git worktree?
+### Phase 1: Core Infrastructure
+1. `normalization.py` — symlog/symexp + running_zscore
+2. `networks/base.py` — symlog → [Dense(no bias) → LN → SiLU]×K → linear+clip
+3. `networks/policy.py` — generic policy network (s → a)
+4. `networks/critic.py` — Q(s,a) critic with symlog-space output
+5. `environments/base.py` — abstract MDPEnvironment with state_dim, action_dim, action_bounds, reward, transition, discount, and optional euler_residual
 
-Normally, a git repo has one working directory. `git worktree` lets you have **multiple working directories** (each on a different branch) checked out simultaneously:
+### Phase 2: Training Methods
+1. `trainers/core.py` — training loop, replay buffer, online/offline data pipeline, seed schedule, evaluation
+2. `trainers/lr.py` — generic LR (trajectory rollout, discounted reward)
+3. `trainers/er.py` — generic ER (calls env.euler_residual, AiO cross-product loss)
+4. `trainers/mve.py` — MVE-DDPG (Q-critic, multi-step targets, actor via ∂Q/∂a)
 
-```bash
-# You're on dev/v1-stable in /Users/wangzhaoxuan/Desktop/JPM-TSRL/DL_corp_finance
-
-# Create a second checkout on a new branch
-git worktree add ../DL_corp_finance_v2 -b dev/v2-refactor
-
-# Now you have TWO directories:
-# /DL_corp_finance/      → dev/v1-stable  (your current code)
-# /DL_corp_finance_v2/   → dev/v2-refactor (fresh branch for v2)
-```
-
-### Key Properties
-- Both directories share the same .git history (no duplication)
-- Changes in one worktree don't affect the other
-- You can `cd` between them and run tests independently
-- Commits in either worktree are visible from both
-
-### Pros
-- Complete isolation: v2 branch can't accidentally break v1
-- Full git history available in both
-- No directory naming conventions needed (it's just a branch)
-- Easy to merge v2 back into main when ready
-
-### Cons
-- **You lose the ability to compare v1 and v2 side-by-side in the same Python process.** You can't `from src.trainers import BasicTrainerER` and `from src.v2.trainers import GenericER` in the same test.
-- **Shared modules (economy/) diverge.** If you fix a bug in economy/ on v1, you need to cherry-pick it to v2, and vice versa. With the strangler fig approach, there's only one copy.
-- **Harder to keep in sync.** Over weeks of parallel development, merge conflicts accumulate.
-
-### Verdict
-
-**For your situation, I recommend the Strangler Fig pattern (new `src/v2/` directory) over git worktree.** Here's why:
-
-1. You want to reuse `src/economy/` and `src/ddp/` unchanged — worktree forces duplication
-2. You want to compare v1 vs v2 results on the same data — strangler fig makes this trivial
-3. You're a solo developer — worktree's isolation benefits are less important than convenience
-4. Your v2 changes are additive (new methods, new architecture) not destructive (rewriting existing modules)
-
-Git worktree is better when: (a) multiple developers need to work on different features simultaneously, (b) the refactor touches the same files as the existing code, or (c) you need a "clean room" environment for certification/audit purposes.
-
-## C3. Concrete Migration Plan
-
-### Phase 0: Preparation (Before Writing Any v2 Code)
-
-**0.1. Lock v1.5 baseline**
-```bash
-git tag v1.5-baseline   # Tag current state
-```
-Run full test suite, save results as the regression benchmark.
-
-**0.2. Write v1.5 delta documentation**
-Document the 11 undocumented features from Part A above (this document serves as that).
-
-**0.3. Complete v2 report gaps**
-Fill in the missing "Section X" material (especially critic loss formula, MVE computational cost, constraint handling). The implementation should not start until the spec is complete.
-
-### Phase 1: Core Infrastructure (src/v2/)
-
-**1.1. symlog + symexp utilities**
-- Implement and unit-test symlog/symexp transforms
-- Benchmark against v1.5 log_zscore on the basic model (compare gradient magnitudes)
-
-**1.2. Generic network architecture**
-- Build the symlog → [Dense → LN → SiLU]×K → linear+clip architecture
-- Support configurable input_dim, output_dim, n_layers, n_neurons
-- Unit test: forward pass, gradient flow, output range
-
-**1.3. MDP environment interface**
-```python
-class MDPEnvironment(ABC):
-    @abstractmethod
-    def state_dim(self) -> int: ...
-    @abstractmethod
-    def action_dim(self) -> int: ...
-    @abstractmethod
-    def action_bounds(self) -> tuple[Tensor, Tensor]: ...
-    @abstractmethod
-    def reward(self, s, a) -> Tensor: ...
-    @abstractmethod
-    def transition(self, s, a, eps) -> Tensor: ...
-    @abstractmethod
-    def discount(self) -> float: ...
-```
-Implement `BasicInvestmentEnv` and `RiskyDebtEnv` as concrete subclasses wrapping the existing `src/economy/` functions.
-
-### Phase 2: Training Methods (src/v2/trainers/)
-
-**2.1. LR trainer (generic)**
-- Takes an MDPEnvironment, a policy network, and a config
-- Rolls out trajectories using env.transition() and env.reward()
-- No model-specific code in the trainer
-
-**2.2. ER trainer (generic)**
-- Requires the user to supply an Euler residual function (or derive it from the reward/transition automatically via autodiff for differentiable rewards)
-- For non-differentiable rewards: skip ER, use MVE instead
-
-**2.3. BR actor-critic trainer (generic)**
-- V(s) critic, 1-step Bellman target
-- Actor maximizes r(s,a) + γ·V(s')
-- This is the v1.5 approach generalized
-
-**2.4. MVE-DDPG trainer (new)**
-- Q(s,a) critic with symlog prediction
-- Multi-step MVE targets
-- TD-k mixture loss
-- Actor maximizes Q(s, π(s))
-
-### Phase 3: Corporate Finance Applications (src/v2/environments/)
-
-**3.1. Basic investment model**
-- Implement as MDPEnvironment using src/economy/ functions
-- Run LR, ER, BR, MVE and compare against v1.5 results and DDP benchmark
-- Acceptance criterion: v2 results match or exceed v1.5 accuracy
-
-**3.2. Risky debt model**
-- Implement as MDPEnvironment with nested price network
-- Run BR and MVE (ER not applicable due to non-closed-form FOC with default)
-- Compare against DDP benchmark
+### Phase 3: Basic Model Application
+1. `environments/basic_investment.py` — wraps src/economy/ functions
+2. Run LR, ER, MVE on basic model
+3. Compare against v1.5 results and DDP benchmark
+4. Acceptance criterion: v2 matches or exceeds v1.5 accuracy
 
 ### Phase 4: Validation and Cutover
+1. Regression tests against v1.5 test suite
+2. Performance benchmarks (wall-clock, convergence speed)
+3. Gradual retirement of v1.5 (deprecate, then archive)
 
-**4.1. Regression tests**
-- Run v2 on all test cases from v1.5 test suite
-- Compare accuracy metrics (Euler residual, Bellman residual, policy error vs DDP)
-
-**4.2. Performance benchmarks**
-- Wall-clock training time: v2 vs v1.5
-- Convergence speed: epochs to target accuracy
-
-**4.3. Gradual retirement of v1.5**
-- Once v2 passes all tests: update imports in notebooks/pipeline
-- Mark v1.5 trainers as deprecated (not deleted)
-- After 1+ month with no regressions: archive v1.5 to `src/_legacy/` or delete
-
-### Phase 5: Report Update
-
-**5.1.** Finalize v2 report with complete Section X material
-**5.2.** Update all notebooks to use v2 API
-**5.3.** Tag v2.0-release
-
----
-
-## C4. Key Risks and Mitigations
+## Key Risks and Mitigations
 
 | Risk | Mitigation |
 |------|-----------|
-| v2 symlog + LayerNorm underperforms v1.5 log_zscore on small networks | Phase 1.1 includes head-to-head benchmark before committing |
-| MVE is slower than 1-step BR due to T-step rollouts | Benchmark wall-clock per step; consider T=1 (pure DDPG) as fallback |
-| Linear+clip output causes learning issues at bounds | Keep bounded_sigmoid as configurable option |
-| Missing v2 report sections lead to ambiguous implementation | Phase 0.3 requires completing the spec first |
-| Generic MDP interface is over-engineered for 2 models | Keep interface minimal; add complexity only when a third model demands it |
-| v1.5 bugs found during v2 development | Fix in v1.5 first (shared economy/ module); v2 inherits the fix automatically |
+| symlog + LayerNorm underperforms v1.5 log_zscore | Phase 1 benchmark before proceeding |
+| MVE too slow (T-step rollouts) | T=1 (pure DDPG) as fallback |
+| Linear+clip boundary issues | Generous bounds; user responsibility |
+| 128-neuron networks overfit on small datasets | Monitor val loss; reduce if needed |
+
+## What NOT to Do
+
+1. Do NOT rewrite `src/economy/` or `src/ddp/`.
+2. Do NOT delete v1.5 trainers until v2 is fully validated.
+3. Do NOT implement risky debt model until basic model v2 is stable.
+4. Do NOT add domain-specific output heads (bounded_sigmoid, affine_exp) to v2.
+5. Do NOT use autodiff for Euler residuals — use user-supplied functions.
+6. Do NOT make v2 checkpoints backward-compatible with v1.
 
 ---
 
-## C5. What NOT to Do
+# Part E: Implementation Progress and Validation
 
-1. **Do NOT rewrite src/economy/.** The economic logic (parameters, bounds, grids, value_scale) is model-agnostic and well-tested. v2 should import from it directly.
+Status as of v2 basic model baseline validation (BALANCED profile).
 
-2. **Do NOT rewrite src/ddp/.** The DDP solvers are the ground-truth benchmark. Keep them as-is.
+## E1. What Has Been Built and Validated
 
-3. **Do NOT delete v1.5 trainers prematurely.** They are your working, validated codebase. Retire only after v2 matches or exceeds their accuracy on all test cases.
+### Core Infrastructure (Phase 1 — Complete)
+- `normalization.py` — `RunningZScore` only. Explicit `update()`/`normalize()` API.
+- `networks/base.py` — `GenericNetwork`: RunningZScore → [Dense(bias=True) → SiLU] × K. No LayerNorm.
+- `networks/policy.py` — Affine-rescaled output: `action = center + sqrt(half_range) * raw`, then clip. Output head uses `Orthogonal(gain=0.01)` for warm start near center.
+- `networks/critic.py` — Q(s,a) → level-space output (no symlog).
+- `environments/base.py` — Abstract `MDPEnvironment` with `action_bounds()`, `action_scale_reference()`, `action_spec()`, `reward()`, `transition()`, `discount()`, `euler_residual()`.
 
-4. **Do NOT implement v2 without completing the report spec.** The missing "Section X" material covers critical design decisions (critic loss, constraint handling, distribution mismatch). Implementing without a complete spec will lead to rework.
+### Training Methods (Phase 2 — Complete)
+- `trainers/lr.py` — BPTT through T-step trajectory. Normalizer updates once with `s0` before GradientTape. Terminal value: `r(s_T, a_T) / (1 - γ)`.
+- `trainers/er.py` — Cross-product (AiO) or MSE loss on `euler_residual()`. Target policy with Polyak averaging.
+- `trainers/mve.py` — MVE-DDPG with Q(s,a) critic. Multi-step model-based value expansion. Actor gradient via `∂Q/∂a`.
 
-5. **Do NOT try to make v2 trainers backward-compatible with v1 checkpoints.** Clean break on the checkpoint format. Provide a one-time conversion script if needed.
+### Basic Model (Phase 3 — Baseline Validated)
+- `environments/basic_investment.py` — Self-contained. No `bounds.py` dependency. Explicit multiplier parameters. `_frictionless_kprime()` as single source of truth for k*.
+- `_apply_action()` constraint method prevents phantom cash exploit.
+
+### Validation Results (BALANCED profile)
+
+| Method | corr | MSE | Status |
+|--------|------|-----|--------|
+| **LR** | 1.000 | 23.8 | Excellent — near-perfect fit across full z range |
+| **ER** | 1.000 | 4.8 | Excellent — best accuracy of all methods |
+| **MVE** | 0.986 | 12465 | Broken — policy learned k' ≈ k (identity) instead of flat optimal |
+
+LR and ER are validated for the basic investment model. MVE needs separate investigation (see E3).
+
+## E2. Current Environment Configuration
+
+```python
+BasicInvestmentEnv(
+    k_min_mult=0.1,   # k_min = 0.1 × k* ≈ 8.0
+    k_max_mult=10.0,  # k_max = 10 × k* ≈ 802
+    z_sd_mult=3.0,    # z ∈ [0.53, 1.88] in levels
+)
+# Derived: k_star ≈ 80.2 (with Jensen's correction)
+#          k_ref(z_max) ≈ 349 (frictionless upper envelope)
+# Action: I ∈ [-k_max, k_max] = [-802, 802]
+# Scale: center = δk* ≈ 12, half_range = k_max ≈ 802
+```
+
+## E3. Known Issues Requiring Future Work
+
+1. **MVE divergence.** Q(s,a) single-step DDPG actor update fails. The critic bootstraps on its own errors, causing the actor to learn k' ≈ k (identity). V1.1 experiments showed that V(s) + H-step BPTT through the model works. Consider porting v1's approach to v2.
+2. **Right-tail learning speed.** Tighter `k_max_mult` (e.g., 5 instead of 10) would concentrate training samples in the economically relevant region and improve convergence. Heuristic: `k_max_mult ≈ 1.2 × (k_ref / k_star)`.
+3. **Temperature annealing for LR with fixed costs.** When `cost_fixed > 0`, the sigmoid gate at `temperature=1e-6` blocks gradients through the fixed cost indicator. Needs `temperature_schedule` in `LRConfig`. Deferred — frictionless baseline unaffected.
+
+---
+
+# Part F: User Preferences and Design Principles
+
+These preferences have been established across multiple iterations. Follow them in all future work.
+
+## F1. Architecture and Code Organization
+
+- **Strict v1/v2 separation.** V2 lives entirely under `src/v2/`. Never import from `src/networks/`, `src/trainers/`, or other v1-specific modules. Shared code (`src/economy/`, `src/ddp/`) is fine.
+- **No code duplication.** Single source of truth for each computation. When two functions compute the same thing, keep one and delete the other.
+- **No redundant features.** If ablation shows a feature doesn't help, remove it entirely. Don't keep it "just in case." Goal: simple and minimal.
+- **Explicit parameters over hidden configs.** Prefer `__init__(k_min_mult=0.1)` over `BoundsConfig(k_min=0.2)` with hardcoded defaults buried in a dataclass.
+- **TensorFlow throughout v2.** No numpy in v2 code. Use `tf.exp`, `tf.sqrt`, etc.
+- **Readable function names.** English over math notation: `euler_residual()` not `chi()`, `marginal_cost_of_action` not `psi_I`.
+
+## F2. Domain Knowledge Separation (Critical)
+
+- **All domain knowledge lives in `MDPEnvironment` subclasses.** The environment defines bounds, rewards, transitions, Euler residuals, and action scaling references.
+- **Trainers, networks, and normalization are fully generic.** They receive bounds, dimensions, and scales as inputs. They never contain economic formulas or model-specific logic.
+- **`action_spec()` is the bridge.** Environment bundles all action space info (bounds, center, half_range) into a dict that PolicyNetwork consumes. The network doesn't know what these numbers mean.
+
+## F3. Process Preferences
+
+- **Discuss before implementing.** Major design changes require review and agreement before code is written. Do not jump to implementation.
+- **Document rejected ideas.** Record what was tried, what was rejected, and why — so we never revisit dead ends.
+- **Back claims with evidence.** Do not present hypotheses as conclusions. When a claim is made about why something fails, either show experimental evidence or explicitly label it as a hypothesis.
+- **Understand v1 before proposing v2 changes.** Read v1 code and experiment logs before suggesting new approaches. Many "new ideas" have already been tested.
+- **Commit and tag before major changes.** Always preserve a known-good checkpoint before risky refactors.
+
+## F4. Specific Design Preferences (Quick Reference)
+
+| Topic | Preference | Rejected Alternative |
+|-------|-----------|---------------------|
+| Normalization | RunningZScore only | symlog, LayerNorm, batch z-score, log_zscore |
+| Output head | Linear + hard clip | bounded_sigmoid, softclip, affine_exp, straight-through |
+| Action variable | I (investment) | k' (next capital) |
+| Normalization API | Explicit `update()` + `normalize()` | `__call__(training=True)` |
+| Terminal value | `r(s_T, a_T) / (1-γ)` | Domain-specific exact V |
+| z sampling | Uniform in levels | Uniform in log-space |
+| MVE actor (v1 evidence) | V(s) + H-step BPTT | Q(s,a) + single-step DDPG, TD3 twin critics |
+| Framework naming | "generic" | "general" |
+
+---
+
+# Part G: Ablation Results and Key Experimental Findings
+
+These findings are definitive. Do not re-test or re-investigate.
+
+## G1. Normalization Ablation (norm_ablation.py, v2_component_ablation.py)
+
+**Setup:** 5 LR configs + 2 MVE configs, each with symlog vs running_zscore, with/without LayerNorm.
+
+**Results:**
+
+| Config | LR rel_rmse | ER rel_rmse |
+|--------|-------------|-------------|
+| symlog + LayerNorm (original v2) | 0.857 | 0.804 |
+| running_zscore + LayerNorm | 0.245 | 0.217 |
+| symlog only (no LN) | 0.493 | 0.318 |
+| **running_zscore only (no LN)** | **0.081** | **0.117** |
+| v1-gold baseline | 0.272 | — |
+
+**Conclusions:**
+1. **LayerNorm is actively harmful** for BPTT-based training. It compounds gradient noise through multi-step rollouts. Responsible for 42% of the v1-v2 performance gap.
+2. **symlog is mediocre.** Worse than running z-score across all methods and configurations.
+3. **Running z-score alone is optimal.** 3.4x better than v1-gold on LR. No additional normalization layers needed.
+
+## G2. MVE Failure Analysis
+
+**Finding:** Q(s,a) with single-step DDPG actor update diverges on the basic investment model.
+- Q-values explode: 0 → 438 in 500 steps.
+- All configs produce flat policies (rel_rmse ≈ 0.9).
+- TD3 twin critics and delayed actor updates made it worse (v1.1 experiments).
+- V1's V(s) + H-step BPTT through model works well.
+
+**Root cause:** Over-estimation of Q compounds through bootstrapping. The basic investment model has a low-dimensional continuous state/action space where function approximation error in Q(s,a) overwhelms the signal. V(s) avoids this by not conditioning on a.
+
+**Implication:** The v2 MVE trainer needs redesign. Port v1's V(s) + H-step BPTT approach, or use MVE only for target computation with V(s) critic.
+
+## G3. Phantom Cash Exploit
+
+**Finding:** When `_apply_action()` clamps `k_next >= k_min`, using raw `I` (instead of effective `I`) in the reward creates an arbitrage. The policy can claim to disinvest more than exists, getting rewarded for the raw negative I while the transition only applies the clamped version.
+
+**Fix:** `_apply_action()` returns both `k_next` (clamped) and `I_effective = k_next - (1-δ)k`. Reward uses `I_effective`. Both `reward()` and `transition()` call `_apply_action()` — single source of truth.
+
+**Lesson:** Any environment with state-dependent constraints must use consistent effective actions in both reward and transition. Never let the reward see a raw action that differs from what the transition actually applies.
+
+## G4. LR Normalizer Contamination
+
+**Finding:** Updating `RunningZScore` inside `GradientTape` during T-step rollout causes divergence at step ~100-150. Seed-independent, data-independent (online and offline show identical failure).
+
+**Root cause:** The normalizer's running mean/std shift between rollout steps, so the same raw state produces different normalized values at step t vs step t+10. This injects non-stationary noise into the gradient computation.
+
+**Fix:** Update normalizer once per training step with initial states `s0`, before entering GradientTape. During rollout, call `normalize()` only (no stat updates).
+
+**Lesson:** Never update adaptive normalization statistics inside a gradient tape that spans multiple time steps.
+
+## G5. Right-Tail Underestimation
+
+**Finding:** Both LR and ER underestimate optimal k' at high z values. Investigated and ruled out four potential causes:
+1. **Gradient vanishing from SiLU:** Ruled out — SiLU has non-zero gradient for all inputs, no saturation.
+2. **k_max binding:** Ruled out — `clip_by_value` never activates (max raw output << k_max).
+3. **Affine scale errors:** Ruled out — raw=9.5 needed for right tail is well within network range.
+4. **Uniform sampling bias:** Ruled out — uniform in z-levels actually gives more weight to high z than log-uniform would.
+
+**Root cause:** Insufficient training iterations (FAST_DEBUG profile: 300 LR / 500 ER steps). Euler residuals still decreasing when training stops. Confirmed by BALANCED profile results (MSE dropped from 1454 → 23.8 for LR, 317 → 4.8 for ER).
+
+**Contributing factor:** Wide `k_max_mult=10` wastes training samples on states far from the ergodic distribution. Tighter multipliers would concentrate samples and improve convergence speed.
+
+## G6. Sampling Distribution
+
+**Finding:** Uniform sampling in log(z) space over-represents low-z states and under-represents high-z states (where the right-tail policy targets live).
+
+**Decision:** Changed to uniform sampling in z-levels (raw state space). This is the correct method-agnostic default: the training distribution should cover the state space uniformly, not replicate the ergodic distribution.
+
+---
+
+# Part H: Decision Log — Resolved Technical Questions
+
+Quick reference for questions that have been fully answered. Do not re-investigate.
+
+| Question | Answer | Evidence |
+|----------|--------|----------|
+| Is LayerNorm beneficial? | No — actively harmful for BPTT | Ablation G1: 42% of v1-v2 gap |
+| Is symlog better than running z-score? | No — worse across all methods | Ablation G1: 0.857 vs 0.081 rel_rmse |
+| Should we use Q(s,a) or V(s) for MVE? | V(s) + H-step BPTT (v1 approach) | G2: Q(s,a) single-step diverges; v1.1 V(s) works |
+| Do TD3 twin critics help? | No — made MVE worse | v1.1 experiments (br_improvements_design.md) |
+| Why does the right tail underfit? | Insufficient training steps | G5: BALANCED profile resolves it |
+| Is the affine scale causing right-tail error? | No — raw=9.5 is well within range | G5 investigation |
+| Should z be sampled in log or level space? | Level space (uniform in raw states) | G6: better coverage at tails |
+| Does Jensen's correction matter for k*? | Yes — shifts k* by ~4% (77.2 → 80.2) | Economically correct; propagates to all bounds |
+| Should `_apply_action` be shared? | Yes — single source of truth | G3: prevents phantom cash exploit |
+| Can normalizer update inside GradientTape? | No — causes divergence | G4: non-stationary noise in gradients |
