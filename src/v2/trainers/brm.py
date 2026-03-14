@@ -24,8 +24,11 @@ from src.v2.trainers.config import BRMConfig
 from src.v2.trainers.core import (
     evaluate_euler_residual,
     evaluate_bellman_residual_v,
+    warm_start_value_net,
 )
-from src.v2.data.pipeline import build_iterator, validate_dataset_keys
+from src.v2.data.pipeline import (
+    build_iterator, validate_dataset_keys, fit_normalizer_flat,
+)
 
 
 _DATASET_KEYS = ["s_endo", "z", "z_next_main", "z_next_fork"]
@@ -96,15 +99,16 @@ def train_brm(env, policy, value_net, train_dataset: dict,
         clipnorm=config.policy_optimizer.clipnorm)
 
     # ------------------------------------------------------------------
-    # Normalizer warm-up — freeze after warm-up
+    # Fit normalizer from full dataset (once, before gradient steps)
     # ------------------------------------------------------------------
-    if config.warmup_steps > 0:
-        warmup_iter = build_iterator(train_dataset, config.batch_size)
-        for batch in warmup_iter.take(config.warmup_steps):
-            s = env.merge_state(batch["s_endo"], batch["z"])
-            policy.update_normalizer(s)
-    # Normalizer is now warm. All subsequent policy calls use training=False
-    # so update_normalizer is never triggered during gradient steps.
+    fit_normalizer_flat(env, train_dataset, policy, value_net)
+
+    # ------------------------------------------------------------------
+    # Warm-start critic on analytical V (before gradient steps)
+    # ------------------------------------------------------------------
+    if config.warm_start_steps > 0:
+        warm_start_value_net(env, value_net, train_dataset,
+                             n_steps=config.warm_start_steps)
 
     # ------------------------------------------------------------------
     # Training loop

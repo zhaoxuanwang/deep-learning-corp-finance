@@ -1,71 +1,101 @@
-"""Tests for v2 normalization module: RunningZScore."""
+"""Tests for v2 normalization module: StaticNormalizer."""
 
 import tensorflow as tf
 import numpy as np
 import pytest
 
-from src.v2.normalization import RunningZScore
+from src.v2.normalization import StaticNormalizer
 
 
-# =============================================================================
-# RunningZScore
-# =============================================================================
-
-class TestRunningZScore:
-    """Tests for RunningZScore normalizer."""
+class TestStaticNormalizer:
+    """Tests for StaticNormalizer."""
 
     def test_initial_state(self):
-        """Initial mean=0, var=1."""
-        rz = RunningZScore(dim=3)
-        np.testing.assert_allclose(rz.running_mean.numpy(), [0, 0, 0])
-        np.testing.assert_allclose(rz.running_var.numpy(), [1, 1, 1])
+        """Before fit(), mean=0 and std=1 (identity transform)."""
+        sn = StaticNormalizer(dim=3)
+        np.testing.assert_allclose(sn.mean.numpy(), [0, 0, 0])
+        np.testing.assert_allclose(sn.std.numpy(), [1, 1, 1])
 
-    def test_normalize_initial(self):
-        """With initial stats, normalize(x) = x / 1 = x."""
-        rz = RunningZScore(dim=2)
-        x = tf.constant([[1.0, 2.0]])
-        result = rz.normalize(x)
+    def test_normalize_before_fit_is_identity(self):
+        """With default mean=0, std=1, normalize(x) == x."""
+        sn = StaticNormalizer(dim=2)
+        x = tf.constant([[1.0, 2.0], [3.0, 4.0]])
+        result = sn.normalize(x)
         np.testing.assert_allclose(result.numpy(), x.numpy(), atol=1e-6)
 
-    def test_update_shifts_mean(self):
-        """Updating with a batch shifts running_mean toward batch mean."""
-        rz = RunningZScore(dim=1, momentum=0.1)
-        batch = tf.constant([[10.0]] * 100)  # batch mean = 10
-        rz.update(batch)
-        # After one update: mean = 0.9 * 0 + 0.1 * 10 = 1.0
-        assert float(rz.running_mean[0]) == pytest.approx(1.0, abs=1e-5)
+    def test_fit_sets_correct_mean(self):
+        """fit() stores exact per-feature mean of the data."""
+        sn = StaticNormalizer(dim=2)
+        data = tf.constant([[1.0, 10.0], [3.0, 20.0], [5.0, 30.0]])
+        sn.fit(data)
+        np.testing.assert_allclose(sn.mean.numpy(), [3.0, 20.0], atol=1e-5)
 
-    def test_explicit_update_normalize(self):
-        """update() then normalize() produces correct output."""
-        rz = RunningZScore(dim=1, momentum=1.0)  # full replacement
-        batch = tf.constant([[5.0]] * 100)  # mean=5, var=0
-        rz.update(batch)
-        # After full update: mean=5, var=0, std=sqrt(0+eps)≈eps
-        result = rz.normalize(tf.constant([[5.0]]))
-        # (5 - 5) / sqrt(eps) ≈ 0
-        assert abs(float(result[0, 0])) < 1e-2
+    def test_fit_sets_correct_std(self):
+        """fit() stores exact per-feature std of the data."""
+        sn = StaticNormalizer(dim=1)
+        data = tf.constant([[0.0], [2.0], [4.0]])  # std = sqrt(8/3)
+        sn.fit(data)
+        expected_std = float(np.std([0.0, 2.0, 4.0]))
+        np.testing.assert_allclose(sn.std.numpy(), [expected_std], atol=1e-5)
 
-    def test_inference_does_not_update(self):
-        """normalize() without update() does not change stats."""
-        rz = RunningZScore(dim=1)
-        x = tf.constant([[100.0]] * 10)
-        _ = rz.normalize(x)
-        assert float(rz.running_mean[0]) == pytest.approx(0.0)
-        assert int(rz.count) == 0
+    def test_normalize_after_fit(self):
+        """After fit(), normalize(mean) ≈ 0 and normalize(mean+std) ≈ 1."""
+        sn = StaticNormalizer(dim=2)
+        data = tf.constant(
+            [[float(i), float(i) * 10] for i in range(100)],
+            dtype=tf.float32)
+        sn.fit(data)
 
-    def test_update_increments_count(self):
-        """update() increments the count variable."""
-        rz = RunningZScore(dim=1, momentum=0.5)
-        x = tf.constant([[5.0]] * 10)
-        rz.update(x)
-        assert int(rz.count) == 1
-        rz.update(x)
-        assert int(rz.count) == 2
+        mean_val = tf.reduce_mean(data, axis=0)
+        std_val  = tf.math.reduce_std(data, axis=0)
 
-    def test_output_shape(self):
+        # Normalizing the mean should give ~0
+        result_mean = sn.normalize(mean_val[tf.newaxis])
+        np.testing.assert_allclose(result_mean.numpy(), [[0.0, 0.0]], atol=1e-4)
+
+        # Normalizing mean + std should give ~1
+        result_one = sn.normalize((mean_val + std_val)[tf.newaxis])
+        np.testing.assert_allclose(result_one.numpy(), [[1.0, 1.0]], atol=1e-4)
+
+    def test_normalize_output_shape(self):
         """Output shape matches input shape."""
-        rz = RunningZScore(dim=4)
-        x = tf.constant(np.random.randn(32, 4).astype(np.float32))
-        rz.update(x)
-        result = rz.normalize(x)
+        sn = StaticNormalizer(dim=4)
+        data = tf.random.normal((1000, 4))
+        sn.fit(data)
+        x = tf.random.normal((32, 4))
+        result = sn.normalize(x)
         assert result.shape == (32, 4)
+
+    def test_fit_is_frozen_after_call(self):
+        """fit() variables are non-trainable."""
+        sn = StaticNormalizer(dim=2)
+        assert sn.mean.trainable is False
+        assert sn.std.trainable is False
+
+    def test_refit_updates_stats(self):
+        """Calling fit() a second time updates to new data statistics."""
+        sn = StaticNormalizer(dim=1)
+        sn.fit(tf.constant([[0.0], [2.0]]))
+        mean_first = float(sn.mean[0])
+
+        sn.fit(tf.constant([[100.0], [200.0]]))
+        mean_second = float(sn.mean[0])
+
+        assert mean_second != mean_first
+        np.testing.assert_allclose(mean_second, 150.0, atol=1e-4)
+
+    def test_epsilon_prevents_division_by_zero(self):
+        """Constant-feature data (std=0) does not produce NaN or Inf."""
+        sn = StaticNormalizer(dim=1)
+        sn.fit(tf.constant([[5.0]] * 100))  # std = 0
+        result = sn.normalize(tf.constant([[5.0]]))
+        assert tf.math.is_finite(result[0, 0])
+
+    def test_normalize_batched_input(self):
+        """normalize() handles arbitrary leading batch dimensions."""
+        sn = StaticNormalizer(dim=3)
+        data = tf.random.normal((500, 3))
+        sn.fit(data)
+        x = tf.random.normal((8, 16, 3))
+        result = sn.normalize(x)
+        assert result.shape == (8, 16, 3)

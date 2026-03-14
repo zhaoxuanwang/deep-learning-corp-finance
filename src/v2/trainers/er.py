@@ -22,7 +22,9 @@ from src.v2.trainers.core import (
     polyak_update,
     build_target_policy,
 )
-from src.v2.data.pipeline import build_iterator, validate_dataset_keys
+from src.v2.data.pipeline import (
+    build_iterator, validate_dataset_keys, fit_normalizer_flat,
+)
 
 
 _DATASET_KEYS = ["s_endo", "z", "z_next_main", "z_next_fork"]
@@ -55,15 +57,9 @@ def train_er(env, policy, train_dataset: dict, val_dataset: dict = None,
         clipnorm=config.policy_optimizer.clipnorm)
 
     # ------------------------------------------------------------------
-    # Normalizer warm-up — freeze after warm-up
+    # Fit normalizer from full dataset (once, before gradient steps)
     # ------------------------------------------------------------------
-    if config.warmup_steps > 0:
-        warmup_iter = build_iterator(train_dataset, config.batch_size)
-        for batch in warmup_iter.take(config.warmup_steps):
-            s = env.merge_state(batch["s_endo"], batch["z"])
-            policy.update_normalizer(s)
-    # Normalizer is now warm. All subsequent policy calls use training=False
-    # so update_normalizer is never triggered during gradient steps.
+    fit_normalizer_flat(env, train_dataset, policy, target_policy)
 
     # ------------------------------------------------------------------
     # Training loop

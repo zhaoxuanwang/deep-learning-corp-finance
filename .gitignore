@@ -3,7 +3,6 @@ archive/
 notebooks/
 .venv/
 .DS_Store
-docs/
 experiments/
 
 # --- Python Standard Exclusions ---

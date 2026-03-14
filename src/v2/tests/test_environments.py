@@ -246,8 +246,7 @@ class TestRewardScale:
 
     def test_reward_scale_positive(self, env):
         """compute_reward_scale returns a positive scalar."""
-        from src.v2.trainers.core import SeedSchedule
-        seed = SeedSchedule().pretraining_seed(SeedSchedule.VAR_BELLMAN_SCALE)
+        seed = tf.constant([42, 0], dtype=tf.int32)
         lam = env.compute_reward_scale(seed=seed)
         assert lam > 0
 
@@ -262,15 +261,13 @@ class TestRewardScale:
         s_endo_ss = tf.constant([[env.k_star]])
         abs_v_star = float(tf.abs(env.terminal_value(s_endo_ss)[0]))
         expected = 1.0 / abs_v_star
-        from src.v2.trainers.core import SeedSchedule
-        seed = SeedSchedule().pretraining_seed(SeedSchedule.VAR_BELLMAN_SCALE)
+        seed = tf.constant([42, 0], dtype=tf.int32)
         assert env.compute_reward_scale(seed=seed) == pytest.approx(
             expected, rel=1e-5)
 
     def test_reward_scale_makes_q_order_one(self, env):
         """λ · |V*| ≈ 1 — the whole point of the normalizer."""
-        from src.v2.trainers.core import SeedSchedule
-        seed = SeedSchedule().pretraining_seed(SeedSchedule.VAR_BELLMAN_SCALE)
+        seed = tf.constant([42, 0], dtype=tf.int32)
         lam = env.compute_reward_scale(seed=seed)
         s_endo_ss = tf.constant([[env.k_star]])
         abs_v_star = float(tf.abs(env.terminal_value(s_endo_ss)[0]))
@@ -278,9 +275,8 @@ class TestRewardScale:
 
     def test_reward_scale_generic_vs_analytical(self, env):
         """Generic and analytical λ should be same order of magnitude."""
-        from src.v2.trainers.core import SeedSchedule
         from src.v2.environments.base import MDPEnvironment
-        seed = SeedSchedule().pretraining_seed(SeedSchedule.VAR_BELLMAN_SCALE)
+        seed = tf.constant([42, 0], dtype=tf.int32)
         lam_analytical = env.compute_reward_scale(seed=seed)
         lam_generic = MDPEnvironment.compute_reward_scale(
             env, n_samples=2000, seed=seed)

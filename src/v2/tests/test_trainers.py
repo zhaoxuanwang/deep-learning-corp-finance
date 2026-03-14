@@ -1,4 +1,4 @@
-"""Tests for v2 trainer modules: core utilities, LR, ER, BRM, MVE.
+"""Tests for v2 trainer modules: core utilities, LR, ER, BRM, SHAC.
 
 All training smoke tests use very small configs (few steps, small batch)
 to verify correctness without long runtimes.
@@ -10,21 +10,23 @@ import pytest
 
 from src.v2.environments.basic_investment import BasicInvestmentEnv
 from src.v2.networks.policy import PolicyNetwork
-from src.v2.networks.critic import CriticNetwork
 from src.v2.networks.state_value import StateValueNetwork
+from src.v2.data.generator import DataGenerator, DataGeneratorConfig
+from src.v2.data.pipeline import (
+    build_iterator, validate_dataset_keys,
+    fit_normalizer_traj, fit_normalizer_flat,
+)
 from src.v2.trainers.core import (
-    ReplayBuffer, SeedSchedule, polyak_update, hard_update,
-    collect_transitions, generate_eval_dataset,
-    evaluate_euler_residual, evaluate_bellman_residual,
-    evaluate_bellman_residual_v,
+    polyak_update, hard_update, build_target_policy, build_target_value,
+    evaluate_euler_residual, evaluate_bellman_residual_v,
 )
 from src.v2.trainers.config import (
-    LRConfig, ERConfig, BRMConfig, MVEConfig, OptimizerConfig,
+    LRConfig, ERConfig, BRMConfig, SHACConfig, OptimizerConfig,
 )
 from src.v2.trainers.lr import train_lr
 from src.v2.trainers.er import train_er
 from src.v2.trainers.brm import train_brm
-from src.v2.experimental.mve import train_mve
+from src.v2.trainers.shac import train_shac
 
 
 # =============================================================================
@@ -44,21 +46,7 @@ def policy(env):
         state_dim=env.state_dim(), action_dim=env.action_dim(),
         **env.action_spec(), n_layers=2, n_neurons=32,
     )
-    dummy = tf.zeros((1, env.state_dim()))
-    net(dummy)
-    return net
-
-
-@pytest.fixture
-def critic(env):
-    """Small critic network for smoke tests."""
-    net = CriticNetwork(
-        state_dim=env.state_dim(), action_dim=env.action_dim(),
-        n_layers=2, n_neurons=32,
-    )
-    dummy_s = tf.zeros((1, env.state_dim()))
-    dummy_a = tf.zeros((1, env.action_dim()))
-    net(dummy_s, dummy_a)
+    net(tf.zeros((1, env.state_dim())))
     return net
 
 
@@ -69,110 +57,33 @@ def value_net(env):
         state_dim=env.state_dim(),
         n_layers=2, n_neurons=32,
     )
-    dummy = tf.zeros((1, env.state_dim()))
-    net(dummy)
+    net(tf.zeros((1, env.state_dim())))
     return net
 
 
+@pytest.fixture
+def traj_dataset(env):
+    """Small trajectory-format dataset for LR/SHAC tests."""
+    gen = DataGenerator(env, DataGeneratorConfig(n_paths=32, horizon=8))
+    return gen.get_trajectory_dataset("train")
+
+
+@pytest.fixture
+def flat_dataset(env):
+    """Small flattened-format dataset for ER/BRM tests."""
+    gen = DataGenerator(env, DataGeneratorConfig(n_paths=32, horizon=8))
+    return gen.get_flattened_dataset("train")
+
+
+@pytest.fixture
+def val_dataset(env):
+    """Small flattened-format validation dataset."""
+    gen = DataGenerator(env, DataGeneratorConfig(n_paths=16, horizon=8))
+    return gen.get_flattened_dataset("val")
+
+
 def _small_optimizer():
-    """Shared small optimizer config for fast smoke tests."""
     return OptimizerConfig(learning_rate=1e-3, clipnorm=100.0)
-
-
-# =============================================================================
-# ReplayBuffer
-# =============================================================================
-
-class TestReplayBuffer:
-    """Tests for the ReplayBuffer."""
-
-    def test_empty_buffer(self):
-        """New buffer has size 0."""
-        buf = ReplayBuffer(capacity=100, state_dim=2, action_dim=1)
-        assert len(buf) == 0
-
-    def test_add_and_size(self):
-        """Adding transitions increases buffer size."""
-        buf = ReplayBuffer(capacity=100, state_dim=2, action_dim=1)
-        s = np.random.randn(10, 2).astype(np.float32)
-        a = np.random.randn(10, 1).astype(np.float32)
-        r = np.random.randn(10).astype(np.float32)
-        s_next = np.random.randn(10, 2).astype(np.float32)
-        eps = np.random.randn(10, 1).astype(np.float32)
-        buf.add(s, a, r, s_next, eps)
-        assert len(buf) == 10
-
-    def test_capacity_limit(self):
-        """Buffer does not exceed capacity."""
-        buf = ReplayBuffer(capacity=20, state_dim=2, action_dim=1)
-        for _ in range(5):
-            s = np.random.randn(10, 2).astype(np.float32)
-            a = np.random.randn(10, 1).astype(np.float32)
-            r = np.random.randn(10).astype(np.float32)
-            s_next = np.random.randn(10, 2).astype(np.float32)
-            eps = np.random.randn(10, 1).astype(np.float32)
-            buf.add(s, a, r, s_next, eps)
-        assert len(buf) == 20
-
-    def test_sample_returns_tf_tensors(self):
-        """Sampled batch values are TF tensors."""
-        buf = ReplayBuffer(capacity=100, state_dim=2, action_dim=1)
-        s = np.random.randn(50, 2).astype(np.float32)
-        a = np.random.randn(50, 1).astype(np.float32)
-        r = np.random.randn(50).astype(np.float32)
-        s_next = np.random.randn(50, 2).astype(np.float32)
-        eps = np.random.randn(50, 1).astype(np.float32)
-        buf.add(s, a, r, s_next, eps)
-
-        batch = buf.sample(16)
-        assert isinstance(batch["s"], tf.Tensor)
-        assert batch["s"].shape == (16, 2)
-        assert batch["a"].shape == (16, 1)
-        assert batch["r"].shape == (16, 1)
-        assert batch["s_next"].shape == (16, 2)
-
-    def test_sample_deterministic_with_seed(self):
-        """Same seed produces same sample."""
-        buf = ReplayBuffer(capacity=100, state_dim=2, action_dim=1)
-        s = np.random.randn(50, 2).astype(np.float32)
-        a = np.random.randn(50, 1).astype(np.float32)
-        r = np.random.randn(50).astype(np.float32)
-        s_next = np.random.randn(50, 2).astype(np.float32)
-        eps = np.random.randn(50, 1).astype(np.float32)
-        buf.add(s, a, r, s_next, eps)
-
-        b1 = buf.sample(8, seed=(1, 2))
-        b2 = buf.sample(8, seed=(1, 2))
-        np.testing.assert_allclose(b1["s"].numpy(), b2["s"].numpy())
-
-
-# =============================================================================
-# SeedSchedule
-# =============================================================================
-
-class TestSeedSchedule:
-    """Tests for the SeedSchedule."""
-
-    def test_training_seeds_unique(self):
-        """Different steps produce different seeds."""
-        ss = SeedSchedule((20, 26))
-        s1 = ss.training_seed(0, SeedSchedule.VAR_STATE)
-        s2 = ss.training_seed(1, SeedSchedule.VAR_STATE)
-        assert s1 != s2
-
-    def test_different_vars_different_seeds(self):
-        """Different variable types produce different seeds at same step."""
-        ss = SeedSchedule((20, 26))
-        s1 = ss.training_seed(0, SeedSchedule.VAR_STATE)
-        s2 = ss.training_seed(0, SeedSchedule.VAR_SHOCK_MAIN)
-        assert s1 != s2
-
-    def test_eval_seed_deterministic(self):
-        """Eval seeds are deterministic."""
-        ss = SeedSchedule((20, 26))
-        e1 = ss.eval_seed(SeedSchedule.VAR_STATE)
-        e2 = ss.eval_seed(SeedSchedule.VAR_STATE)
-        assert e1 == e2
 
 
 # =============================================================================
@@ -189,14 +100,11 @@ class TestTargetOps:
             **env.action_spec(), n_layers=2, n_neurons=32,
             name="policy_target",
         )
-        dummy = tf.zeros((1, env.state_dim()))
-        target(dummy)
-
+        target(tf.zeros((1, env.state_dim())))
         hard_update(policy, target)
         for src, tgt in zip(policy.trainable_variables,
                             target.trainable_variables):
-            np.testing.assert_allclose(
-                src.numpy(), tgt.numpy(), atol=1e-7)
+            np.testing.assert_allclose(src.numpy(), tgt.numpy(), atol=1e-7)
 
     def test_polyak_update_interpolates(self, policy, env):
         """polyak_update moves target toward source."""
@@ -205,61 +113,98 @@ class TestTargetOps:
             **env.action_spec(), n_layers=2, n_neurons=32,
             name="policy_target",
         )
-        dummy = tf.zeros((1, env.state_dim()))
-        target(dummy)
-
-        # Record initial target weights.
+        target(tf.zeros((1, env.state_dim())))
         before = [v.numpy().copy() for v in target.trainable_variables]
-
-        # Polyak with tau=0.5.
         polyak_update(policy, target, tau=0.5)
-
-        # Check interpolation: w_target = 0.5 * w_old + 0.5 * w_source.
         for src, tgt, bef in zip(policy.trainable_variables,
-                                 target.trainable_variables, before):
+                                  target.trainable_variables, before):
             expected = 0.5 * bef + 0.5 * src.numpy()
-            np.testing.assert_allclose(
-                tgt.numpy(), expected, atol=1e-6)
+            np.testing.assert_allclose(tgt.numpy(), expected, atol=1e-6)
+
+    def test_build_target_policy(self, policy, env):
+        """build_target_policy creates a target with identical initial weights."""
+        target = build_target_policy(policy)
+        for src, tgt in zip(policy.trainable_variables,
+                             target.trainable_variables):
+            np.testing.assert_allclose(src.numpy(), tgt.numpy(), atol=1e-7)
+
+    def test_build_target_value(self, value_net):
+        """build_target_value creates a target with identical initial weights."""
+        target = build_target_value(value_net)
+        for src, tgt in zip(value_net.trainable_variables,
+                             target.trainable_variables):
+            np.testing.assert_allclose(src.numpy(), tgt.numpy(), atol=1e-7)
 
 
 # =============================================================================
-# Data pipeline
+# Data pipeline utilities
 # =============================================================================
 
 class TestDataPipeline:
-    """Tests for data collection and evaluation utilities."""
+    """Tests for pipeline utilities."""
 
-    def test_collect_transitions_shape(self, env, policy):
-        """collect_transitions returns correct shapes."""
-        ss = SeedSchedule((20, 26))
-        data = collect_transitions(env, policy, n_samples=32,
-                                   seed_schedule=ss, step=0)
-        assert data["s"].shape == (32, 2)
-        assert data["a"].shape == (32, 1)
-        assert data["s_next"].shape == (32, 2)
-        assert data["eps"].shape == (32, 1)
+    def test_validate_dataset_keys_passes(self, flat_dataset):
+        """validate_dataset_keys raises nothing when all keys present."""
+        validate_dataset_keys(flat_dataset,
+                              ["s_endo", "z", "z_next_main", "z_next_fork"],
+                              "test")
 
-    def test_generate_eval_dataset(self, env):
-        """generate_eval_dataset returns states and two shock sets."""
-        ss = SeedSchedule((20, 26))
-        eval_data = generate_eval_dataset(env, n_samples=64, seed_schedule=ss)
-        assert "s" in eval_data
-        assert "eps" in eval_data
-        assert "eps_fork" in eval_data
-        assert eval_data["s"].shape == (64, 2)
+    def test_validate_dataset_keys_raises(self, flat_dataset):
+        """validate_dataset_keys raises ValueError on missing key."""
+        with pytest.raises(ValueError, match="missing required keys"):
+            validate_dataset_keys(flat_dataset, ["s_endo", "missing_key"],
+                                  "test")
 
-    def test_evaluate_euler_residual_finite(self, env, policy):
-        """Euler residual evaluation returns a finite number."""
-        ss = SeedSchedule((20, 26))
-        eval_data = generate_eval_dataset(env, n_samples=32, seed_schedule=ss)
-        er = evaluate_euler_residual(env, policy, eval_data)
+    def test_build_iterator_shape(self, flat_dataset, env):
+        """build_iterator yields batches with correct shapes."""
+        ds = build_iterator(flat_dataset, batch_size=16)
+        batch = next(iter(ds))
+        assert batch["s_endo"].shape == (16, env.endo_dim())
+        assert batch["z"].shape == (16, env.exo_dim())
+
+    def test_fit_normalizer_flat(self, env, flat_dataset, policy):
+        """fit_normalizer_flat sets non-trivial mean on the policy network."""
+        np.testing.assert_allclose(policy.normalizer.mean.numpy(),
+                                   np.zeros(env.state_dim()), atol=1e-6)
+        fit_normalizer_flat(env, flat_dataset, policy)
+        assert not np.allclose(policy.normalizer.mean.numpy(),
+                               np.zeros(env.state_dim()))
+
+    def test_fit_normalizer_traj(self, env, traj_dataset, policy):
+        """fit_normalizer_traj sets non-trivial mean on the policy network."""
+        np.testing.assert_allclose(policy.normalizer.mean.numpy(),
+                                   np.zeros(env.state_dim()), atol=1e-6)
+        fit_normalizer_traj(env, traj_dataset, policy)
+        assert not np.allclose(policy.normalizer.mean.numpy(),
+                               np.zeros(env.state_dim()))
+
+    def test_fit_normalizer_multiple_networks(self, env, flat_dataset,
+                                              policy, value_net):
+        """fit_normalizer_flat gives identical stats to all networks."""
+        fit_normalizer_flat(env, flat_dataset, policy, value_net)
+        np.testing.assert_allclose(
+            policy.normalizer.mean.numpy(),
+            value_net.normalizer.mean.numpy(), atol=1e-6)
+        np.testing.assert_allclose(
+            policy.normalizer.std.numpy(),
+            value_net.normalizer.std.numpy(), atol=1e-6)
+
+
+# =============================================================================
+# Evaluation metrics
+# =============================================================================
+
+class TestEvaluationMetrics:
+
+    def test_evaluate_euler_residual_finite(self, env, policy, val_dataset):
+        """evaluate_euler_residual returns a finite number."""
+        er = evaluate_euler_residual(env, policy, val_dataset)
         assert np.isfinite(er)
 
-    def test_evaluate_bellman_residual_finite(self, env, policy, critic):
-        """Bellman residual evaluation returns a finite number."""
-        ss = SeedSchedule((20, 26))
-        eval_data = generate_eval_dataset(env, n_samples=32, seed_schedule=ss)
-        br = evaluate_bellman_residual(env, policy, critic, eval_data)
+    def test_evaluate_bellman_residual_v_finite(self, env, policy,
+                                                value_net, val_dataset):
+        """evaluate_bellman_residual_v returns a finite number."""
+        br = evaluate_bellman_residual_v(env, policy, value_net, val_dataset)
         assert np.isfinite(br)
 
 
@@ -270,29 +215,39 @@ class TestDataPipeline:
 class TestTrainLR:
     """Smoke test for the LR trainer."""
 
-    def test_train_lr_runs(self, env, policy):
+    def test_train_lr_runs(self, env, policy, traj_dataset):
         """train_lr completes without error for a few steps."""
         config = LRConfig(
             n_steps=5, batch_size=16, horizon=4,
-            eval_interval=2, eval_size=32,
+            eval_interval=2,
             policy_optimizer=_small_optimizer(),
         )
-        result = train_lr(env, policy, config=config)
+        result = train_lr(env, policy, traj_dataset, config=config)
         assert "policy" in result
         assert "history" in result
         assert len(result["history"]["step"]) > 0
 
-    def test_train_lr_loss_recorded(self, env, policy):
-        """LR trainer records loss values."""
+    def test_train_lr_loss_recorded(self, env, policy, traj_dataset,
+                                    val_dataset):
+        """LR trainer records finite loss values and euler residual."""
         config = LRConfig(
             n_steps=3, batch_size=16, horizon=4,
-            eval_interval=1, eval_size=32,
+            eval_interval=1,
             policy_optimizer=_small_optimizer(),
         )
-        result = train_lr(env, policy, config=config)
+        result = train_lr(env, policy, traj_dataset, val_dataset=val_dataset,
+                          config=config)
         losses = result["history"]["loss"]
         assert len(losses) == 3
         assert all(np.isfinite(l) for l in losses)
+
+    def test_train_lr_horizon_exceeds_data_raises(self, env, policy,
+                                                   traj_dataset):
+        """train_lr raises if horizon > dataset horizon."""
+        config = LRConfig(n_steps=2, batch_size=16, horizon=999,
+                          policy_optimizer=_small_optimizer())
+        with pytest.raises(ValueError, match="horizon"):
+            train_lr(env, policy, traj_dataset, config=config)
 
 
 # =============================================================================
@@ -302,19 +257,19 @@ class TestTrainLR:
 class TestTrainER:
     """Smoke test for the ER trainer."""
 
-    def test_train_er_runs(self, env, policy):
+    def test_train_er_runs(self, env, policy, flat_dataset):
         """train_er completes without error for a few steps."""
         config = ERConfig(
             n_steps=5, batch_size=16,
-            eval_interval=2, eval_size=32,
-            replay_buffer_size=200,
+            eval_interval=2,
             policy_optimizer=_small_optimizer(),
         )
-        result = train_er(env, policy, config=config)
+        result = train_er(env, policy, flat_dataset, config=config)
         assert "policy" in result
         assert "history" in result
+        assert len(result["history"]["step"]) > 0
 
-    def test_train_er_crossprod_and_mse(self, env):
+    def test_train_er_crossprod_and_mse(self, env, flat_dataset):
         """Both loss types run without error."""
         for loss_type in ["crossprod", "mse"]:
             p = PolicyNetwork(
@@ -324,93 +279,19 @@ class TestTrainER:
             p(tf.zeros((1, env.state_dim())))
             config = ERConfig(
                 n_steps=3, batch_size=16, loss_type=loss_type,
-                eval_interval=2, eval_size=32,
-                replay_buffer_size=200,
+                eval_interval=2,
                 policy_optimizer=_small_optimizer(),
             )
-            result = train_er(env, p, config=config)
+            result = train_er(env, p, flat_dataset, config=config)
             assert len(result["history"]["step"]) > 0
 
-
-# =============================================================================
-# MVE trainer smoke test
-# =============================================================================
-
-class TestTrainMVE:
-    """Smoke test for the MVE trainer."""
-
-    def test_train_mve_runs(self, env, policy, critic):
-        """train_mve completes without error for a few steps."""
-        config = MVEConfig(
-            n_steps=5, batch_size=16, mve_horizon=3,
-            eval_interval=2, eval_size=32,
-            replay_buffer_size=200,
-            policy_optimizer=_small_optimizer(),
-            critic_optimizer=_small_optimizer(),
-        )
-        result = train_mve(env, policy, critic, config=config)
-        assert "policy" in result
-        assert "critic" in result
-        assert "history" in result
-
-    def test_train_mve_records_both_losses(self, env, policy, critic):
-        """MVE trainer records both actor and critic losses."""
-        config = MVEConfig(
-            n_steps=3, batch_size=16, mve_horizon=2,
-            eval_interval=1, eval_size=32,
-            replay_buffer_size=200,
-            policy_optimizer=_small_optimizer(),
-            critic_optimizer=_small_optimizer(),
-        )
-        result = train_mve(env, policy, critic, config=config)
-        h = result["history"]
-        assert len(h["actor_loss"]) > 0
-        assert len(h["critic_loss"]) > 0
-        assert all(np.isfinite(l) for l in h["actor_loss"])
-        assert all(np.isfinite(l) for l in h["critic_loss"])
-
-    def test_lambda_preprocessing_reduces_critic_loss(self, env):
-        """λ-preprocessing brings critic loss to O(1) scale."""
-        from src.v2.trainers.core import SeedSchedule
-        seed = SeedSchedule().pretraining_seed(SeedSchedule.VAR_BELLMAN_SCALE)
-        lam = env.compute_reward_scale(seed=seed)
-
-        def _fresh_nets():
-            tf.random.set_seed(0)
-            p = PolicyNetwork(
-                state_dim=env.state_dim(), action_dim=env.action_dim(),
-                **env.action_spec(), n_layers=2, n_neurons=32)
-            c = CriticNetwork(
-                state_dim=env.state_dim(), action_dim=env.action_dim(),
-                n_layers=2, n_neurons=32)
-            p(tf.zeros((1, env.state_dim())))
-            c(tf.zeros((1, env.state_dim())), tf.zeros((1, env.action_dim())))
-            return p, c
-
-        base_cfg = dict(
-            n_steps=10, batch_size=32, mve_horizon=3,
-            eval_interval=5, eval_size=64,
-            replay_buffer_size=500,
-            master_seed=(99, 0),
-            policy_optimizer=_small_optimizer(),
-            critic_optimizer=_small_optimizer(),
-        )
-
-        p1, c1 = _fresh_nets()
-        r1 = train_mve(env, p1, c1,
-                        config=MVEConfig(**base_cfg, reward_scale=1.0))
-
-        p2, c2 = _fresh_nets()
-        r2 = train_mve(env, p2, c2,
-                        config=MVEConfig(**base_cfg, reward_scale=lam))
-
-        # The λ-normalized run should have much smaller critic loss.
-        loss_unnorm = r1["history"]["critic_loss"][-1]
-        loss_norm = r2["history"]["critic_loss"][-1]
-        assert loss_norm < loss_unnorm, (
-            f"λ-normalized loss ({loss_norm:.4f}) should be smaller than "
-            f"unnormalized ({loss_unnorm:.4f})"
-        )
+    def test_train_er_missing_keys_raises(self, env, policy):
+        """train_er raises ValueError if dataset missing required keys."""
+        bad_dataset = {"s_endo": tf.zeros((10, env.endo_dim()))}
+        config = ERConfig(n_steps=1, batch_size=4,
+                          policy_optimizer=_small_optimizer())
+        with pytest.raises(ValueError, match="missing required keys"):
+            train_er(env, policy, bad_dataset, config=config)
 
 
 # =============================================================================
@@ -420,21 +301,20 @@ class TestTrainMVE:
 class TestTrainBRM:
     """Smoke test for the BRM trainer."""
 
-    def test_train_brm_runs(self, env, policy, value_net):
+    def test_train_brm_runs(self, env, policy, value_net, flat_dataset):
         """train_brm completes without error for a few steps."""
         config = BRMConfig(
             n_steps=5, batch_size=16,
-            eval_interval=2, eval_size=32,
-            replay_buffer_size=200,
+            eval_interval=2,
             policy_optimizer=_small_optimizer(),
         )
-        result = train_brm(env, policy, value_net, config=config)
+        result = train_brm(env, policy, value_net, flat_dataset, config=config)
         assert "policy" in result
         assert "value_net" in result
         assert "history" in result
         assert len(result["history"]["step"]) > 0
 
-    def test_train_brm_crossprod_and_mse(self, env):
+    def test_train_brm_crossprod_and_mse(self, env, flat_dataset):
         """Both loss types run without error."""
         for loss_type in ["crossprod", "mse"]:
             p = PolicyNetwork(
@@ -448,14 +328,28 @@ class TestTrainBRM:
             v(tf.zeros((1, env.state_dim())))
             config = BRMConfig(
                 n_steps=3, batch_size=16, loss_type=loss_type,
-                eval_interval=2, eval_size=32,
-                replay_buffer_size=200,
+                eval_interval=2,
                 policy_optimizer=_small_optimizer(),
             )
-            result = train_brm(env, p, v, config=config)
+            result = train_brm(env, p, v, flat_dataset, config=config)
             assert len(result["history"]["step"]) > 0
 
-    def test_train_brm_foc_finite(self, env):
+    def test_train_brm_records_all_losses(self, env, policy, value_net,
+                                          flat_dataset):
+        """BRM trainer records all component losses."""
+        config = BRMConfig(
+            n_steps=3, batch_size=16,
+            eval_interval=1,
+            policy_optimizer=_small_optimizer(),
+        )
+        result = train_brm(env, policy, value_net, flat_dataset, config=config)
+        h = result["history"]
+        assert len(h["loss_br"]) == 3
+        assert len(h["loss_foc"]) == 3
+        assert all(np.isfinite(l) for l in h["loss"])
+        assert all(np.isfinite(l) for l in h["loss_br"])
+
+    def test_train_brm_foc_finite(self, env, flat_dataset):
         """BRM autodiff FOC loss is finite."""
         p = PolicyNetwork(
             state_dim=env.state_dim(), action_dim=env.action_dim(),
@@ -468,56 +362,268 @@ class TestTrainBRM:
         v(tf.zeros((1, env.state_dim())))
         config = BRMConfig(
             n_steps=3, batch_size=16,
-            eval_interval=2, eval_size=32,
-            replay_buffer_size=200,
+            eval_interval=2,
             policy_optimizer=_small_optimizer(),
         )
-        result = train_brm(env, p, v, config=config)
-        assert len(result["history"]["step"]) > 0
+        result = train_brm(env, p, v, flat_dataset, config=config)
         assert all(np.isfinite(l) for l in result["history"]["loss_foc"])
 
-    def test_train_brm_records_all_losses(self, env, policy, value_net):
-        """BRM trainer records all component losses."""
-        config = BRMConfig(
-            n_steps=3, batch_size=16,
-            eval_interval=1, eval_size=32,
-            replay_buffer_size=200,
-            policy_optimizer=_small_optimizer(),
+
+# =============================================================================
+# SHAC trainer (DDPG-style variant) tests
+# =============================================================================
+
+def _shac_config(**overrides):
+    """Build a small SHACConfig for testing."""
+    defaults = dict(
+        n_steps=4, batch_size=16, horizon=8, short_horizon=4,
+        n_critic=2, eval_interval=2,
+        policy_optimizer=_small_optimizer(),
+        critic_optimizer=_small_optimizer(),
+    )
+    defaults.update(overrides)
+    return SHACConfig(**defaults)
+
+
+def _make_policy_and_value(env):
+    """Create fresh small policy + value_net for isolation tests."""
+    p = PolicyNetwork(
+        state_dim=env.state_dim(), action_dim=env.action_dim(),
+        **env.action_spec(), n_layers=2, n_neurons=32,
+    )
+    p(tf.zeros((1, env.state_dim())))
+    v = StateValueNetwork(
+        state_dim=env.state_dim(), n_layers=2, n_neurons=32,
+    )
+    v(tf.zeros((1, env.state_dim())))
+    return p, v
+
+
+class TestTrainSHAC:
+    """Tests for SHAC trainer (DDPG-style variant)."""
+
+    # ---- Smoke / integration tests ----
+
+    def test_train_shac_runs(self, env, policy, value_net, traj_dataset):
+        """train_shac completes without error for a few steps."""
+        config = _shac_config()
+        result = train_shac(env, policy, value_net, traj_dataset, config=config)
+        assert "policy" in result
+        assert "value_net" in result
+        assert "history" in result
+        assert len(result["history"]["step"]) > 0
+
+    def test_train_shac_records_losses(self, env, traj_dataset, val_dataset):
+        """SHAC trainer records finite actor and critic losses."""
+        p, v = _make_policy_and_value(env)
+        config = _shac_config(eval_interval=1)
+        result = train_shac(env, p, v, traj_dataset,
+                            val_dataset=val_dataset, config=config)
+        hist = result["history"]
+        assert len(hist["loss_actor"]) == 4
+        assert all(np.isfinite(l) for l in hist["loss_actor"])
+        assert all(np.isfinite(l) for l in hist["loss_critic"])
+        assert all(np.isfinite(r) for r in hist["euler_residual"])
+        assert all(np.isfinite(r) for r in hist["bellman_residual"])
+
+    # ---- Input validation ----
+
+    def test_train_shac_horizon_exceeds_data_raises(self, env, policy,
+                                                     value_net, traj_dataset):
+        """train_shac raises if horizon > dataset horizon."""
+        config = _shac_config(horizon=999, short_horizon=3)
+        with pytest.raises(ValueError, match="horizon"):
+            train_shac(env, policy, value_net, traj_dataset, config=config)
+
+    def test_train_shac_window_not_divisible_raises(self, env, policy,
+                                                     value_net, traj_dataset):
+        """train_shac raises if horizon % short_horizon != 0."""
+        config = _shac_config(horizon=8, short_horizon=3)
+        with pytest.raises(ValueError, match="divisible"):
+            train_shac(env, policy, value_net, traj_dataset, config=config)
+
+    def test_train_shac_step_counting(self, env, traj_dataset):
+        """Each mini-batch produces horizon/short_horizon steps."""
+        p, v = _make_policy_and_value(env)
+        # horizon=8, short_horizon=4 → 2 windows per batch
+        # n_steps=6 → exactly 6 steps (3 batches × 2 windows)
+        config = _shac_config(
+            n_steps=6, n_critic=1,
+            eval_interval=100,  # only log at step 0 and step 5 (last)
         )
-        result = train_brm(env, policy, value_net, config=config)
-        h = result["history"]
-        assert len(h["loss_br"]) == 3
-        assert len(h["loss_foc"]) == 3
-        assert all(np.isfinite(l) for l in h["loss"])
-        assert all(np.isfinite(l) for l in h["loss_br"])
+        result = train_shac(env, p, v, traj_dataset, config=config)
+        steps = result["history"]["step"]
+        assert steps[0] == 0
+        assert steps[-1] == 5  # 0-indexed, last step is n_steps - 1
 
-    def test_bellman_residual_v_finite(self, env, policy, value_net):
-        """evaluate_bellman_residual_v returns a finite number."""
-        ss = SeedSchedule((20, 26))
-        eval_data = generate_eval_dataset(env, n_samples=32,
-                                          seed_schedule=ss)
-        br = evaluate_bellman_residual_v(env, policy, value_net, eval_data)
-        assert np.isfinite(br)
+    # ---- Config shape ----
 
+    def test_shac_config_no_warm_start(self):
+        """SHACConfig has no warm_start_steps field (cold start only)."""
+        config = SHACConfig()
+        assert not hasattr(config, 'warm_start_steps')
+        assert not hasattr(config, 'td_lambda')
+        assert not hasattr(config, 'n_mb')
 
-# =============================================================================
-# Environment interface: euler_residual with temperature
-# =============================================================================
+    def test_shac_config_reward_normalization_defaults(self):
+        """SHACConfig defaults to normalize_rewards=True."""
+        config = SHACConfig()
+        assert config.normalize_rewards is True
+        assert config.reward_scale_override is None
 
-class TestEnvironmentResiduals:
-    """Tests for environment-level residual methods."""
+    def test_shac_reward_scale_auto(self, env, traj_dataset):
+        """normalize_rewards=True (default) produces reward_scale != 1.0."""
+        from src.v2.trainers.shac import _resolve_reward_scale
+        config = SHACConfig()
+        rs = _resolve_reward_scale(env, config)
+        assert rs != 1.0
+        assert rs > 0.0
 
-    def test_euler_residual_with_temperature(self, env, policy):
-        """euler_residual accepts temperature and returns finite values."""
-        ss = SeedSchedule((20, 26))
-        s = env.sample_initial_states(32, seed=ss.eval_seed(1))
-        eps = env.sample_shocks(32, seed=ss.eval_seed(4))
-        a = policy(s, training=False)
-        s_next = env.transition(s, a, eps)
-        a_next = policy(s_next, training=False)
+    def test_shac_reward_scale_disabled(self, env):
+        """normalize_rewards=False gives reward_scale = 1.0."""
+        from src.v2.trainers.shac import _resolve_reward_scale
+        config = SHACConfig(normalize_rewards=False)
+        rs = _resolve_reward_scale(env, config)
+        assert rs == 1.0
 
-        for temp in [1e-6, 0.01, 0.1]:
-            res = env.euler_residual(s, a, s_next, a_next,
-                                     temperature=temp)
-            assert res.shape == (32,)
-            assert tf.reduce_all(tf.math.is_finite(res))
+    def test_shac_reward_scale_override(self, env):
+        """reward_scale_override takes priority over normalize_rewards."""
+        from src.v2.trainers.shac import _resolve_reward_scale
+        config = SHACConfig(normalize_rewards=True,
+                            reward_scale_override=0.005)
+        rs = _resolve_reward_scale(env, config)
+        assert rs == 0.005
+
+    # ---- Target network management ----
+
+    def test_shac_training_updates_both_networks(self, env, traj_dataset):
+        """After training, both policy and value weights have changed."""
+        p, v = _make_policy_and_value(env)
+        w_policy_before = [w.numpy().copy() for w in p.trainable_variables]
+        w_value_before = [w.numpy().copy() for w in v.trainable_variables]
+
+        config = _shac_config(n_steps=2, n_critic=1, eval_interval=100)
+        train_shac(env, p, v, traj_dataset, config=config)
+
+        policy_changed = any(
+            not np.allclose(w.numpy(), wb, atol=1e-7)
+            for w, wb in zip(p.trainable_variables, w_policy_before))
+        value_changed = any(
+            not np.allclose(w.numpy(), wb, atol=1e-7)
+            for w, wb in zip(v.trainable_variables, w_value_before))
+        assert policy_changed, "Policy weights should change during training"
+        assert value_changed, "Value weights should change during training"
+
+    # ---- Actor uses current V bootstrap (not target V̄) ----
+
+    def test_actor_bootstrap_uses_current_v(self, env, traj_dataset):
+        """Verify actor loss depends on current V, not target V̄.
+
+        Strategy: compute the actor objective with the real V and with a
+        corrupted V. If the actor uses current V, the results must differ.
+        """
+        from src.v2.data.pipeline import fit_normalizer_traj
+
+        p, v = _make_policy_and_value(env)
+        fit_normalizer_traj(env, traj_dataset, p, v)
+
+        gamma = env.discount()
+        window_len = 4
+        discount_powers = tf.constant(
+            [gamma ** t for t in range(window_len + 1)], dtype=tf.float32)
+
+        # Get a batch
+        gen = iter(tf.data.Dataset.from_tensor_slices(traj_dataset)
+                   .batch(16))
+        batch = next(gen)
+        k_endo = batch["s_endo_0"]
+        z_window = batch["z_path"][:, :window_len + 1, :]
+
+        def compute_actor_objective(policy_net, value_network):
+            """Compute actor objective (no gradient step)."""
+            k_current = k_endo
+            total_r = tf.zeros(tf.shape(k_endo)[0])
+            for tau in range(window_len):
+                z_t = z_window[:, tau, :]
+                s_t = env.merge_state(k_current, z_t)
+                a_t = policy_net(s_t, training=False)
+                r_t = tf.reshape(env.reward(s_t, a_t), [-1])
+                total_r = total_r + discount_powers[tau] * r_t
+                k_current = env.endogenous_transition(k_current, a_t, z_t)
+            s_end = env.merge_state(k_current, z_window[:, window_len, :])
+            v_boot = tf.squeeze(value_network(s_end, training=False))
+            total_r = total_r + discount_powers[window_len] * v_boot
+            return -tf.reduce_mean(total_r)
+
+        loss_with_current_v = compute_actor_objective(p, v)
+
+        # Create a corrupted value net (large bias)
+        v_corrupt = StateValueNetwork(
+            state_dim=env.state_dim(), n_layers=2, n_neurons=32)
+        v_corrupt(tf.zeros((1, env.state_dim())))
+        for var in v_corrupt.trainable_variables:
+            var.assign(var + 999.0)
+
+        loss_with_corrupt_v = compute_actor_objective(p, v_corrupt)
+
+        assert not np.isclose(float(loss_with_current_v),
+                              float(loss_with_corrupt_v), rtol=1e-3), \
+            "Actor loss must depend on the value network (current V bootstrap)"
+
+    # ---- Critic uses stop_gradient on Bellman target ----
+
+    def test_critic_target_is_stopped(self, env, traj_dataset):
+        """Verify critic gradient doesn't flow through policy.
+
+        Strategy: compute critic loss using target π̄ + target V̄ with
+        stop_gradient on the Bellman target y. Then check that
+        tape.gradient(loss, policy.trainable_variables) returns all None.
+        """
+        from src.v2.trainers.core import build_target_value, build_target_policy
+        from src.v2.data.pipeline import fit_normalizer_traj
+
+        p, v = _make_policy_and_value(env)
+        fit_normalizer_traj(env, traj_dataset, p, v)
+
+        target_v = build_target_value(v)
+        target_p = build_target_policy(p)
+        fit_normalizer_traj(env, traj_dataset, target_p, target_v)
+
+        discount_tf = tf.constant(env.discount(), dtype=tf.float32)
+
+        # Get some states
+        gen = iter(tf.data.Dataset.from_tensor_slices(traj_dataset)
+                   .batch(16))
+        batch = next(gen)
+        s_endo_0 = batch["s_endo_0"]
+        z_path = batch["z_path"]
+
+        s = env.merge_state(s_endo_0, z_path[:, 0, :])
+        z_next = z_path[:, 1, :]
+
+        # Compute Bellman target — uses target_p + target_v, detached
+        a_target = target_p(s, training=False)
+        r_target = tf.reshape(env.reward(s, a_target), [-1])
+        s_endo, s_exo = env.split_state(s)
+        k_next = env.endogenous_transition(s_endo, a_target, s_exo)
+        s_next = env.merge_state(k_next, z_next)
+        v_next = tf.squeeze(target_v(s_next, training=False))
+        bellman_target = tf.stop_gradient(r_target + discount_tf * v_next)
+
+        # Only the MSE on current V should be inside the tape
+        with tf.GradientTape() as tape:
+            v_pred = tf.squeeze(v(s, training=True), axis=-1)
+            loss_c = tf.reduce_mean((v_pred - bellman_target) ** 2)
+
+        # Gradient w.r.t. value_net should exist
+        grads_wrt_value = tape.gradient(loss_c, v.trainable_variables)
+        assert any(g is not None for g in grads_wrt_value), \
+            "Critic loss must produce gradients w.r.t. value network"
+
+        # bellman_target is detached, so no gradient flows to policy
+        with tf.GradientTape() as tape2:
+            v_pred2 = tf.squeeze(v(s, training=True), axis=-1)
+            loss_c2 = tf.reduce_mean((v_pred2 - bellman_target) ** 2)
+        grads_wrt_policy = tape2.gradient(loss_c2, p.trainable_variables)
+        assert all(g is None for g in grads_wrt_policy), \
+            "Critic loss must not produce gradients w.r.t. policy variables"

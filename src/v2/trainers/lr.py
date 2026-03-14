@@ -24,7 +24,9 @@ so BPTT flows through k but not z.
 import tensorflow as tf
 from src.v2.trainers.config import LRConfig
 from src.v2.trainers.core import evaluate_euler_residual
-from src.v2.data.pipeline import build_iterator, validate_dataset_keys
+from src.v2.data.pipeline import (
+    build_iterator, validate_dataset_keys, fit_normalizer_traj,
+)
 
 
 _TRAIN_KEYS = ["s_endo_0", "z_path", "z_fork"]
@@ -67,16 +69,9 @@ def train_lr(env, policy, train_dataset: dict, val_dataset: dict = None,
         clipnorm=config.policy_optimizer.clipnorm)
 
     # ------------------------------------------------------------------
-    # Normalizer warm-up — freeze after warm-up
+    # Fit normalizer from full dataset (once, before gradient steps)
     # ------------------------------------------------------------------
-    if config.warmup_steps > 0:
-        warmup_iter = build_iterator(train_dataset, config.batch_size)
-        for batch in warmup_iter.take(config.warmup_steps):
-            # Warm up with initial states (t=0 of each trajectory)
-            s0 = env.merge_state(batch["s_endo_0"], batch["z_path"][:, 0, :])
-            policy.update_normalizer(s0)
-    # Normalizer is now warm — training uses training=False for all policy
-    # calls so update_normalizer is never triggered during gradient steps.
+    fit_normalizer_traj(env, train_dataset, policy)
 
     # ------------------------------------------------------------------
     # Compiled training step (tf.function with static unroll)

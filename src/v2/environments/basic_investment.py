@@ -69,6 +69,10 @@ class BasicInvestmentEnv(MDPEnvironment):
         # Analytical reference k'(z_max) — for analysis only
         self.k_ref = self._frictionless_kprime(self.z_max, self.econ, self.shocks)
 
+        # Feasible investment bounds: k' = (1-δ)k + I with k' ∈ [k_min, k_max]
+        self.I_min = self.k_min - (1.0 - self.econ.delta) * self.k_max
+        self.I_max = self.k_max - (1.0 - self.econ.delta) * self.k_min
+
         # Stationary exogenous mean (level space)
         self._z_bar = tf.constant([float(tf.exp(mu))], dtype=tf.float32)
 
@@ -91,14 +95,15 @@ class BasicInvestmentEnv(MDPEnvironment):
 
     def action_bounds(self) -> tuple:
         return (
-            tf.constant([-self.k_max], dtype=tf.float32),
-            tf.constant([ self.k_max], dtype=tf.float32),
+            tf.constant([self.I_min], dtype=tf.float32),
+            tf.constant([self.I_max], dtype=tf.float32),
         )
 
     def action_scale_reference(self) -> tuple:
         I_ss       = self.econ.delta * self.k_star
-        center     = tf.constant([I_ss],       dtype=tf.float32)
-        half_range = tf.constant([self.k_max], dtype=tf.float32)
+        center     = tf.constant([I_ss], dtype=tf.float32)
+        half_range = tf.constant([max(abs(self.I_min), self.I_max)],
+                                 dtype=tf.float32)
         return center, half_range
 
     # ------------------------------------------------------------------
@@ -120,7 +125,7 @@ class BasicInvestmentEnv(MDPEnvironment):
         """
         I      = a[..., 0]
         k_next = (1.0 - self.econ.delta) * k + I
-        k_next = tf.maximum(k_next, self.k_min)
+        k_next = tf.clip_by_value(k_next, self.k_min, self.k_max)
         I_eff  = k_next - (1.0 - self.econ.delta) * k
         return k_next, I_eff
 
@@ -229,6 +234,30 @@ class BasicInvestmentEnv(MDPEnvironment):
     # ------------------------------------------------------------------
     # Analytical overrides
     # ------------------------------------------------------------------
+
+    def grid_spec(self):
+        """Grid discretization hints for discrete solvers (VFI/PFI).
+
+        Capital (endo): log-spaced grid. Dense where curvature is highest
+            (low k) and sparse where the value function is nearly linear
+            (high k). Grid size is always exactly the user-specified
+            endo_sizes value.
+
+        Productivity (exo): log-spaced grid. z follows a log-AR(1) process,
+            so log-spacing gives uniform resolution in the natural (log)
+            coordinate of the process. Grid values are in levels (matching
+            the v2 convention that all z data is in levels).
+
+        Investment (action): linear grid over [I_min, I_max] where
+            I_min = k_min − (1−δ)·k_max and I_max = k_max − (1−δ)·k_min
+            are the tightest state-independent feasible bounds.
+        """
+        from src.v2.solvers.grid import GridAxis
+        return {
+            "endo":   [GridAxis(self.k_min, self.k_max, spacing="log")],
+            "exo":    [GridAxis(self.z_min, self.z_max, spacing="log")],
+            "action": [GridAxis(self.I_min, self.I_max, spacing="linear")],
+        }
 
     def compute_reward_scale(self, n_samples: int = 1000,
                              seed: tf.Tensor = None) -> float:

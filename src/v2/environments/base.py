@@ -288,6 +288,36 @@ class MDPEnvironment(ABC):
     # Optional methods — override as needed
     # ------------------------------------------------------------------
 
+    def grid_spec(self):
+        """Per-variable grid discretization hints for discrete solvers.
+
+        Returns a dict with keys 'endo', 'exo', 'action', each mapping to
+        a list of GridAxis (one per variable in that group).  The solver
+        reads this spec and builds grids mechanically — all domain knowledge
+        stays inside the environment.
+
+        Two spacing options:
+            - "linear": uniform spacing (default for actions).
+            - "log":    denser at low values (use for capital, productivity).
+
+        Return None (default) to let the solver fall back to linspace grids
+        derived from action_bounds() and sampled state ranges.
+
+        Example override::
+
+            from src.v2.solvers.grid import GridAxis
+            def grid_spec(self):
+                return {
+                    "endo":   [GridAxis(self.k_min, self.k_max, spacing="log")],
+                    "exo":    [GridAxis(self.z_min, self.z_max, spacing="log")],
+                    "action": [GridAxis(-self.k_max, self.k_max)],
+                }
+
+        Returns:
+            Dict[str, List[GridAxis]] or None.
+        """
+        return None
+
     def euler_residual(
         self, s: tf.Tensor, a: tf.Tensor,
         s_next: tf.Tensor, a_next: tf.Tensor,
@@ -325,7 +355,7 @@ class MDPEnvironment(ABC):
     def exo_stationary_mean(self) -> tf.Tensor:
         """Stationary mean of the exogenous state, shape (exo_dim,).
 
-        Used by the default terminal_value to construct s̄ = [s_endo | s̄_exo].
+        Used by terminal_value (LR method) to construct s̄ = [s_endo | s̄_exo].
         Override in subclass.
         """
         raise NotImplementedError(
@@ -346,7 +376,13 @@ class MDPEnvironment(ABC):
     def terminal_value(
         self, s_endo: tf.Tensor, temperature: float = 1e-6
     ) -> tf.Tensor:
-        """Terminal value V^term(s_endo) = r(s̄, ā) / (1-γ).
+        """Analytical terminal value V^term(s_endo) = r(s̄, ā) / (1-γ).
+
+        LR-method specific.  This is an analytical steady-state perpetuity
+        used by the Lifetime Reward (LR) trainer to approximate continuation
+        value beyond the rollout horizon.  It does NOT involve a learned
+        value network — methods that learn V_φ (SHAC, BRM) use the network
+        bootstrap instead and do not call this method.
 
         Constructs s̄ = [s_endo | s̄_exo] and ā = stationary_action(s_endo),
         then computes the steady-state perpetuity.  Gradients flow through

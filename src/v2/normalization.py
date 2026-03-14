@@ -1,62 +1,73 @@
 """Observation normalization for v2 generic framework.
 
-Running Z-Score normalizer using exponential moving average (EMA) of
-per-feature mean and variance. Standard approach in OpenAI Baselines,
-Stable-Baselines3, and CleanRL.
+Static Z-score normalizer: fitted once from the full training dataset
+before gradient steps begin, then frozen for the entire round.
 
-Usage:
-    normalizer = RunningZScore(dim=state_dim, momentum=0.01)
+Design rationale
+----------------
+All v2 training methods use pre-generated fixed datasets, so exact
+population statistics are computable in a single pass before training
+starts.  There is no need for incremental (EMA) estimation during
+training, and no warmup phase is required.
 
-    # During training — update stats then normalize:
-    normalizer.update(batch)
-    x_norm = normalizer.normalize(batch)
+The exogenous and endogenous state components are fitted from different
+data sources.  See fit_normalizer_traj() and fit_normalizer_flat() in
+src/v2/data/pipeline.py for the construction details.
 
-    # During evaluation — normalize only (stats frozen):
-    x_norm = normalizer.normalize(batch)
+Usage
+-----
+    normalizer = StaticNormalizer(dim=state_dim)
+
+    # Before training (once per round):
+    normalizer.fit(s_all)          # s_all: (N, state_dim)
+
+    # During training (always frozen):
+    x_norm = normalizer.normalize(x)
 """
 
 import tensorflow as tf
 
 
-class RunningZScore(tf.Module):
-    """Exponential moving average z-score normalizer.
+class StaticNormalizer(tf.Module):
+    """Z-score normalizer fitted once from the full dataset.
 
-    Maintains running estimates of per-feature mean and variance via EMA:
-        running_mean ← (1 - α) * running_mean + α * batch_mean
-        running_var  ← (1 - α) * running_var  + α * batch_var
-
-    Then normalizes:  x_norm = (x - running_mean) / sqrt(running_var + ε)
+    Computes exact per-feature mean and standard deviation from the
+    supplied data tensor and stores them as non-trainable variables.
+    After fit(), normalize() applies the frozen transform for the rest
+    of the round.  Refit at the start of each round from fresh data.
 
     Args:
-        dim: number of input features.
-        momentum: EMA update rate α. Higher = adapts faster, noisier.
-        epsilon: small constant for numerical stability in division.
+        dim:     Number of input features (state dimension).
+        epsilon: Small constant added to std for numerical stability.
     """
 
-    def __init__(self, dim: int, momentum: float = 0.001,
-                 epsilon: float = 1e-8, name: str = "running_zscore"):
+    def __init__(self, dim: int, epsilon: float = 1e-8,
+                 name: str = "normalizer"):
         super().__init__(name=name)
-        self.momentum = momentum
+        self.dim     = dim
         self.epsilon = epsilon
-        self.running_mean = tf.Variable(
-            tf.zeros(dim), trainable=False, name="running_mean")
-        self.running_var = tf.Variable(
-            tf.ones(dim), trainable=False, name="running_var")
-        self.count = tf.Variable(0, dtype=tf.int64, trainable=False,
-                                 name="count")
+        self.mean = tf.Variable(tf.zeros(dim), trainable=False, name="mean")
+        self.std  = tf.Variable(tf.ones(dim),  trainable=False, name="std")
 
-    def update(self, batch: tf.Tensor) -> None:
-        """Update running statistics from a batch. Call during training only."""
-        batch_mean = tf.reduce_mean(batch, axis=0)
-        batch_var = tf.math.reduce_variance(batch, axis=0)
-        alpha = self.momentum
-        self.running_mean.assign(
-            (1.0 - alpha) * self.running_mean + alpha * batch_mean)
-        self.running_var.assign(
-            (1.0 - alpha) * self.running_var + alpha * batch_var)
-        self.count.assign_add(1)
+    def fit(self, data: tf.Tensor) -> None:
+        """Compute exact mean and std from the full dataset.
+
+        Call once before gradient training begins.  data should contain
+        all representative states for the round (see pipeline helpers).
+
+        Args:
+            data: Tensor of shape (N, dim) containing state observations.
+        """
+        self.mean.assign(tf.reduce_mean(data, axis=0))
+        self.std.assign(tf.math.reduce_std(data, axis=0))
 
     def normalize(self, x: tf.Tensor) -> tf.Tensor:
-        """Normalize using current running statistics."""
-        std = tf.sqrt(self.running_var + self.epsilon)
-        return (x - self.running_mean) / std
+        """Apply frozen z-score normalization.
+
+        Args:
+            x: Input tensor of shape (..., dim).
+
+        Returns:
+            Normalized tensor, same shape as x.
+        """
+        return (x - self.mean) / (self.std + self.epsilon)

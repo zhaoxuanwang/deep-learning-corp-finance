@@ -54,7 +54,8 @@ A Markov Decision Process (MDP) is defined as a collection $(\mathcal{S}, \mathc
 | $\mathcal{E}$                                                          | **Shock space**. The space from which exogenous shocks $\varepsilon$ are drawn. When dynamics are deterministic, $\mathcal{E} = \emptyset$.                                                                                                                                                                                                                                                                                       |
 | $f: \mathcal{S} \times \mathcal{A} \times \mathcal{E} \to \mathcal{S}$ | **State transition function/dynamics**. Given current state $s$, action $a$, and exogenous shock $\varepsilon \in \mathcal{E}$, the next state is $s' = f(s, a, \varepsilon)$. When dynamics are deterministic, the shock argument is absent and $f: \mathcal{S} \times \mathcal{A} \to \mathcal{S}$. When the dynamics involve both exogenous and endogenous components, they are combined into a single vector-valued function. |
 | $r: \mathcal{S} \times \mathcal{A} \to \mathbb{R}$                     | **Reward function**. A scalar signal $r(s, a)$ received after taking action $a$ in state $s$ (e.g., utility, profit).                                                                                                                                                                                                                                                                                                             |
-| $\gamma \in (0, 1)$                                                    | **Discount factor**. Controls the trade-off between immediate and future rewards.                                                                                                                                                                                                                                                                                                                                                 |
+| $\gamma \in (0, 1)$                                                    | **Discount factor**. Controls the trade-off between immediate and future rewards.                                                                                |
+
 A full sequence of actions and states is defined as a **trajectory** or **rollouts** $\tau$:
 $$ \tau = (s_0,a_0,s_1,a_1,\dots)$$
 where the initial state $s_0$ is randomly sampled from some distribution $p_0$. The state transitions are **deterministic** according to the transition function $f$:
@@ -191,6 +192,241 @@ Although the projection method provides a continuous approximation by eliminatin
 10. **Return** $\hat{V}(\cdot;\,\boldsymbol{\theta}^*)$, $\pi^*$
 
 ---
+# Data Pipeline and Training Workflow
+
+This section describes how synthetic training data is generated, the design principles behind the data pipeline, and the full training workflow. The framework is model-agnostic: it applies to any Markov decision process with known dynamics.
+
+## Design Principles {#sec-data-design}
+
+### Separation of simulation and training
+
+Data generation and training are strictly separated. The data generator produces a complete, fixed dataset $\mathcal{D}$ before training begins. The trainer is stateless with respect to simulation: it contains no RNG for data generation, no simulation logic, and no buffer management. Two runs with the same $\mathcal{D}$ and the same optimizer seed produce identical training trajectories.
+
+This provides three concrete benefits. First, when training fails, the cause is unambiguously in the optimizer or the network, not in the data. Second, the loss at any checkpoint is computed on the same distribution, so loss curves reflect optimization progress rather than distributional shift. Third, ablation studies are clean: changing a training hyperparameter changes nothing about the data.
+
+### The distributional mismatch problem
+
+All residual-based methods minimize $J(\theta) = \mathbb{E}_{s \sim \xi}[\ell(s; \theta)^2]$, where $\xi$ is the distribution over evaluation states. The ideal $\xi$ is the ergodic distribution $\xi^*$ of the Markov chain under the optimal policy $\pi^*$, because this concentrates approximation quality where the economy spends time. But $\xi^*$ depends on $\pi^*$, which is the object being solved for. As the policy improves during training, the induced distribution shifts, and evaluation points drawn under earlier policies become stale. @fern26 (Section 2.5) calls this the equilibrium loop.
+
+**Low-dimensional case.** For small state spaces, the problem is sidestepped by sampling uniformly from a bounded domain wide enough to contain the ergodic set. The wasted computation on non-ergodic states is acceptable. @fern26 recommends this for low-dimensional problems.
+
+**Method-dependent asymmetry.** The mismatch affects methods differently. LRM rolls out full trajectories under $\pi_\theta$ during training, so its endogenous states are approximately ergodic under the current policy and update automatically as $\theta$ improves — LRM gets implicit ergodic sampling for free. ER and BR use the flattened format where endogenous states are uniform draws from data generation time, never recomputed under any policy. The exogenous states are ergodic (policy-independent), but the endogenous states are not. For low-dimensional problems this hybrid is adequate; for high-dimensional problems the uniform endogenous states become the bottleneck.
+
+**High-dimensional case: the equilibrium loop.** When the state dimension is large, uniform sampling of endogenous states becomes intractable. The volume of the ergodic set relative to the bounding hypercube shrinks exponentially with dimension (@maliar21, Eq. 18): at $N_s = 10$ about 0.3% of the hypercube is relevant; at $N_s = 30$ the fraction is negligible.
+
+The solution is the equilibrium loop (@fern26, Section 2.5; @maliar21): iterate between simulation and training. (1) Guess $\theta_0$. (2) Simulate under $\pi_{\theta_0}$ to generate evaluation points on the ergodic set. (3) Train to obtain $\theta_1$. (4) Re-simulate under $\pi_{\theta_1}$. (5) Repeat until convergence. Our training workflow implements this as a sequence of **rounds** (defined precisely in the Training Workflow section), where each round generates a completely fresh dataset and trains to convergence. Within each round, the dataset is fixed and training is separated from simulation. For high-dimensional problems, the endogenous initial states at round $k \geq 1$ are harvested from the previous round's learned policy rather than sampled uniformly.
+
+Increasing the data trajectory length $T_{\text{data}}$ is always cheap — it requires only additional shock draws, no gradient computation. Setting $T_{\text{data}}$ much larger than the mixing time of the chain (on the order of 40–100 periods for typical quarterly-calibrated models) ensures that the terminal endogenous states are approximately ergodic.
+
+### Comparison with alternative data strategies
+
+**@maliar21: epoch-based simulation.** Maliar et al. implement the same equilibrium loop: simulate a panel under the current policy, train, re-simulate. Our workflow differs in implementation: we strictly separate data generation from training within each round. Maliar et al. note that their simulated data have serial correlation and recommend training on cross-sections separated in time — our flatten-and-shuffle eliminates this entirely.
+
+**Replay buffer (standard off-policy RL, Duarte 2024).** Standard off-policy reinforcement learning maintains a buffer of transitions from past policies, discarding old transitions as new ones arrive. The buffer's distribution is a path-dependent mixture across policy vintages — it corresponds to no well-defined training objective and introduces non-stationarity. Duarte's DPI uses a buffer of 500,000 states with periodic ergodic refresh. Our design avoids buffer management: within each round the dataset is fixed and stationary, and no tuning of buffer size, eviction policy, or mixing ratio is required. Between rounds, the dataset is regenerated cleanly.
+
+## Dataset Structure
+
+### Setup
+
+Consider a discrete-time MDP with state $s \in \mathcal{S} \subset \mathbb{R}^{N_s}$, action $a \in \mathcal{A} \subset \mathbb{R}^{N_a}$, transition dynamics $s' = f(s, a, \varepsilon)$ with i.i.d. shocks $\varepsilon \sim F$, reward $r(s, a)$, and discount factor $\gamma \in (0,1)$. The policy $\pi_\theta(s)$ and value function $V_\phi(s)$ are parameterized by neural networks.
+
+The state vector $s$ may contain exogenous components $s^{\text{exo}}$ (driven entirely by $\varepsilon$) and endogenous components $s^{\text{endo}}$ (influenced by $a$). This distinction matters for data generation: the exogenous path can be simulated exactly from shock draws alone, while the endogenous path depends on the policy and is computed during training, not during data generation.
+
+Both the state and action spaces are bounded; the rules for setting bounds are described in the state space section. For data generation, we take $\mathcal{S} = [s_{\min}, s_{\max}]$ and $\mathcal{A} = [a_{\min}, a_{\max}]$ as given.
+
+### Trajectory Simulation
+
+The data generator produces $L$ independent trajectories of length $T_{\text{data}}$, where $T_{\text{data}}$ is deliberately set large enough for the endogenous chain to mix (typically $T_{\text{data}} \geq 40\text{--}100$ periods for quarterly-calibrated models). Note that $T_{\text{data}}$ is a data generation parameter that controls trajectory length, distinct from $T_{\text{bptt}}$ which controls the truncation horizon for BPTT in the LRM trainer ($T_{\text{bptt}} \leq T_{\text{data}}$).
+
+The exogenous and endogenous components of the initial state are sampled separately: $s_0^{\text{endo},i}$ and $s_0^{\text{exo},i} \sim \text{Uniform}(\mathcal{S}^{\text{exo}})$, each with its own dedicated RNG stream. The source of $s_0^{\text{endo},i}$ depends on the round and the problem dimension (see Training Workflow). For each trajectory, $M$ independent shock sequences $\varepsilon^{(1)}, \ldots, \varepsilon^{(M)} \sim F$ are drawn and used to roll out the full exogenous state paths. The stored trajectory is:
+$$\mathcal{T}^i = \left(s_{0}^{\text{endo},i},\; \{s_t^{\text{exo},i}\}_{t=0}^{T_{\text{data}}},\; \{s_t^{\text{exo},\text{fork},i}\}_{t=1}^{T_{\text{data}}}\right), \quad i = 1, \ldots, L$$
+
+where the exogenous paths are computed at generation time via the policy-independent transition $s^{\text{exo}}_{t+1} = g(s^{\text{exo}}_t, \varepsilon_{t+1})$. Raw shocks are consumed internally by the data generator and are not stored. This is possible because the exogenous and endogenous state transitions are treated separately: $g$ depends only on $s^{\text{exo}}$ and $\varepsilon$ and can be evaluated without the policy, whereas the endogenous transition $h(s_t, \pi_\theta(s_t), \varepsilon_{t+1})$ requires $\pi_\theta$ and is computed during training. The data generator is model-agnostic because each environment specifies $g$ explicitly.
+
+The endogenous path cannot be pre-computed and is handled differently by each method:
+
+- **LRM (trajectory-based):** The trainer rolls out the full endogenous state sequence on-the-fly under the current $\pi_\theta$ at each training step, using the pre-computed $\{s_t^{\text{exo}}\}$ from the dataset as a fixed exogenous backdrop. The BPTT truncation horizon $T_{\text{bptt}}$ controls how many steps gradients flow backward through; this can be much shorter than $T_{\text{data}}$. No additional randomness enters the trainer.
+
+- **ER/BR (one-step methods):** The flattened format pairs each endogenous initial state with a pre-computed exogenous transition. The source of endogenous states depends on the round: uniform draws at round 0, and harvested ergodic states at subsequent rounds for high-dimensional problems (see Training Workflow).
+
+### Main Path and Fork Paths
+
+Multiple shock realizations per trajectory enable Monte Carlo estimation of expectations over future states.
+
+**Main path.** The first shock sequence $\{\varepsilon_t^{(1)}\}$ drives a continuous chain of exogenous states, providing the trajectory for lifetime reward calculations (LRM).
+
+**Fork paths.** At each step $t$, the remaining sequences branch from the main path's current state:
+$$s^{\text{exo},\text{fork}(m)}_{t+1} = g(s^{\text{exo}}_t, \varepsilon_{t+1}^{(m)}), \quad m = 2, \ldots, M$$
+
+Each fork is a one-step transition from the main path, not a parallel chain.
+
+```
+Main path:   s0 -> s1 -> s2 -> s3 -> ... -> sT
+               \     \     \     \
+Fork 1:        s1F   s2F   s3F   sTF
+Fork 2:        s1F'  s2F'  s3F'  sTF'
+  ...
+```
+
+With $M = 2$, the cross-product of main and fork transitions provides the AiO variance-reduced estimator (@maliar21) used by ER and BR. Simulating $M > 2$ fork paths yields a lower-variance Monte Carlo estimator for $\mathbb{E}_{\varepsilon}[\cdot \mid s_t]$ (@pascal24_JDEC). This is a pure data generation choice that does not affect the training algorithm.
+
+### Flattened Format
+
+One-step methods (ER, BR, actor-critic) require i.i.d. samples, not full trajectories. The flattened dataset provides each observation as a single-step transition with pre-computed exogenous next states:
+$$\text{Obs} = \left(s^{\text{endo}},\; s^{\text{exo}},\; s^{\text{exo},\prime(1)},\; s^{\text{exo},\prime(2)}\right)$$
+
+where $s^{\text{exo}}$ is extracted from the trajectory's main path and $s^{\text{exo},\prime(1)}, s^{\text{exo},\prime(2)}$ are the pre-computed main and fork next states. Because all exogenous transitions are resolved at generation time, the trainer calls no RNG and performs no simulation — it uses $s^{\text{exo},\prime}$ directly. The endogenous states are sampled uniformly from $\mathcal{S}^{\text{endo}}$, independently for each observation — no policy exists at data generation time. After construction, all observations are pooled and shuffled to break the serial correlation in exogenous states. The resulting dataset has $L \times T$ i.i.d. observations.
+
+Both LRM and one-step methods train on the same underlying exogenous trajectories; only the batching and the treatment of endogenous states differ.
+
+### Validation and Test Sets
+
+- **Validation set**: Regenerated each round alongside the training set ($N_{\text{val}} = 10n$ where $n$ is the training batch size), used for early stopping within a round
+- **Test set**: Generated once before training begins and sealed ($N_{\text{test}} = 50n$), used for cross-round convergence and final evaluation
+
+The test set uses a separate RNG stream and is never regenerated, providing a stable reference across rounds.
+
+## Training Workflow {#sec-workflow}
+
+Training is organized as a sequence of **rounds**, where each round generates a completely fresh dataset and trains the policy to within-round convergence. This prevents the network from overfitting to specific exogenous shock realizations and ensures that the training distribution remains representative. We adopt the following terminology hierarchy:
+
+- **Round** $k = 0, 1, 2, \ldots$: one complete data-generation-then-training cycle. Each round produces a fresh dataset.
+- **Epoch**: one full pass through the dataset within a round (standard ML convention).
+- **Step** $j$: one mini-batch gradient update.
+
+### Round Structure
+
+Each round $k$ proceeds in three stages: data generation, training, and evaluation.
+
+**Stage 1: Data generation.** A completely fresh dataset $\mathcal{D}^{(k)}$ is generated at the start of each round. This includes new exogenous initial states, new shock sequences, and new exogenous trajectory rollouts. The endogenous initial states are sourced differently depending on the round and problem dimension (see below). A fresh validation set $\mathcal{D}^{(k)}_{\text{val}}$ is generated alongside.
+
+**Stage 2: Training.** The generic trainer receives the fixed dataset $\mathcal{D}^{(k)}$ and runs SGD with mini-batching. Training proceeds for a number of steps determined by the dataset size and batch size: given $N$ observations and batch size $B$, one epoch (full pass) requires $N/B$ steps; training may run for multiple epochs without replacement until the dataset is exhausted each pass. The input normalizer is warmed up on the training states before gradient steps begin. Early stopping within a round is based on the validation set $\mathcal{D}^{(k)}_{\text{val}}$.
+
+- **LRM:** rolls out endogenous states on-the-fly under $\pi_\theta$ using the pre-computed exogenous paths as a fixed backdrop; BPTT truncation horizon is $T_{\text{bptt}} \leq T_{\text{data}}$.
+- **ER/BR:** uses the flattened format with pre-computed exogenous transitions directly — no simulation.
+
+**Stage 3: Cross-round evaluation.** After training completes, the policy $\pi_{\theta_{k+1}}$ is evaluated on the sealed test set $\mathcal{D}_{\text{test}}$. Training terminates when the test metric stabilizes across rounds.
+
+### Endogenous State Initialization
+
+The only difference between low-dimensional and high-dimensional problems is how endogenous initial states are sourced at round $k \geq 1$.
+
+**Round 0** (both cases): All initial states are sampled uniformly. $s_0^{\text{endo}} \sim \text{Uniform}(\mathcal{S}^{\text{endo}})$ and $s_0^{\text{exo}} \sim \text{Uniform}(\mathcal{S}^{\text{exo}})$.
+
+**Round $k \geq 1$, low-dimensional:** Endogenous initial states are sampled uniformly $s_0^{\text{endo}} \sim \text{Uniform}(\mathcal{S}^{\text{endo}})$, same as round 0. The purpose of additional rounds is solely to train on fresh exogenous realizations, preventing overfitting to specific shock paths.
+
+**Round $k \geq 1$, high-dimensional (ergodic harvest):** Before generating the new dataset, a harvest step collects approximately ergodic endogenous states from the previous round. For each trajectory $i$ in $\mathcal{D}^{(k-1)}_{\text{traj}}$, the learned policy $\pi_{\theta_k}$ is rolled out along the stored exogenous path $\{s_t^{\text{exo},i}\}_{t=0}^{T_{\text{data}}}$ to produce the endogenous trajectory, and the terminal state $s_{T_{\text{data}}}^{\text{endo},i}$ is collected. Because $T_{\text{data}}$ exceeds the mixing time of the endogenous chain, these terminal states are approximately ergodic under $\pi_{\theta_k}$. The harvested states are used as $s_0^{\text{endo}}$ for the new dataset. All exogenous components ($s_0^{\text{exo}}$, shock sequences, exogenous paths) are freshly generated.
+
+### Pseudocode
+
+```
+Setup:
+   Generate sealed test set D_test (fixed across all rounds)
+
+Round 0:
+   [Data generation]
+   Sample s_endo_0 ~ Uniform(S^endo), s_exo_0 ~ Uniform(S^exo)
+   Draw M fresh shock sequences; roll out exogenous paths of length T_data
+   Store D_traj_0 = {(s_endo_0, {s_exo_t}_{t=0}^{T_data}, {s_exo_fork_t}_{t=1}^{T_data})}
+   Flatten and shuffle into D_flat_0 for one-step methods
+   Generate validation set D_val_0 (same procedure, separate RNG)
+
+   [Training]
+   Train on D_0 with mini-batching; early stop via D_val_0 → θ_1
+
+Round k (k ≥ 1):
+   [Harvest — high-dim only]
+   For each trajectory i in D_traj_{k-1}:
+     Roll out endogenous states under π_{θ_k} along stored exogenous path
+     Collect terminal state s_endo_{T_data, i} as ergodic initial state
+
+   [Data generation]
+   Sample s_exo_0 ~ Uniform(S^exo); draw M fresh shock sequences
+   Roll out new exogenous paths of length T_data
+   Sample s_endo_0:
+     Low-dim:  ~ Uniform(S^endo)
+     High-dim: from harvested {s_endo_{T_data, i}}
+   Store D_traj_k; flatten and shuffle into D_flat_k
+   Generate validation set D_val_k (same procedure, separate RNG)
+
+   [Training]
+   Train on D_k with mini-batching; early stop via D_val_k → θ_{k+1}
+
+   [Cross-round convergence]
+   Evaluate π_{θ_{k+1}} on sealed D_test; stop when test metric stabilizes
+```
+
+### Key Invariants
+
+1. **Fresh data each round.** Every round generates completely new exogenous paths and shock sequences. No exogenous data is reused across rounds, preventing overfitting to specific shock realizations.
+2. **Stateless trainer.** The trainer receives a fixed dataset dict, contains no RNG for data generation, and performs no simulation. Two runs with the same dataset and optimizer seed produce identical results.
+3. **Fixed within round.** Within each round, the dataset is constant. Loss curves reflect optimization progress, not distributional shift. Ablation studies are clean.
+4. **Sealed test set.** The test set is generated once at setup and never regenerated, providing the sole stable reference for cross-round convergence.
+5. **Single branch point.** The only difference between low-dimensional and high-dimensional workflows is the source of $s_0^{\text{endo}}$ at round $k \geq 1$.
+
+## Application: Corporate Finance Model
+
+The state vector is $s = (k, b, z)$ where $k$ is capital (endogenous), $b$ is debt (endogenous), and $z$ is productivity (exogenous). The action is $a = k'$ (next-period capital). The exogenous transition is $\ln z_{t+1} = (1-\rho)\mu + \rho \ln z_t + \sigma \varepsilon_t$.
+
+Each trajectory sample $i$ at round $k$ contains:
+$$\left(k_{0,i},\; b_{0,i},\; \{z_{t,i}\}_{t=0}^{T_{\text{data}}},\; \{z_{t,i}^{\text{fork}}\}_{t=1}^{T_{\text{data}}}\right)$$
+where the exogenous initial state $z_0 \sim \text{Uniform}([z_{\min}, z_{\max}])$ (in levels), and the full exogenous trajectories $z_{1:T_{\text{data}}}$ (main path) and $z_{1:T_{\text{data}}}^{\text{fork}}$ (one-step branches for the AiO estimator) are pre-computed from $M = 2$ shock sequences at generation time. Endogenous initial states $(k_0, b_0)$ are sampled uniformly from $\mathcal{S}^{\text{endo}}$ at every round (low-dimensional case). For the one-step ER/BR dataset, the trajectories are flattened into $(k_i, b_i, z_i, z_{i}^{\prime(1)}, z_{i}^{\prime(2)})$ with $(k, b)$ sampled i.i.d. uniform.
+
+The basic model and the risky debt model are trained on the same dataset. The basic model simply ignores $b_0$ and the debt dimension.
+
+## RNG Seed Schedule
+
+Reproducibility requires deterministic random number generation. The framework uses TensorFlow's stateless random functions (`tf.random.stateless_*`) which produce identical outputs given identical seed pairs, regardless of call order.
+
+**Master Seed**
+
+A master seed pair $\mathbf{s}^{\text{master}} = (m_0, m_1)$ anchors all randomness.
+
+**Split Seeds**
+
+Disjoint seeds for each dataset split and round $k$:
+$$\mathbf{s}^{\text{train},(k)} = (m_0 + 100, \; m_1 + k), \quad \mathbf{s}^{\text{val},(k)} = (m_0 + 200, \; m_1 + k), \quad \mathbf{s}^{\text{test}} = (m_0 + 300, \; m_1)$$
+
+The test seed has no round index — it is generated once and sealed.
+
+**Variable IDs**
+
+Each random variable has a fixed ID:
+
+| Variable            | ID  |
+| ------------------- | --- |
+| $k_0$               | 1   |
+| $z_0$               | 2   |
+| $b_0$               | 3   |
+| $\varepsilon^{(1)}$ | 4   |
+| $\varepsilon^{(2)}$ | 5   |
+| shuffle             | 6   |
+
+**Training Seeds by Round and Variable**
+
+For round $k$ and variable $x$:
+$$\mathbf{s}^{\text{train},(k)}_{x} = (m_0 + 100 + \text{VarID}(x), \; m_1 + k)$$
+
+This ensures each round $k$ receives unique, reproducible random draws. Different rounds produce completely independent datasets because the round index $k$ shifts the second seed component.
+
+**Validation Seeds**
+
+Regenerated each round alongside training data:
+$$\mathbf{s}^{\text{val},(k)}_{x} = (m_0 + 200 + \text{VarID}(x), \; m_1 + k)$$
+
+**Test Seeds**
+
+Generated once (no round index):
+$$\mathbf{s}^{\text{test}}_{x} = (m_0 + 300 + \text{VarID}(x), \; m_1)$$
+
+This schedule guarantees:
+
+1. **Reproducibility**: Identical master seed and round index produce identical data across runs
+2. **Fresh data each round**: Different rounds receive independent shock sequences and initial states
+3. **Common random numbers**: Different methods trained at the same round $k$ share the same data, enabling fair comparison
+4. **No leakage**: Train/validation/test sets use disjoint RNG streams; the test set is independent of the round index
+
+
 # Deep Learning Methods
 This section presents three deep learning solution methods introduced by Maliar et al. (2021) and reviewed by @fern26. All three methods parameterize the policy $\pi_\theta: \mathcal{S} \to \mathcal{A}$ as a neural network and train it by minimizing a loss function $J(\theta)$ via SGD. They differ in which optimality condition defines the loss. For the Bellman residual method, an additional value function network $V_\phi: \mathcal{S} \to \mathbb{R}$ is jointly trained.
 
@@ -227,31 +463,31 @@ Splitting at a finite horizon $T$ gives an exact decomposition:
 $$V^{\pi}(s_0) = \mathbb{E}\left[\sum_{t=0}^{T-1} \gamma^t \, r(s_t, \pi_\theta(s_t))\right] + \gamma^T \, \mathbb{E}\left[V^{\pi}(s_T)\right]$$
 where the second term is the discounted expected continuation value from the terminal state $s_T$ onward.
 
-**Truncated objective.** @maliar21 approximate the true objective by dropping the continuation term, setting $V^{\text{term}}(s_T) = 0$:
+**Truncated objective.** @maliar21 approximate the true objective by dropping the continuation term, setting $\hat{V}^{\text{term}}(s_T) = 0$:
 $$\max_\theta \; J_T(\theta) = \mathbb{E}_{(s_0,\,\epsilon_1,\dots,\epsilon_T)}\left[\sum_{t=0}^{T-1} \gamma^t \, r(s_t, \pi_\theta(s_t))\right]$$
 This is valid when $T$ is large enough that $\gamma^T V^{\pi}(s_T) \approx 0$. However, the discount factor contracts this term slowly: with $\gamma = 0.96$, keeping the truncation bias below 1\% of the true value requires $T \geq \lceil\log(0.01)/\log(0.96)\rceil = 113$ periods. BPTT through such a long chain is computationally prohibitive — gradient memory scales linearly in $T$, and vanishing or exploding gradients compound across the chain.
 
 **Key property.** The entire trajectory is generated by composing $\pi_\theta$ and $f$, so the loss is end-to-end differentiable — gradients flow backward through the trajectory via backpropagation through time. This requires $r$ and $f$ to be differentiable with respect to the action.
 
 ### Terminal Value Correction
-Rather than increasing $T$ to reduce the truncation bias, we approximate the continuation value $V^{\pi}(s_T)$ by exploiting the structure of the MDP.
+Rather than increasing $T$ to reduce the truncation bias, we approximate the continuation value by exploiting the structure of the MDP. The true continuation value from the terminal state $s_T$ is:
+$$V^{\pi}(s_T) = \mathbb{E}\left[\sum_{t=0}^{\infty} \gamma^t \, r(s_{T+t},\, \pi(s_{T+t})) \;\middle|\; s_T\right]$$
+which integrates over all future shock realizations and the policy's dynamic response to them. We replace this with a closed-form approximation that uses only model primitives.
 
 **Terminal value formula.** Define:
 $$\bar{s} = [s^{\text{endo}} \mid \bar{s}^{\text{exo}}], \qquad \bar{a} = \bar{a}(s^{\text{endo}})$$
-where $\bar{s}^{\text{exo}}$ is a summary of the stationary exogenous distribution (e.g., its mean), and $\bar{a}(s^{\text{endo}})$ is the action implied by stationarity of the endogenous state, i.e., the action satisfying $f^{\text{endo}}(s^{\text{endo}}, \bar{a}) = s^{\text{endo}}$. Both are functions of $s^{\text{endo}}$ alone — the exogenous summary and the stationarity condition are model constants provided by the environment. The terminal value is a geometric perpetuity:
-$$V^{\text{term}}(s^{\text{endo}}) = \frac{r(\bar{s},\, \bar{a})}{1 - \gamma}$$
-
-**Estimate at training iteration $j$.** The formula $V^{\text{term}}$ is a fixed function that does not depend on the policy parameters $\theta$. During training, we evaluate it at $s_{T,j}^{\text{endo}}$, the terminal endogenous state obtained by rolling out the current policy $\pi_{\theta_j}$ for $T$ steps:
-$$\hat{V}^{\text{term}}_j = V^{\text{term}}(s_{T,j}^{\text{endo}})$$
+where $\bar{s}^{\text{exo}} = \mathbb{E}[s^{\text{exo}}_\infty]$ is the stationary mean of the exogenous process, and $\bar{a}(s^{\text{endo}})$ is the action satisfying $f^{\text{endo}}(s^{\text{endo}}, \bar{a}) = s^{\text{endo}}$, the action that holds the endogenous state constant. Both are functions of $s^{\text{endo}}$ alone and are model constants provided by the environment. The approximation replaces the stochastic future with a deterministic steady state in which the exogenous state is frozen at its mean and the agent repeats the stationary action forever. The continuation then reduces to a geometric perpetuity. During training, we evaluate it at $s_{T}^{\text{endo}}$, the terminal endogenous state obtained by rolling out the current policy $\pi_{\theta}$ for $T$ steps:
+$$\hat{V}^{\text{term}}(s_T^{\text{endo}}) = \frac{r(\bar{s},\, \bar{a})}{1 - \gamma}$$
+The formula is a fixed function of $s^{\text{endo}}$ that does not depend on $\theta$.
 
 **Loss.** The SGD loss with terminal value correction, evaluated over a mini-batch $\mathcal{B}$:
-$$J(\theta) = -\frac{1}{|\mathcal{B}|}\sum_{i \in \mathcal{B}} \left(\sum_{t=0}^{T-1} \gamma^t \cdot r(s_{it}, \pi_\theta(s_{it})) + \gamma^T \, \hat{V}^{\text{term}}_j(s_{iT}^{\text{endo}})\right)$$
-Setting $V^{\text{term}} = 0$ recovers the truncated objective of @maliar21. In the BPTT computation, $\hat{V}^{\text{term}}_j$ should be differentiable with respect to $s_{T,j}^{\text{endo}}$ so that gradients prevent the policy from de-investing near the horizon, but should not route gradients through the policy network at the terminal step to avoid $1/(1-\gamma)$ gradient amplification through the BPTT chain.
+$$J(\theta) = -\frac{1}{|\mathcal{B}|}\sum_{i \in \mathcal{B}} \left(\sum_{t=0}^{T-1} \gamma^t \cdot r(s_{it}, \pi_\theta(s_{it})) + \gamma^T \, \hat{V}^{\text{term}}(s_{iT}^{\text{endo}})\right)$$
+Setting $\hat{V}^{\text{term}} = 0$ recovers the truncated objective of @maliar21. In the BPTT computation, $\hat{V}^{\text{term}}$ should be differentiable with respect to $s_{T}^{\text{endo}}$ so that gradients prevent the policy from de-investing near the horizon, but should not route gradients through the policy network at the terminal step to avoid $1/(1-\gamma)$ gradient amplification through the BPTT chain.
 
-The LRM terminal value exploits known model structure — the dynamics and the stationary exogenous distribution — to approximate the continuation value analytically. The Bellman Residual Minimization method takes an alternative approach: it trains a separate value network $V_\phi$ to approximate $V^*(s)$ directly, bypassing the need for structural assumptions about the terminal state.
+The gap between $\hat{V}^{\text{term}}$ and the true continuation $V^{\pi}$ arises because the perpetuity ignores future exogenous volatility and the agent's dynamic response to it. We analyze the magnitude and structure of this approximation error below.
 
 ### Algorithm 4: Lifetime Reward Maximization
-**Input:** Policy network $\pi_\theta$, dynamics $f$, reward $r$, discount $\gamma$, horizon $T$, terminal value $V^{\text{term}}$, learning rate $\eta$, convergence rule $\texttt{CONVERGED}(\theta, j)$
+**Input:** Policy network $\pi_\theta$, dynamics $f$, reward $r$, discount $\gamma$, horizon $T$, terminal value $\hat{V}^{\text{term}}$, learning rate $\eta$, convergence rule $\texttt{CONVERGED}(\theta, j)$
 
 **Output:** Trained policy $\pi^*_{\theta}$
 
@@ -260,7 +496,7 @@ The LRM terminal value exploits known model structure — the dynamics and the s
 3. $\quad$ Sample mini-batch $\mathcal{B}$ consisting of initial states $\{s_0\}_i$ and shock sequences $\{\epsilon_1,\dots,\epsilon_T\}_{i}$
 4. $\quad$ **For** each observation $i \in \mathcal{B}$, rollout trajectory:
 5. $\qquad$ **For** $t = 0, \ldots, T-1$: simulate $a_{i,t} = \pi_\theta(s_{i,t})$ and $s_{i,t+1} = f(s_{i,t}, a_{i,t}, \epsilon_{i,t+1})$
-6. $\quad$ Compute loss: $J(\theta) = -\frac{1}{|\mathcal{B}|}\sum_{i \in \mathcal{B}} \left(\sum_{t=0}^{T-1} \gamma^t \cdot r(s_{it}, \pi_\theta(s_{it})) + \gamma^T \, \hat{V}^{\text{term}}_j(s_{iT}^{\text{endo}})\right)$
+6. $\quad$ Compute loss: $J(\theta) = -\frac{1}{|\mathcal{B}|}\sum_{i \in \mathcal{B}} \left(\sum_{t=0}^{T-1} \gamma^t \cdot r(s_{it}, \pi_\theta(s_{it})) + \gamma^T \, \hat{V}^{\text{term}}(s_{iT}^{\text{endo}})\right)$
 7. $\quad$ SGD update: $\theta \leftarrow \theta - \eta \cdot \nabla_\theta J(\theta)$
 8. $\quad$**If** $\texttt{CONVERGED}(\theta, j)$ **then** **break**
 9. **End for**
@@ -268,32 +504,37 @@ The LRM terminal value exploits known model structure — the dynamics and the s
 
 ### Why the Terminal Value Correction Works
 
-The ideal bootstrap is the true value function $V^*(s_T) = \mathbb{E}[\sum_{t \geq T} \gamma^{t-T} r_t \mid s_T]$, which requires integrating over all future shock paths and is unavailable in closed form. The perpetuity formula approximates it by exploiting the endogenous-exogenous state decomposition.
+The true continuation value $V^{\pi}(s_T) = \mathbb{E}[\sum_{t \geq T} \gamma^{t-T} r(s_t, \pi(s_t)) \mid s_T]$ integrates over all future shock paths and the agent's dynamic response to them. The perpetuity formula approximates it by exploiting the endogenous-exogenous state decomposition.
 
-**Endogenous and exogenous states.** Recall the state decomposes as $s = [s^{\text{endo}} \mid s^{\text{exo}}]$, where $s^{\text{endo}}$ evolves under the policy and $s^{\text{exo}}$ follows an exogenous stochastic process with known distribution. At the terminal state $s_T$, we treat these two components differently:
+**What the correction exploits.** At the terminal step $T$, we treat the two state components differently:
 
-- $s_T^{\text{endo}}$: determined by the policy trajectory. After $T$ steps of optimization, we assume it is approximately stationary. We use the actual rolled-out value from BPTT.
-- $s_T^{\text{exo}}$: stochastic, but its stationary distribution is known from the model specification (e.g., the ergodic distribution of an AR(1) process). We replace it with a distributional summary $\bar{s}^{\text{exo}}$ computed from the known stationary distribution.
+- $s_T^{\text{endo}}$ is taken as given: the actual endogenous state produced by the BPTT rollout.
+- $s_T^{\text{exo}}$ is replaced by its stationary mean $\bar{s}^{\text{exo}} = \mathbb{E}[s^{\text{exo}}_\infty]$, computed from the known exogenous process.
+- The action is set to $\bar{a}(s^{\text{endo}})$, the unique action satisfying $f^{\text{endo}}(s^{\text{endo}}, \bar{a}) = s^{\text{endo}}$.
 
-**Bias decomposition.** The approximation error of $\hat{V}^{\text{term}}_j$ relative to the true continuation value $V^*(s_T)$ decomposes as:
-$$\hat{V}^{\text{term}}_j - V^*(s_T) = \underbrace{V^{\text{term}}(s_{T,j}^{\text{endo}}) - V^*(s_{T,j})}_{\text{(i) formula bias}} \;+\; \underbrace{V^*(s_{T,j}) - V^*(s_T^*)}_{\text{(ii) endogenous convergence bias}}$$
-where $s_{T,j}$ is the terminal state under the current policy and $s_T^*$ is the terminal state under the true optimal policy. Term (i) is the intrinsic error of the perpetuity formula. Term (ii) reflects how far the current policy's rollout is from the optimal trajectory.
+All three ingredients (the exogenous mean, the stationarity condition, and the reward function) are model primitives. No learned quantity is needed.
 
-**Formula bias (i).** The choice of $\bar{s}^{\text{exo}}$ determines the magnitude of term (i):
+**Approximation gap.** The error of the perpetuity relative to the true continuation is:
+$$\hat{V}^{\text{term}}(s_T^{\text{endo}}) - V^{\pi}(s_T) = \frac{r(\bar{s},\, \bar{a})}{1-\gamma} - \mathbb{E}\left[\sum_{t=0}^{\infty} \gamma^t \, r(s_{T+t},\, \pi(s_{T+t})) \;\middle|\; s_T\right]$$
 
-- *Linear case.* When $r$ is linear in $s^{\text{exo}}$ (holding $s^{\text{endo}}$ and $a$ fixed), set $\bar{s}^{\text{exo}} = \mathbb{E}[s^{\text{exo}}_\infty]$, the stationary mean. By linearity, $r(\cdot, \mathbb{E}[s^{\text{exo}}]) = \mathbb{E}_{s^{\text{exo}}}[r(\cdot, s^{\text{exo}})]$ exactly, so the formula is **unbiased in expectation** over the stationary distribution. The residual conditional bias for a specific realization $s_T^{\text{exo}}$ scales as $O(|s_T^{\text{exo}} - \bar{s}^{\text{exo}}| / (1 - \gamma\rho))$, where $\rho$ is the persistence of the exogenous process.
-- *Nonlinear case.* When $r$ is nonlinear in $s^{\text{exo}}$, using the stationary mean introduces a Jensen's correction of order $O(\text{Var}(s^{\text{exo}}_\infty) \cdot r''_{s^{\text{exo}}})$, where $r''$ denotes the curvature of the reward with respect to the exogenous state. When the stationary distribution is known, this correction can in principle be computed analytically or by Monte Carlo averaging over the ergodic distribution.
+To understand its magnitude, consider the idealized case where $s_T^{\text{endo}}$ is at the optimal steady state $s^{*,\text{endo}}$. The perpetuity gives the reward at the deterministic steady state, while $V^{\pi}$ accounts for the agent's optimal response to future stochastic shocks. By the **envelope theorem**, the first-order effect of small shocks on the value function vanishes: the agent is already optimizing, so marginal perturbations in the exogenous state are absorbed by optimal policy adjustment. The gap is therefore **second-order in the exogenous volatility** $\sigma$:
+$$\hat{V}^{\text{term}}(s^{*,\text{endo}}) - V^{\pi}(s^{*,\text{endo}}, \bar{s}^{\text{exo}}) = O(\sigma^2)$$
 
-**Endogenous convergence bias (ii).** Term (ii) depends on how close $s_{T,j}^{\text{endo}}$ is to the optimal steady state. This is governed by the contraction rate of the endogenous dynamics and the quality of the current policy $\pi_{\theta_j}$, not by the discount factor.
+The $O(\sigma^2)$ residual has two components:
 
-The speed at which the endogenous state converges to its steady state is determined by how the optimal action depends on the current endogenous state. Consider two polar cases:
+1. **Jensen's correction.** The value function is generally concave in the exogenous state (due to diminishing returns). Replacing the stochastic $s^{\text{exo}}$ with its mean overstates the value by $O(\text{Var}(s^{\text{exo}}_\infty) \cdot V''_{s^{\text{exo}}})$.
+2. **Precautionary motive.** An agent facing adjustment costs benefits from the *option to respond* to future shocks. The perpetuity, which assumes a fixed action forever, ignores this option value.
 
-- When the optimal action does not depend on the current endogenous state — that is, the policy maps directly to a target steady state regardless of where the agent starts — adjustment is instantaneous. Starting from any initial condition, the endogenous state reaches its steady-state level in a single period. In this case, even $T = 1$ is sufficient for the terminal value approximation to be accurate.
-- When the optimal action depends on the current endogenous state — for example, when adjustment costs force the agent to partially correct toward the steady state each period — convergence is gradual. The number of periods required depends on how fast the dynamics contract: high adjustment costs mean slow contraction and a larger $T$ is needed, while low adjustment costs mean fast contraction and a small $T$ suffices.
+Both terms depend on the curvature of $V^{\pi}$, specifically how the optimal policy adjusts dynamically to exogenous fluctuations. This is precisely the object that $\pi_\theta$ is being trained to learn. Reducing the residual further would require an explicit approximation of $V^{\pi}$, at which point the algorithm becomes a critic-based method (e.g., actor-critic or Bellman residual minimization), a fundamentally different algorithmic approach. Within the class of corrections that use only known model structure and no learned value function, the perpetuity formula is essentially tight.
 
-In both cases, the required $T$ is governed by the contraction rate of the endogenous dynamics, which is a property of the model and the optimal policy. It is entirely separate from the discount factor $\gamma$. Recall that without the terminal value correction, the horizon requirement is dictated by $\gamma$: at $\gamma = 0.96$, over 100 periods are needed just to make the truncation bias negligible. The terminal value correction replaces this discount-rate-dependent requirement with a dynamics-dependent one, which is typically far less demanding.
+**Endogenous convergence.** The analysis above assumes $s_T^{\text{endo}}$ is near the optimal steady state. How quickly this holds depends on the contraction rate of the endogenous dynamics, not on the discount factor $\gamma$:
 
-**Self-correcting training dynamics.** During training, the policy has not yet converged to its optimum, so the rollout trajectory may not reach the true steady state even when $T$ is large. Early in training, the terminal value is therefore a rough approximation. However, the training process is self-correcting: as the policy improves across training iterations, the rollout trajectories increasingly reach the neighborhood of the steady state, which makes the terminal value a better approximation, which in turn provides a more accurate gradient signal that further improves the policy. The terminal value approximation is most reliable precisely when it matters most — in the later stages of training when the policy is being fine-tuned near the optimum.
+- When adjustment costs are low, the policy can move $s^{\text{endo}}$ to its target rapidly; even $T = 1$ may suffice.
+- When adjustment costs are high, convergence is gradual and a larger $T$ is needed.
+
+In either case, the terminal value correction replaces the discount-rate-dependent horizon requirement ($T \geq 113$ at $\gamma = 0.96$) with a dynamics-dependent one, which is typically far less demanding.
+
+**Self-correcting training dynamics.** Early in training, the policy has not converged, so the rollout may not reach the steady state even when $T$ is adequate. The terminal value is then a rough approximation. However, as the policy improves, rollout trajectories increasingly reach the neighborhood of the steady state, making the terminal value more accurate, which in turn provides a better gradient signal. The approximation is most reliable precisely when it matters most — in the later stages of training when the policy is being fine-tuned near the optimum.
 
 ## Euler Residual Minimization
 The ER method minimizes violations of the first-order conditions (Euler equations) that characterize optimality. Rather than simulating full trajectories, it enforces an intertemporal necessary condition between $(s,a)$ and $(s',a')$.
@@ -404,30 +645,38 @@ For example, there exist multiple solutions that can minimize the total loss by 
 This section discusses main issues that need to be handled carefully in implementation.
 
 ## Input Normalization
-Normalization is essential for stable and efficient neural network training. Without it, variables on different scales produce gradients of vastly different magnitudes, causing some parameters to update too aggressively while others stagnate. It also leads to gradient saturation and prevents convergence when variables mismatch on scale and when their raw levels are too large.
 
-Modern RL algorithms address this at two levels. First, observations are normalized before entering the network, compressing heterogeneous state variables to comparable scales. Second, hidden-layer normalization (typically LayerNorm or BatchNorm) stabilizes the internal representations between layers, preventing pre-activations from drifting into regions where gradients vanish or explode. In my application, I only apply observation (input) normalization and do not apply hidden-layer normalization because the example economic models and neural network architecture are relatively simple, so that input normalization will be sufficient.
+Normalization is essential for stable neural network training. Without it, state variables on different scales produce gradients of vastly different magnitudes, causing some parameters to update too aggressively while others stagnate. The goal is a uniform transform that works across economic and financial models without domain-specific tuning. State variables in these applications span orders of magnitude: capital stocks in the hundreds, log-productivity shocks near zero, interest rates as fractions, wealth in the millions. The normalizer must compress all of these to a comparable range.
 
-My goal here is to build a simple and effective normalization strategy that works across a variety of economic and financial models _without requiring domain-specific tuning_. In these applications, state variables can span orders of magnitude in scale and the appropriate scale depends on the model. For example, capital stocks in the hundreds, log-productivity shocks near zero, interest rate and saving rate as fractions, wealth in the millions. My normalization strategy aim to work well across these heterogeneous state and action spaces.
+I only apply observation (input) normalization and do not apply hidden-layer normalization. For the economic models and network architectures considered here, input normalization is sufficient.
 
-All observations are normalized using a per-feature running z-score before the network input layer. Each feature $x_d$ is transformed as
-$$\hat{x}_d = \frac{x_d - \hat{\mu}_d}{\sqrt{\hat{\sigma}^2_d + \varepsilon}}$$
+### Method: static Z-score fitted from the training dataset
 
-where $\hat{\mu}_d$ and $\hat{\sigma}^2_d$ are exponential moving average (EMA) estimates of the feature mean and variance, and $\varepsilon$ is a small constant for numerical stability. The running statistics are initialized to $\hat{\mu}_d = 0$ and $\hat{\sigma}^2_d = 1$, so that the normalizer acts as the identity at initialization. During training, each mini-batch updates the statistics as
+Each feature $x_d$ of the full state $s = (s^{\text{endo}}, s^{\text{exo}})$ is normalized by:
 
-$$\hat{\mu}_d \leftarrow (1 - \alpha)\hat{\mu}_d + \alpha\bar{x}_d^{(\mathcal{B})}, \qquad \hat{\sigma}^2_d \leftarrow (1 - \alpha)\hat{\sigma}^2_d + \alpha{s^2_d}^{(\mathcal{B})}$$
+$$\hat{x}_d = \frac{x_d - \mu_d}{\sigma_d + \varepsilon}$$
 
-where $\bar{x}_d^{(\mathcal{B})}$ and ${s^2_d}^{(\mathcal{B})}$ are the sample mean and variance of feature $d$ in the current batch, and $\alpha$ is the momentum. At inference time, the statistics are frozen and normalization uses the final training estimates.
+where $\mu_d$ and $\sigma_d$ are the per-feature mean and standard deviation computed from the full training dataset $\mathcal{D}^{(k)}$ at the start of round $k$, and $\varepsilon$ is a small constant for numerical stability. The statistics are frozen for the entire round and recomputed from fresh data at the start of each subsequent round. No updates occur during gradient training.
 
-The running z-score guarantees that each feature has approximately zero mean and unit variance regardless of its natural scale. For a model with capital $k \in [10, 500]$ and productivity $z \in [0.8, 1.2]$, the normalizer maps both to $O(1)$ range, equalizing their contribution to the first-layer gradients. This equalization is exact up to the accuracy of the running statistics, which converge within a few dozen batches for a momentum of $\alpha = 0.1$. A warm-up phase of 50 passes through the training data before optimization begins ensures that the statistics are well-calibrated at step zero.
+Unlike running z-score normalizers common in online RL that estimate statistics incrementally during training, this approach computes exact population statistics from the pre-generated dataset in a single pass before gradient steps begin. Since the full dataset is available before training starts, incremental estimation adds no information and only introduces unnecessary hyperparameters.
 
-I prefer the running z-score over two common alternatives considered during development:
+### Exogenous and endogenous components
+
+The two state components are fitted from different data sources, reflecting what is available in the dataset without a policy rollout.
+
+**Exogenous states** $s^{\text{exo}}$ (e.g., productivity $z$): the pre-simulated trajectory provides $N \times T_{\text{data}}$ samples of the ergodic exogenous distribution. All $T_{\text{data}}$ steps per trajectory are used for fitting, regardless of the training rollout horizon ($T_{\text{train}}$ for LR, $h$ for SHAC). Using the full $T_{\text{data}}$ ensures the normalizer captures the ergodic distribution of $z$ rather than the narrower initial distribution of $z_0$.
+
+**Endogenous states** $s^{\text{endo}}$ (e.g., capital $k$, debt $b$): only the $N$ initial states $s^{\text{endo}}_0$ are available without a policy rollout, so these are used. At Round 0 with $s^{\text{endo}}_0 \sim \text{Uniform}(\mathcal{S}^{\text{endo}})$, the statistics cover the full state space range. At Round $k \geq 1$ with ergodic harvesting, the initial states approximate the ergodic distribution under $\pi_{\theta_k}$, giving tighter statistics.
+
+In practice, fitting is implemented by pairing each $s^{\text{endo},i}_0$ with all $T_{\text{data}}$ exogenous states from trajectory $i$, producing a single $N \times T_{\text{data}}$ array from which both sets of statistics are extracted in one pass. For one-step methods (ER, BRM), the flattened dataset already provides $N \times T_{\text{data}}$ paired $(s^{\text{endo}}, s^{\text{exo}})$ observations and the normalizer is fitted directly.
+
+The normalizer does not need to be ergodically exact. Since the state space is bounded by construction, all states visited during training fall within a fixed interval after normalization. The purpose is to map inputs to an $O(1)$ range before the first network layer, equalizing gradient scale across features. The optimizer's adaptive learning rates absorb residual scale differences within a few hundred steps.
+
+### Alternatives considered
 
 **Standard logarithm** $\ln(1 + x)$: works well for $x \geq 0$, but undefined for negative values. Variables such as log-productivity, returns, or value functions that take negative values require special-casing, breaking the goal of a uniform transform.
 
 **Hyperbolic tangent** $\tanh(x)$: achieves near-perfect cross-variable equalization but saturates for $|x| > 3$, mapping all large values to $\pm 1$. For a variable like capital with range $[0, 500]$, the network cannot distinguish $k = 100$ from $k = 500$ after $\tanh$ compression.
-
-The main limitation of the running z-score relative to a fixed transform is statefulness: the normalizer output for a given input depends on the accumulated statistics, which introduces a potential source of non-stationarity in online training where the state distribution shifts as the policy improves. In our current setting of batch training on a fixed state grid, this concern is minimal, as the statistics converge quickly and the data distribution does not shift. For future online training extensions, standard mitigations (higher momentum, periodic resets, or warm-up buffers) are available. These require a single shared momentum parameter, not per-model constants, preserving the model-agnostic design.
 
 
 ## Activation and Gradient Saturation
@@ -509,213 +758,6 @@ $$\hat{\mu}_{|r|} = \frac{1}{N}\sum_{i=1}^N |r(s_i, a_i)|, \qquad C = \frac{\hat
 The bounded sampling region should be chosen to cover the ergodic distribution of the model — in practice, any reasonable compact subset of the state space suffices, since the ergodic distribution is always concentrated on a bounded region even when $\mathcal{S}$ is unbounded in principle. No dynamics evaluation, no rollout, and no policy are required; only the reward function $r$, which is known exactly by assumption. $N = 1000$ random samples is more than sufficient since $\hat{\mu}_{|r|}$ converges at rate $1/\sqrt{N}$ and order-of-magnitude accuracy is all that is needed.
 
 **Preferred alternative: analytical $V^*$.** When the model admits an analytical or semi-analytical steady state with computable $V^* = Q^*(s^*, \pi^*(s^*))$, set $C = |V^*|$ directly. This gives a tighter estimate than the reward sampling procedure because $V^*$ already accounts for the discount-weighted accumulation of rewards along the optimal path, whereas $\hat{\mu}_{|r|}/(1-\gamma)$ is an upper bound that may overestimate $C$ when the ergodic reward distribution is skewed. An exact computation of $V^*$ is not required; an approximation within the correct order of magnitude is sufficient.
-
-
-
-
-# Data Generation and Training Workflow
-
-This section describes how synthetic training data is generated, the design principles behind the data pipeline, and the full training workflow. The framework is model-agnostic: it applies to any Markov decision process with known dynamics.
-
-## Dataset Structure
-
-### Setup
-
-Consider a discrete-time MDP with state $s \in \mathcal{S} \subset \mathbb{R}^{N_s}$, action $a \in \mathcal{A} \subset \mathbb{R}^{N_a}$, transition dynamics $s' = f(s, a, \varepsilon)$ with i.i.d. shocks $\varepsilon \sim F$, reward $r(s, a)$, and discount factor $\gamma \in (0,1)$. The policy $\pi_\theta(s)$ and value function $V_\phi(s)$ are parameterized by neural networks.
-
-The state vector $s$ may contain exogenous components $s^{\text{exo}}$ (driven entirely by $\varepsilon$) and endogenous components $s^{\text{endo}}$ (influenced by $a$). This distinction matters for data generation: the exogenous path can be simulated exactly from shock draws alone, while the endogenous path depends on the policy and is computed during training, not during data generation.
-
-Both the state and action spaces are bounded; the rules for setting bounds are described in the state space section. For data generation, we take $\mathcal{S} = [s_{\min}, s_{\max}]$ and $\mathcal{A} = [a_{\min}, a_{\max}]$ as given.
-
-### Trajectory Simulation
-
-The data generator produces $L$ independent trajectories of length $T$. The exogenous and endogenous components of the initial state are sampled separately: $s_0^{\text{endo},i} \sim \text{Uniform}(\mathcal{S}^{\text{endo}})$ and $s_0^{\text{exo},i} \sim \text{Uniform}(\mathcal{S}^{\text{exo}})$, each with its own dedicated RNG stream. Both are drawn once at generation time and remain fixed. For each trajectory, $M$ independent shock sequences $\varepsilon^{(1)}, \ldots, \varepsilon^{(M)} \sim F$ are drawn and used to roll out the full exogenous state paths. The stored trajectory is:
-$$\mathcal{T}^i = \left(s_{0}^{\text{endo},i},\; \{s_t^{\text{exo},i}\}_{t=0}^{T},\; \{s_t^{\text{exo},\text{fork},i}\}_{t=1}^{T}\right), \quad i = 1, \ldots, L$$
-
-where the exogenous paths are computed at generation time via the policy-independent transition $s^{\text{exo}}_{t+1} = g(s^{\text{exo}}_t, \varepsilon_{t+1})$. Raw shocks are consumed internally by the data generator and are not stored. This is possible because the exogenous and endogenous state transitions are treated separately: $g$ depends only on $s^{\text{exo}}$ and $\varepsilon$ and can be evaluated without the policy, whereas the endogenous transition $h(s_t, \pi_\theta(s_t), \varepsilon_{t+1})$ requires $\pi_\theta$ and is computed during training. The data generator is model-agnostic because each environment specifies $g$ explicitly.
-
-The endogenous path cannot be pre-computed and is handled differently by each method:
-
-- **LRM (trajectory-based):** The trainer rolls out the full endogenous state sequence on-the-fly under the current $\pi_\theta$ at each training step, using the pre-computed $\{s_t^{\text{exo}}\}$ from the dataset as a fixed exogenous backdrop. Gradients flow backward through the endogenous trajectory (BPTT) but not through $s^{\text{exo}}$, which is constant data. This is exact — no additional randomness enters the trainer.
-
-- **ER/BR (one-step methods):** The flattened format samples endogenous states uniformly from $\mathcal{S}^{\text{endo}}$, independently of any policy. This is sufficient for low-dimensional problems. For high-dimensional problems, the multi-epoch workflow replaces these uniform draws with ergodic states from trajectory simulation under the learned policy.
-
-### Main Path and Fork Paths
-
-Multiple shock realizations per trajectory enable Monte Carlo estimation of expectations over future states.
-
-**Main path.** The first shock sequence $\{\varepsilon_t^{(1)}\}$ drives a continuous chain of exogenous states, providing the trajectory for lifetime reward calculations (LRM).
-
-**Fork paths.** At each step $t$, the remaining sequences branch from the main path's current state:
-$$s^{\text{exo},\text{fork}(m)}_{t+1} = g(s^{\text{exo}}_t, \varepsilon_{t+1}^{(m)}), \quad m = 2, \ldots, M$$
-
-Each fork is a one-step transition from the main path, not a parallel chain.
-
-```
-Main path:   s0 -> s1 -> s2 -> s3 -> ... -> sT
-               \     \     \     \
-Fork 1:        s1F   s2F   s3F   sTF
-Fork 2:        s1F'  s2F'  s3F'  sTF'
-  ...
-```
-
-With $M = 2$, the cross-product of main and fork transitions provides the AiO variance-reduced estimator (@maliar21) used by ER and BR. Simulating $M > 2$ fork paths yields a lower-variance Monte Carlo estimator for $\mathbb{E}_{\varepsilon}[\cdot \mid s_t]$ (@pascal24_JDEC). This is a pure data generation choice that does not affect the training algorithm.
-
-### Flattened Format
-
-One-step methods (ER, BR, actor-critic) require i.i.d. samples, not full trajectories. The flattened dataset provides each observation as a single-step transition with pre-computed exogenous next states:
-$$\text{Obs} = \left(s^{\text{endo}},\; s^{\text{exo}},\; s^{\text{exo},\prime(1)},\; s^{\text{exo},\prime(2)}\right)$$
-
-where $s^{\text{exo}}$ is extracted from the trajectory's main path and $s^{\text{exo},\prime(1)}, s^{\text{exo},\prime(2)}$ are the pre-computed main and fork next states. Because all exogenous transitions are resolved at generation time, the trainer calls no RNG and performs no simulation — it uses $s^{\text{exo},\prime}$ directly. The endogenous states are sampled uniformly from $\mathcal{S}^{\text{endo}}$, independently for each observation — no policy exists at data generation time. After construction, all observations are pooled and shuffled to break the serial correlation in exogenous states. The resulting dataset has $L \times T$ i.i.d. observations.
-
-Both LRM and one-step methods train on the same underlying exogenous trajectories; only the batching and the treatment of endogenous states differ.
-
-### Validation and Test Sets
-
-- **Validation set**: Fixed dataset ($N_{\text{val}} = 10n$ where $n$ is the training batch size), used for model selection and early stopping
-- **Test set**: Fixed dataset ($N_{\text{test}} = 50n$), used only for final evaluation
-
-Both are generated from the same distribution with different RNG seeds.
-
-
-## Design Principles {#sec-data-design}
-
-### Separation of simulation and training
-
-Data generation and training are strictly separated. The data generator produces a complete, fixed dataset $\mathcal{D}$ before training begins. The trainer is stateless with respect to simulation: it contains no RNG for data generation, no simulation logic, and no buffer management. Two runs with the same $\mathcal{D}$ and the same optimizer seed produce identical training trajectories.
-
-This provides three concrete benefits. First, when training fails, the cause is unambiguously in the optimizer or the network, not in the data. Second, the loss at any checkpoint is computed on the same distribution, so loss curves reflect optimization progress rather than distributional shift. Third, ablation studies are clean: changing a training hyperparameter changes nothing about the data.
-
-### The distributional mismatch problem
-
-All residual-based methods minimize $J(\theta) = \mathbb{E}_{s \sim \xi}[\ell(s; \theta)^2]$, where $\xi$ is the distribution over evaluation states. The ideal $\xi$ is the ergodic distribution $\xi^*$ of the Markov chain under the optimal policy $\pi^*$, because this concentrates approximation quality where the economy spends time. But $\xi^*$ depends on $\pi^*$, which is the object being solved for. As the policy improves during training, the induced distribution shifts, and evaluation points drawn under earlier policies become stale. @fern26 (Section 2.5) calls this the equilibrium loop.
-
-**Low-dimensional case.** For small state spaces, the problem is sidestepped by sampling uniformly from a bounded domain wide enough to contain the ergodic set. The wasted computation on non-ergodic states is acceptable. @fern26 recommends this for low-dimensional problems, and it is the default for the models in this paper (single-epoch workflow).
-
-**Method-dependent asymmetry.** The mismatch affects methods differently. LRM rolls out full trajectories under $\pi_\theta$ during training, so its endogenous states are approximately ergodic under the current policy and update automatically as $\theta$ improves — LRM gets implicit ergodic sampling for free. ER and BR use the flattened format where endogenous states are uniform draws from data generation time, never recomputed under any policy. The exogenous states are ergodic (policy-independent), but the endogenous states are not. For low-dimensional problems this hybrid is adequate; for high-dimensional problems the uniform endogenous states become the bottleneck.
-
-**High-dimensional case: the equilibrium loop.** When the state dimension is large, uniform sampling of endogenous states becomes intractable. The volume of the ergodic set relative to the bounding hypercube shrinks exponentially with dimension (@maliar21, Eq. 18): at $N_s = 10$ about 0.3% of the hypercube is relevant; at $N_s = 30$ the fraction is negligible.
-
-The solution is the equilibrium loop (@fern26, Section 2.5; @maliar21): iterate between simulation and training. (1) Guess $\theta_0$. (2) Simulate under $\pi_{\theta_0}$ to generate evaluation points on the ergodic set. (3) Train to obtain $\theta_1$. (4) Re-simulate under $\pi_{\theta_1}$. (5) Repeat until convergence. Our multi-epoch workflow implements this with the constraint that within each epoch, the dataset is fixed and training is separated from simulation. The data for epoch $j \geq 1$ is generated by rolling out trajectories under $\pi_{\theta_j}$ from the previous epoch, discarding the initial transient (before the chain has mixed), and retaining the approximately ergodic portion. The retained states are flattened, shuffled, and used as i.i.d. training samples.
-
-Increasing trajectory length $T$ is always cheap — it requires only additional shock draws, no gradient computation. Setting $T$ much larger than the mixing time of the chain (on the order of 40–100 periods for typical quarterly-calibrated models) ensures most of each trajectory is usable.
-
-### Comparison with alternative data strategies
-
-**@maliar21: epoch-based simulation.** Maliar et al. implement the same equilibrium loop: simulate a panel under the current policy, train, re-simulate. Our workflow differs in implementation: we strictly separate data generation from training within each epoch. Maliar et al. note that their simulated data have serial correlation and recommend training on cross-sections separated in time — our flatten-and-shuffle eliminates this entirely.
-
-**Replay buffer (standard off-policy RL, Duarte 2024).** Standard off-policy reinforcement learning maintains a buffer of transitions from past policies, discarding old transitions as new ones arrive. The buffer's distribution is a path-dependent mixture across policy vintages — it corresponds to no well-defined training objective and introduces non-stationarity. Duarte's DPI uses a buffer of 500,000 states with periodic ergodic refresh. Our design avoids buffer management: within each epoch the dataset is fixed and stationary, and no tuning of buffer size, eviction policy, or mixing ratio is required. Between epochs, the dataset is regenerated cleanly under the improved policy.
-
-
-## Training Workflow {#sec-workflow}
-
-### Single-Epoch Workflow (Default)
-
-```
-1. Data generation
-   - Set state/action bounds
-   - Draw s_endo_0 ~ Uniform(S^endo) and s_exo_0 ~ Uniform(S^exo) separately
-   - Draw M shock sequences {ε_t^(1), ..., ε_t^(M)} for t = 1, ..., T
-   - Roll out exogenous state paths via g(s^exo, ε); store z_path and z_fork
-   - Store D_traj = {(s_endo_0, z_path, z_fork)} for LRM
-   - Flatten: extract (s^endo ~ Uniform, z, z_next_main, z_next_fork),
-     pool, and shuffle into D_flat for ER/BR
-
-2. Training
-   - Select dataset: D_traj for LRM, D_flat for ER/BR
-   - Warm up input normalizer on training states (frozen during gradient steps)
-   - For each training step:
-     a. Draw mini-batch from the selected dataset
-     b. LRM: roll out endogenous states k on-the-fly under π_θ,
-        using pre-computed z_path as the exogenous backdrop
-        ER/BR: use pre-computed z_next_main/fork directly — no simulation
-     c. Compute loss and update θ
-   - Stop when method-specific convergence criteria are satisfied
-
-3. Evaluation
-   - Evaluate on held-out validation/test set
-   - Report Euler residual, policy accuracy, simulation statistics
-```
-
-Sufficient for low-to-moderate dimensional models with smooth dynamics.
-
-### Multi-Epoch Workflow
-
-When uniform endogenous sampling is inadequate (high-dimensional state spaces), the workflow extends to multiple epochs implementing the equilibrium loop:
-
-```
-Epoch 0:
-   - Generate D_0 with uniform initial states + random shocks
-   - Build D_traj and D_flat as in single-epoch workflow
-   - Train to convergence → θ_1
-
-Epoch j (j ≥ 1):
-   - Simulate trajectories under π_{θ_j}; discard initial transient
-   - Construct D_j from retained (approximately ergodic) states + fresh shocks
-   - Build D_traj and D_flat as in single-epoch workflow
-   - Train to convergence → θ_{j+1}
-
-Convergence check:
-   - Let μ_j, Σ_j = sample mean and covariance of endogenous states in D_j
-   - Stop when ‖μ_j - μ_{j+1}‖ / ‖μ_j‖ < ε and Σ_j ≈ Σ_{j+1}
-```
-
-Within each epoch, the dataset is fixed and all single-epoch properties (reproducibility, stationarity, clean ablations) are preserved. In practice, 2–4 epochs suffice.
-
-
-## Application: Corporate Finance Model
-
-The state vector is $s = (k, b, z)$ where $k$ is capital (endogenous), $b$ is debt (endogenous), and $z$ is productivity (exogenous). The action is $a = k'$ (next-period capital). The exogenous transition is $\ln z_{t+1} = (1-\rho)\mu + \rho \ln z_t + \sigma \varepsilon_t$.
-
-Each trajectory sample $i$ contains:
-$$\left(k_{0,i},\; b_{0,i},\; \{z_{t,i}\}_{t=0}^{T},\; \{z_{t,i}^{\text{fork}}\}_{t=1}^{T}\right)$$
-where endogenous initial states $(k_0, b_0) \sim \text{Uniform}(\mathcal{S}^{\text{endo}})$, the exogenous initial state $z_0 \sim \text{Uniform}([z_{\min}, z_{\max}])$ (in levels), and the full exogenous trajectories $z_{1:T}$ (main path) and $z_{1:T}^{\text{fork}}$ (one-step branches for the AiO estimator) are pre-computed from $M = 2$ shock sequences at generation time. For the one-step ER/BR dataset, the trajectories are flattened into $(k_i, b_i, z_i, z_{i}^{\prime(1)}, z_{i}^{\prime(2)})$ with $k, b$ sampled i.i.d. uniform.
-
-The basic model and the risky debt model are trained on the same dataset. The basic model simply ignores $b_0$ and the debt dimension.
-## RNG Seed Schedule
-
-Reproducibility requires deterministic random number generation. The framework uses TensorFlow's stateless random functions (`tf.random.stateless_*`) which produce identical outputs given identical seed pairs, regardless of call order.
-
-**Master Seed**
-
-A master seed pair $\mathbf{s}^{\text{master}} = (m_0, m_1)$ anchors all randomness.
-
-**Split Seeds**
-
-Disjoint seeds for each dataset:
-$$\mathbf{s}^{\text{train}} = (m_0 + 100, m_1), \quad \mathbf{s}^{\text{val}} = (m_0 + 200, m_1), \quad \mathbf{s}^{\text{test}} = (m_0 + 300, m_1)$$
-
-**Variable IDs**
-
-Each random variable has a fixed ID:
-
-| Variable            | ID  |
-| ------------------- | --- |
-| $k_0$               | 1   |
-| $z_0$               | 2   |
-| $b_0$               | 3   |
-| $\varepsilon^{(1)}$ | 4   |
-| $\varepsilon^{(2)}$ | 5   |
-| shuffle             | 6   |
-
-**Training Seeds by Step**
-
-For training step $j$ and variable $x$:
-$$\mathbf{s}^{\text{train}}_{j,x} = (m_0 + 100 + \text{VarID}(x), \; m_1 + j)$$
-
-This ensures each batch $j$ receives unique, reproducible random draws.
-
-**Validation/Test Seeds**
-
-These are single fixed datasets (no step index):
-$$\mathbf{s}^{\text{val}}_{x} = (m_0 + 200 + \text{VarID}(x), \; m_1)$$
-$$\mathbf{s}^{\text{test}}_{x} = (m_0 + 300 + \text{VarID}(x), \; m_1)$$
-
-This schedule guarantees:
-
-1. **Reproducibility**: Identical seeds produce identical data across runs
-2. **Common random numbers**: Different methods train on the same data, enabling fair comparison
-3. **No leakage**: Train/validation/test sets use disjoint RNG streams
 
 
 # Applications to Corporate Finance
