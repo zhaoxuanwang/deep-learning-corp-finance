@@ -85,7 +85,7 @@ def train_brm(env, policy, value_net, train_dataset: dict,
     """
     config      = config or BRMConfig()
     gamma       = env.discount()
-    temperature = config.temperature
+    schedule    = env.annealing_schedule()
 
     validate_dataset_keys(train_dataset, _DATASET_KEYS, "train_brm", "train_dataset")
     if val_dataset is not None:
@@ -120,6 +120,8 @@ def train_brm(env, policy, value_net, train_dataset: dict,
     }
 
     for step, batch in enumerate(train_iter.take(config.n_steps)):
+        temperature = schedule.value if schedule else config.temperature
+
         s_endo      = batch["s_endo"]        # (B, endo_dim)
         z           = batch["z"]             # (B, exo_dim)
         z_next_main = batch["z_next_main"]   # (B, exo_dim)
@@ -185,6 +187,9 @@ def train_brm(env, policy, value_net, train_dataset: dict,
         policy_optimizer.apply_gradients(zip(grads_p, policy.trainable_variables))
 
         loss = loss_br + config.weight_foc * loss_foc
+
+        if schedule:
+            schedule.update()
 
         # Evaluation
         if step % config.eval_interval == 0 or step == config.n_steps - 1:

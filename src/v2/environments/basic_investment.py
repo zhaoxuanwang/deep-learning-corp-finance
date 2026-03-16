@@ -24,13 +24,122 @@ Exogenous bounds (level space, ±m·σ_erg around mean):
     z_min = exp(μ - m·σ_erg)
     z_max = exp(μ + m·σ_erg)
     z sampled uniformly in [z_min, z_max] (level, not log-space).
+
+Self-contained: this file includes ALL domain knowledge for the basic
+investment model (parameters, production, costs).  The rest of the v2
+codebase is model-agnostic.
 """
 
-import tensorflow as tf
-from src.v2.environments.base import MDPEnvironment
-from src.economy.parameters import EconomicParams, ShockParams
-from src.economy import production_function, adjustment_costs
+from dataclasses import dataclass
 
+import tensorflow as tf
+
+from src.v2.environments.base import MDPEnvironment
+from src.v2.utils.smooth_indicators import indicator_abs_gt
+
+
+# =====================================================================
+# Domain-specific parameter containers
+# =====================================================================
+
+@dataclass(frozen=True)
+class ShockParams:
+    """Immutable AR(1) shock process parameters.
+
+    log(z') = (1-ρ)μ + ρ·log(z) + σ·ε,   ε ~ N(0,1).
+    """
+    rho:   float = 0.7
+    sigma: float = 0.15
+    mu:    float = 0.0
+
+    def __post_init__(self):
+        if self.sigma <= 0:
+            raise ValueError(f"sigma must be > 0. Got {self.sigma}")
+        if not (-1.0 < self.rho < 1.0):
+            raise ValueError(f"rho must be in (-1, 1). Got {self.rho}")
+
+
+@dataclass(frozen=True)
+class EconomicParams:
+    """Immutable economic primitives.
+
+    Contains fields for both the basic and risky-debt models so that a
+    single dataclass can be shared across environments.  The basic model
+    uses only: r_rate, delta, theta, cost_convex, cost_fixed.
+
+    Attributes:
+        r_rate:             Risk-free interest rate.
+        delta:              Depreciation rate.
+        theta:              Production elasticity (Cobb-Douglas).
+        cost_convex:        Convex adjustment cost coefficient (φ₀).
+        cost_fixed:         Fixed adjustment cost coefficient (φ₁).
+        tax:                Corporate income tax rate.
+        cost_default:       Default / bankruptcy cost (α).
+        cost_inject_fixed:  Fixed external equity cost (η₀).
+        cost_inject_linear: Proportional external equity cost (η₁).
+        frac_liquid:        Fraction of capital that can be liquidated.
+    """
+    # Core production
+    r_rate:       float = 0.04
+    delta:        float = 0.15
+    theta:        float = 0.7
+    # Adjustment costs
+    cost_convex:  float = 0.0
+    cost_fixed:   float = 0.0
+    # Risky debt (unused by basic model, kept for reuse by future envs)
+    tax:                float = 0.3
+    cost_default:       float = 0.4
+    cost_inject_fixed:  float = 0.0
+    cost_inject_linear: float = 0.0
+    frac_liquid:        float = 0.5
+
+    def __post_init__(self):
+        if not (0.0 < self.r_rate < 1.0):
+            raise ValueError(f"r_rate must be in (0, 1). Got {self.r_rate}")
+        if not (0.0 <= self.delta <= 1.0):
+            raise ValueError(f"delta must be in [0, 1]. Got {self.delta}")
+        if not (0.0 < self.theta < 1.0):
+            raise ValueError(f"theta must be in (0, 1). Got {self.theta}")
+        if self.cost_convex < 0:
+            raise ValueError(f"cost_convex must be >= 0. Got {self.cost_convex}")
+        if self.cost_fixed < 0:
+            raise ValueError(f"cost_fixed must be >= 0. Got {self.cost_fixed}")
+
+
+# =====================================================================
+# Domain-specific economic functions (inlined from v1 economy/logic.py)
+# =====================================================================
+
+def _production(k, z, theta):
+    """Cobb-Douglas: y = z · k^θ."""
+    return z * (k ** theta)
+
+
+def _adjustment_costs(k, k_next, params, temperature, logit_clip):
+    """Total adjustment costs: convex + fixed.
+
+    Convex: (φ₀/2) · I² / k
+    Fixed:  φ₁ · k · 1{|I/k| > ε}   (smooth indicator)
+    """
+    I = k_next - (1.0 - params.delta) * k
+    safe_k = tf.maximum(k, 1e-8)
+
+    # Convex
+    adj_convex = (params.cost_convex / 2.0) * (I ** 2) / safe_k
+
+    # Fixed (smooth gate)
+    i_norm = I / safe_k
+    is_investing = indicator_abs_gt(
+        i_norm, threshold=1e-8, temperature=temperature,
+        logit_clip=logit_clip)
+    adj_fixed = params.cost_fixed * safe_k * is_investing
+
+    return adj_convex + adj_fixed
+
+
+# =====================================================================
+# Environment
+# =====================================================================
 
 class BasicInvestmentEnv(MDPEnvironment):
     """Corporate finance basic model: optimal capital investment.
@@ -185,9 +294,9 @@ class BasicInvestmentEnv(MDPEnvironment):
         z = s[..., 1]
         k_next, I_eff = self._apply_action(k, a)
 
-        profit   = production_function(k, z, self.econ)
-        adj_cost = adjustment_costs(k, k_next, self.econ,
-                                    temperature=temperature, logit_clip=20.0)
+        profit   = _production(k, z, self.econ.theta)
+        adj_cost = _adjustment_costs(k, k_next, self.econ,
+                                     temperature=temperature, logit_clip=20.0)
         return profit - adj_cost - I_eff
 
     def exo_stationary_mean(self) -> tf.Tensor:
@@ -234,6 +343,23 @@ class BasicInvestmentEnv(MDPEnvironment):
     # ------------------------------------------------------------------
     # Analytical overrides
     # ------------------------------------------------------------------
+
+    def annealing_schedule(self):
+        """Return an annealing schedule when fixed costs are active.
+
+        Fixed adjustment costs use a smooth indicator 1{|I/k| > ε} that
+        requires temperature annealing for effective training.  When
+        cost_fixed == 0 the indicator is multiplied by zero, so annealing
+        is unnecessary and a fixed cold temperature suffices.
+
+        Returns a fresh instance each call (factory method) so that
+        separate training runs on the same env do not share state.
+        """
+        if self.econ.cost_fixed > 0:
+            from src.v2.utils.annealing import AnnealingSchedule
+            return AnnealingSchedule(
+                init_temp=1.0, min_temp=1e-6, decay_rate=0.995)
+        return None
 
     def grid_spec(self):
         """Grid discretization hints for discrete solvers (VFI/PFI).
@@ -290,16 +416,16 @@ class BasicInvestmentEnv(MDPEnvironment):
         # χ = 1 + ∂ψ(k, k')/∂k'
         with tf.GradientTape() as tape:
             tape.watch(k_next)
-            psi = adjustment_costs(k, k_next, self.econ,
-                                   temperature=temperature, logit_clip=20.0)
+            psi = _adjustment_costs(k, k_next, self.econ,
+                                    temperature=temperature, logit_clip=20.0)
         chi = 1.0 + tape.gradient(psi, k_next)
 
         # m via derivatives of next-period adjustment cost
         with tf.GradientTape(persistent=True) as tape:
             tape.watch(k_next)
             tape.watch(k_next_next)
-            psi_next = adjustment_costs(k_next, k_next_next, self.econ,
-                                        temperature=temperature, logit_clip=20.0)
+            psi_next = _adjustment_costs(k_next, k_next_next, self.econ,
+                                         temperature=temperature, logit_clip=20.0)
         dpsi_next_dk = tape.gradient(psi_next, k_next)
         chi_next     = 1.0 + tape.gradient(psi_next, k_next_next)
         del tape
@@ -321,3 +447,32 @@ class BasicInvestmentEnv(MDPEnvironment):
              / (econ.r_rate + econ.delta)
              ) ** (1.0 / (1.0 - econ.theta))
         )
+
+
+# =====================================================================
+# Analytical benchmark (module-level, for notebook validation)
+# =====================================================================
+
+def compute_frictionless_policy(z, econ_params, shock_params):
+    """Vectorized frictionless optimal k'(z).
+
+    k'(z) = [θ · E[z'|z] / (r + δ)]^(1/(1-θ))
+
+    where E[z'|z] = exp((1-ρ)μ + 0.5σ²) · z^ρ.
+
+    Args:
+        z:            Productivity level(s), scalar or array.
+        econ_params:  EconomicParams with theta, r_rate, delta.
+        shock_params: ShockParams with rho, sigma, mu.
+
+    Returns:
+        k'(z) in levels, same shape as z.
+    """
+    import numpy as np
+    rho, sigma, mu = shock_params.rho, shock_params.sigma, shock_params.mu
+    exp_corr = np.exp((1 - rho) * mu + 0.5 * sigma ** 2)
+    return (
+        (econ_params.theta * exp_corr * np.asarray(z) ** rho
+         / (econ_params.r_rate + econ_params.delta))
+        ** (1.0 / (1.0 - econ_params.theta))
+    )

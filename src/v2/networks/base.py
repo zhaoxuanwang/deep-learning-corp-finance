@@ -5,7 +5,7 @@ All networks share this hidden stack. Output heads are defined per-network.
 """
 
 import tensorflow as tf
-from src.v2.normalization import StaticNormalizer
+from src.v2.utils.normalization import StaticNormalizer
 
 
 class HiddenStack(tf.keras.layers.Layer):

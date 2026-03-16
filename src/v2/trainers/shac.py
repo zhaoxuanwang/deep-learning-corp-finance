@@ -100,9 +100,14 @@ def train_shac(env, policy, value_net, train_dataset: dict,
     """
     config      = config or SHACConfig()
     gamma       = env.discount()
-    temperature = config.temperature
     horizon     = config.horizon
     window_len  = config.short_horizon
+
+    # Annealing: env decides; tf.Variable so @tf.function reads it live.
+    schedule = env.annealing_schedule()
+    temp_var = tf.Variable(
+        schedule.value if schedule else config.temperature,
+        dtype=tf.float32, trainable=False)
 
     # ------------------------------------------------------------------
     # Reward normalization
@@ -197,7 +202,7 @@ def train_shac(env, policy, value_net, train_dataset: dict,
                 s_t = env.merge_state(k_current, z_t)
                 a_t = policy(s_t, training=False)
 
-                r_t = env.reward(s_t, a_t, temperature=temperature)
+                r_t = env.reward(s_t, a_t, temperature=temp_var)
                 r_t = tf.reshape(r_t, [-1]) * reward_scale_tf
 
                 collected_states.append(tf.stop_gradient(s_t))
@@ -237,7 +242,7 @@ def train_shac(env, policy, value_net, train_dataset: dict,
         """
         # Target policy action and reward
         a_target = target_policy(s_batch, training=False)
-        r_target = env.reward(s_batch, a_target, temperature=temperature)
+        r_target = env.reward(s_batch, a_target, temperature=temp_var)
         r_target = tf.reshape(r_target, [-1]) * reward_scale_tf
 
         # Target transition: s' under target policy
@@ -316,8 +321,13 @@ def train_shac(env, policy, value_net, train_dataset: dict,
             polyak_update(policy, target_policy,
                           tau=config.polyak_rate)
 
+            if schedule:
+                schedule.update()
+                temp_var.assign(schedule.value)
+
             # Logging
             if step % config.eval_interval == 0 or step == config.n_steps - 1:
+                temperature = float(temp_var)
                 euler_res = bellman_res = float("nan")
                 if val_dataset is not None:
                     euler_res = evaluate_euler_residual(

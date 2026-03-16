@@ -4,7 +4,7 @@ import tensorflow as tf
 import numpy as np
 import pytest
 
-from src.v2.normalization import StaticNormalizer
+from src.v2.utils.normalization import StaticNormalizer
 
 
 class TestStaticNormalizer:

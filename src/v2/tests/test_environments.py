@@ -4,9 +4,8 @@ import tensorflow as tf
 import numpy as np
 import pytest
 
-from src.v2.environments.basic_investment import BasicInvestmentEnv
+from src.v2.environments.basic_investment import BasicInvestmentEnv, EconomicParams, ShockParams
 from src.v2.environments.base import MDPEnvironment
-from src.economy.parameters import EconomicParams, ShockParams
 
 
 # =============================================================================
@@ -286,3 +285,44 @@ class TestRewardScale:
         ratio = lam_generic / lam_analytical
         assert ratio > 0.01, (
             f"Ratio {ratio:.4f} too small — estimates diverge excessively")
+
+
+# =============================================================================
+# Annealing schedule
+# =============================================================================
+
+class TestAnnealingSchedule:
+    """Tests for env.annealing_schedule() factory method."""
+
+    def test_none_when_no_fixed_cost(self):
+        """No annealing needed when cost_fixed == 0."""
+        env = BasicInvestmentEnv(
+            econ_params=EconomicParams(cost_fixed=0.0))
+        assert env.annealing_schedule() is None
+
+    def test_returns_schedule_with_fixed_cost(self):
+        """Annealing schedule returned when cost_fixed > 0."""
+        from src.v2.utils.annealing import AnnealingSchedule
+        env = BasicInvestmentEnv(
+            econ_params=EconomicParams(cost_fixed=0.02))
+        sched = env.annealing_schedule()
+        assert isinstance(sched, AnnealingSchedule)
+        assert sched.init_temp == 1.0
+        assert sched.min_temp == 1e-6
+
+    def test_returns_fresh_instance(self):
+        """Each call returns a new schedule (no shared state)."""
+        env = BasicInvestmentEnv(
+            econ_params=EconomicParams(cost_fixed=0.02))
+        s1 = env.annealing_schedule()
+        s2 = env.annealing_schedule()
+        assert s1 is not s2
+        # Mutating s1 doesn't affect s2
+        s1.update()
+        assert s1.step == 1
+        assert s2.step == 0
+
+    def test_base_class_returns_none(self):
+        """MDPEnvironment base default is None."""
+        env = BasicInvestmentEnv()  # cost_fixed=0 by default
+        assert MDPEnvironment.annealing_schedule(env) is None

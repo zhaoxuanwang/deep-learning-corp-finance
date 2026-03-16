@@ -23,6 +23,7 @@ __pycache__/
 *.npz
 *.csv
 *.png
+outputs/
 
 # --- Model Checkpoints ---
 *.keras

@@ -45,6 +45,7 @@ def train_er(env, policy, train_dataset: dict, val_dataset: dict = None,
         dict with keys: policy, history, config.
     """
     config = config or ERConfig()
+    schedule = env.annealing_schedule()
 
     validate_dataset_keys(train_dataset, _DATASET_KEYS, "train_er", "train_dataset")
     if val_dataset is not None:
@@ -68,6 +69,8 @@ def train_er(env, policy, train_dataset: dict, val_dataset: dict = None,
     history = {"step": [], "loss": [], "euler_residual": []}
 
     for step, batch in enumerate(train_iter.take(config.n_steps)):
+        temperature = schedule.value if schedule else config.temperature
+
         s_endo      = batch["s_endo"]        # (B, endo_dim)
         z           = batch["z"]             # (B, exo_dim)
         z_next_main = batch["z_next_main"]   # (B, exo_dim)
@@ -90,9 +93,9 @@ def train_er(env, policy, train_dataset: dict, val_dataset: dict = None,
 
             # Euler residuals
             f1 = env.euler_residual(s, a, s_next_main, a_next_main,
-                                    temperature=config.temperature)
+                                    temperature=temperature)
             f2 = env.euler_residual(s, a, s_next_fork, a_next_fork,
-                                    temperature=config.temperature)
+                                    temperature=temperature)
 
             if config.loss_type == "crossprod":
                 loss = tf.reduce_mean(f1 * f2)
@@ -103,10 +106,13 @@ def train_er(env, policy, train_dataset: dict, val_dataset: dict = None,
         optimizer.apply_gradients(zip(grads, policy.trainable_variables))
         polyak_update(policy, target_policy, tau=config.polyak_rate)
 
+        if schedule:
+            schedule.update()
+
         # Evaluation
         if step % config.eval_interval == 0 or step == config.n_steps - 1:
             er = (evaluate_euler_residual(env, policy, val_dataset,
-                                          temperature=config.temperature)
+                                          temperature=temperature)
                   if val_dataset is not None else float("nan"))
             history["step"].append(step)
             history["loss"].append(float(loss))

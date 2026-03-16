@@ -50,8 +50,13 @@ def train_lr(env, policy, train_dataset: dict, val_dataset: dict = None,
     """
     config      = config or LRConfig()
     gamma       = env.discount()
-    temperature = config.temperature
     T           = config.horizon
+
+    # Annealing: env decides; tf.Variable so @tf.function reads it live.
+    schedule = env.annealing_schedule()
+    temp_var = tf.Variable(
+        schedule.value if schedule else config.temperature,
+        dtype=tf.float32, trainable=False)
 
     validate_dataset_keys(train_dataset, _TRAIN_KEYS, "train_lr", "train_dataset")
     if val_dataset is not None:
@@ -94,7 +99,7 @@ def train_lr(env, policy, train_dataset: dict, val_dataset: dict = None,
                 s_t = env.merge_state(k, z_t)
                 a_t = policy(s_t, training=False)
                 r_t = tf.reshape(
-                    env.reward(s_t, a_t, temperature=temperature), [-1])
+                    env.reward(s_t, a_t, temperature=temp_var), [-1])
                 total_reward = total_reward + discount_t * r_t
                 k = env.endogenous_transition(k, a_t, z_t)
                 discount_t = discount_t * gamma
@@ -103,7 +108,7 @@ def train_lr(env, policy, train_dataset: dict, val_dataset: dict = None,
             # Gradients flow through k_T but not through the policy.
             if use_terminal:
                 v_term = tf.reshape(
-                    env.terminal_value(k, temperature=temperature), [-1])
+                    env.terminal_value(k, temperature=temp_var), [-1])
                 total_reward = total_reward + discount_t * v_term
 
             loss = -tf.reduce_mean(total_reward)
@@ -121,8 +126,13 @@ def train_lr(env, policy, train_dataset: dict, val_dataset: dict = None,
     for step, batch in enumerate(train_iter.take(config.n_steps)):
         loss = train_step(batch["s_endo_0"], batch["z_path"])
 
+        if schedule:
+            schedule.update()
+            temp_var.assign(schedule.value)
+
         # Evaluation
         if step % config.eval_interval == 0 or step == config.n_steps - 1:
+            temperature = float(temp_var)
             er = (evaluate_euler_residual(env, policy, val_dataset,
                                           temperature=temperature)
                   if val_dataset is not None else float("nan"))

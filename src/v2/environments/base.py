@@ -288,6 +288,23 @@ class MDPEnvironment(ABC):
     # Optional methods — override as needed
     # ------------------------------------------------------------------
 
+    def annealing_schedule(self):
+        """Return a fresh AnnealingSchedule if reward has non-differentiable gates.
+
+        Factory method — each call returns a **new** instance so that
+        separate training runs on the same env do not share state.
+
+        The environment decides whether annealing is needed based on its
+        own domain knowledge (e.g. whether fixed-cost indicators are
+        active).  Trainers call this once at the start of training and
+        step the returned schedule each iteration.
+
+        Returns:
+            AnnealingSchedule instance, or None if no annealing is needed
+            (trainer will use a fixed config.temperature instead).
+        """
+        return None
+
     def grid_spec(self):
         """Per-variable grid discretization hints for discrete solvers.
 

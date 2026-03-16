@@ -25,10 +25,9 @@ from src.v2.solvers.grid import (
 from src.v2.solvers.config import GridConfig, VFIConfig, PFIConfig
 from src.v2.solvers.vfi import solve_vfi
 from src.v2.solvers.pfi import solve_pfi
-from src.v2.environments.basic_investment import BasicInvestmentEnv
+from src.v2.environments.basic_investment import BasicInvestmentEnv, EconomicParams, ShockParams
 from src.v2.environments.base import MDPEnvironment
 from src.v2.data.generator import DataGenerator, DataGeneratorConfig
-from src.economy.parameters import EconomicParams, ShockParams
 
 
 # =============================================================================
