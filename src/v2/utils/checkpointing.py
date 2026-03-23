@@ -33,14 +33,15 @@ Usage::
     result.load_weights(policy=policy_net, value_net=value_net)
 """
 
-import json
 import os
-import time
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional
 
-import numpy as np
+from src.v2.benchmarks.storage import (
+    load_training_result_bundle,
+    save_training_result_bundle,
+)
 
 
 @dataclass
@@ -133,31 +134,14 @@ def save_run(result: TrainingResult, run_dir: str,
     Returns:
         The run_dir path (for convenience).
     """
-    os.makedirs(run_dir, exist_ok=True)
-    weights_dir = os.path.join(run_dir, "weights")
-    os.makedirs(weights_dir, exist_ok=True)
-
-    # Config
-    with open(os.path.join(run_dir, "config.json"), "w") as f:
-        json.dump(result.config, f, indent=2, default=str)
-
-    # Metadata
-    with open(os.path.join(run_dir, "metadata.json"), "w") as f:
-        json.dump(result.metadata, f, indent=2, default=str)
-
-    # History
-    history_arrays = {k: np.array(v) for k, v in result.history.items()}
-    np.savez(os.path.join(run_dir, "history.npz"), **history_arrays)
-
-    # Weights
-    if policy is not None:
-        policy.save_weights(os.path.join(weights_dir, "policy.weights.h5"))
-    if value_net is not None:
-        value_net.save_weights(
-            os.path.join(weights_dir, "value_net.weights.h5"))
-
-    result.run_dir = run_dir
-    return run_dir
+    saved = save_training_result_bundle(
+        result,
+        run_dir,
+        policy=policy,
+        value_net=value_net,
+    )
+    result.run_dir = saved
+    return saved
 
 
 def load_run(run_dir: str) -> TrainingResult:
@@ -170,19 +154,12 @@ def load_run(run_dir: str) -> TrainingResult:
         TrainingResult with config, history, metadata populated.
         Call result.load_weights(policy=...) to restore model weights.
     """
-    with open(os.path.join(run_dir, "config.json")) as f:
-        config = json.load(f)
-
-    with open(os.path.join(run_dir, "metadata.json")) as f:
-        metadata = json.load(f)
-
-    history_data = np.load(os.path.join(run_dir, "history.npz"))
-    history = {k: history_data[k].tolist() for k in history_data.files}
+    payload = load_training_result_bundle(run_dir)
 
     return TrainingResult(
-        method=metadata.get("method", "unknown"),
-        config=config,
-        history=history,
-        metadata=metadata,
-        run_dir=run_dir,
+        method=payload["metadata"].get("method", "unknown"),
+        config=payload["config"],
+        history=payload["history"],
+        metadata=payload["metadata"],
+        run_dir=payload["run_dir"],
     )

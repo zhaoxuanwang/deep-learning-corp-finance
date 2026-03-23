@@ -4,6 +4,8 @@ notebooks/
 .venv/
 .DS_Store
 experiments/
+production/
+notes/
 
 # --- Python Standard Exclusions ---
 __pycache__/

@@ -6,6 +6,7 @@ Used by the BRM trainer which learns V(s) directly, not Q(s, a).
 
 import tensorflow as tf
 from src.v2.networks.base import GenericNetwork
+from src.v2.utils.seeding import make_seed_int
 
 
 class StateValueNetwork(GenericNetwork):
@@ -22,11 +23,19 @@ class StateValueNetwork(GenericNetwork):
 
     def __init__(self, state_dim: int,
                  n_layers: int = 2, n_neurons: int = 128,
-                 name: str = "state_value", **kwargs):
+                 name: str = "state_value", seed: tuple = None,
+                 activation: str = "silu", **kwargs):
         super().__init__(input_dim=state_dim, n_layers=n_layers,
-                         n_neurons=n_neurons, name=name, **kwargs)
+                         n_neurons=n_neurons, name=name, seed=seed,
+                         activation=activation, **kwargs)
+        head_init = "glorot_uniform"
+        if self.seed is not None:
+            head_init = tf.keras.initializers.GlorotUniform(
+                seed=make_seed_int(self.seed, "value_head"))
         self.output_head = tf.keras.layers.Dense(
-            1, use_bias=True, name="value_head")
+            1, use_bias=True, name="value_head",
+            kernel_initializer=head_init,
+            bias_initializer="zeros")
 
     def call(self, s, training=False):
         """Forward pass.
@@ -43,5 +52,9 @@ class StateValueNetwork(GenericNetwork):
 
     def get_config(self):
         config = super().get_config()
-        config.update({"state_dim": self.input_dim})
+        config.update({
+            "state_dim": self.input_dim,
+            "seed": list(self.seed) if self.seed is not None else None,
+            "activation": self.activation,
+        })
         return config

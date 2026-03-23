@@ -54,22 +54,32 @@ class GridAxis:
                    Use for capital (curvature highest at low k) and
                    productivity (log-AR(1) natural coordinate).
                    Grid values are always in levels, not log-space.
+        power:   Power exponent for non-linear spacing modes such as
+                 "zero_power". Larger values concentrate more points near
+                 zero while keeping the user-specified grid size fixed.
     """
     low: float
     high: float
     spacing: str = "linear"
+    power: float = 2.0
 
     def __post_init__(self):
         if self.low >= self.high:
             raise ValueError(
                 f"GridAxis requires low < high. Got low={self.low}, high={self.high}")
-        valid = {"linear", "log"}
+        valid = {"linear", "log", "zero_power"}
         if self.spacing not in valid:
             raise ValueError(
                 f"Unknown spacing '{self.spacing}'. Valid: {sorted(valid)}")
         if self.spacing == "log" and self.low <= 0:
             raise ValueError(
                 f"Log spacing requires low > 0. Got low={self.low}")
+        if self.spacing == "zero_power" and not (self.low < 0.0 < self.high):
+            raise ValueError(
+                "zero_power spacing requires bounds that straddle zero. "
+                f"Got low={self.low}, high={self.high}")
+        if self.power <= 0:
+            raise ValueError(f"GridAxis.power must be > 0. Got {self.power}")
 
 
 # =============================================================================
@@ -88,6 +98,9 @@ def build_1d_grid(axis: GridAxis, n: int) -> np.ndarray:
     """
     if n < 2:
         raise ValueError(f"Grid size must be >= 2. Got {n}")
+    if axis.spacing == "zero_power" and n < 3:
+        raise ValueError(
+            f"zero_power spacing requires n >= 3 so 0 can be included. Got {n}")
 
     if axis.spacing == "linear":
         return np.linspace(axis.low, axis.high, n, dtype=np.float64)
@@ -96,6 +109,21 @@ def build_1d_grid(axis: GridAxis, n: int) -> np.ndarray:
         log_low  = np.log(axis.low)
         log_high = np.log(axis.high)
         return np.exp(np.linspace(log_low, log_high, n)).astype(np.float64)
+
+    elif axis.spacing == "zero_power":
+        n_remaining = n - 1
+        neg_span = abs(axis.low)
+        pos_span = axis.high
+
+        n_neg = int(round(n_remaining * neg_span / (neg_span + pos_span)))
+        n_neg = min(max(n_neg, 1), n_remaining - 1)
+        n_pos = n_remaining - n_neg
+
+        neg_u = np.linspace(1.0, 0.0, n_neg + 1, dtype=np.float64)[:-1]
+        pos_u = np.linspace(0.0, 1.0, n_pos + 1, dtype=np.float64)[1:]
+        neg = -neg_span * np.power(neg_u, axis.power)
+        pos = pos_span * np.power(pos_u, axis.power)
+        return np.concatenate([neg, np.array([0.0]), pos]).astype(np.float64)
 
     raise ValueError(f"Unsupported spacing: {axis.spacing}")
 

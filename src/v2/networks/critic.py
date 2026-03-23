@@ -2,6 +2,7 @@
 
 import tensorflow as tf
 from src.v2.networks.base import GenericNetwork
+from src.v2.utils.seeding import make_seed_int
 
 
 class CriticNetwork(GenericNetwork):
@@ -19,14 +20,20 @@ class CriticNetwork(GenericNetwork):
 
     def __init__(self, state_dim: int, action_dim: int,
                  n_layers: int = 2, n_neurons: int = 128,
-                 name: str = "critic", **kwargs):
+                 name: str = "critic", seed: tuple = None, **kwargs):
         super().__init__(input_dim=state_dim + action_dim,
                          n_layers=n_layers, n_neurons=n_neurons,
-                         name=name, **kwargs)
+                         name=name, seed=seed, **kwargs)
         self.state_dim = state_dim
         self.action_dim = action_dim
+        head_init = "glorot_uniform"
+        if self.seed is not None:
+            head_init = tf.keras.initializers.GlorotUniform(
+                seed=make_seed_int(self.seed, "q_head"))
         self.output_head = tf.keras.layers.Dense(
-            1, use_bias=True, name="q_head")
+            1, use_bias=True, name="q_head",
+            kernel_initializer=head_init,
+            bias_initializer="zeros")
 
     def call(self, s, a, training=False):
         """Forward pass.
@@ -52,5 +59,6 @@ class CriticNetwork(GenericNetwork):
         config.update({
             "state_dim": self.state_dim,
             "action_dim": self.action_dim,
+            "seed": list(self.seed) if self.seed is not None else None,
         })
         return config

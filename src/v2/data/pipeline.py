@@ -3,9 +3,11 @@ src/v2/data/pipeline.py
 
 Mini-batch iteration utilities and normalizer fitting for offline training.
 
-The mini-batch ORDER within each epoch is intentionally non-deterministic
-(standard SGD convention). Reproducibility is guaranteed at the dataset
-level via the master seed in DataGenerator — the underlying data is fixed.
+The mini-batch ORDER within each epoch remains stochastic in the SGD sense,
+but callers can now pass an explicit shuffle seed so that the randomized
+order is reproducible across reruns. Reproducibility is still guaranteed at
+the dataset level via the master seed in DataGenerator — the underlying
+data is fixed.
 
 Normalizer fitting
 ------------------
@@ -19,7 +21,7 @@ run receive identical normalizer statistics.
 
 from __future__ import annotations
 
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import tensorflow as tf
 
@@ -50,20 +52,28 @@ def validate_dataset_keys(
 def build_iterator(
     dataset: Dict[str, tf.Tensor],
     batch_size: int,
-    shuffle_buffer: int = 10000,
+    shuffle_pool_size: Optional[int] = None,
+    shuffle_seed: Optional[int] = None,
 ) -> tf.data.Dataset:
     """Wrap a dataset dict into a repeating, shuffled tf.data mini-batch iterator.
 
-    The dataset is shuffled at the element level each epoch (non-deterministic
-    mini-batch order) and repeated indefinitely. Call `.take(n_steps)` on the
-    returned dataset to consume exactly n_steps batches.
+    The dataset is shuffled at the element level each epoch and repeated
+    indefinitely. When shuffle_seed is provided, the batch order is stochastic
+    but reproducible across reruns. Call `.take(n_steps)` on the returned
+    dataset to consume exactly n_steps batches.
 
     Args:
-        dataset:        Dict mapping key -> tensor of shape (N, ...).
-                        All tensors must have the same leading dimension N.
-        batch_size:     Mini-batch size.
-        shuffle_buffer: Buffer size for tf.data.Dataset.shuffle().
-                        Set to >= N for a full shuffle each epoch.
+        dataset:          Dict mapping key -> tensor of shape (N, ...).
+                          All tensors must have the same leading dimension N.
+        batch_size:       Mini-batch size.
+        shuffle_pool_size: Number of elements held in the sampling pool for
+                          shuffling. None (default) uses the full dataset size,
+                          giving a true random permutation each epoch.  Pass an
+                          explicit int only when memory is a hard constraint;
+                          values much smaller than N produce correlated batches.
+        shuffle_seed:     Optional deterministic seed for the tf.data shuffle.
+                          When provided, batch order stays stochastic within a
+                          run but becomes reproducible across reruns.
 
     Returns:
         tf.data.Dataset that yields batched dicts indefinitely.
@@ -75,10 +85,16 @@ def build_iterator(
             s = env.merge_state(batch["s_endo"], batch["z"])
             ...
     """
+    n_samples = int(next(iter(dataset.values())).shape[0])
+    pool_size = shuffle_pool_size if shuffle_pool_size is not None else n_samples
     tf_dataset = tf.data.Dataset.from_tensor_slices(dataset)
     tf_dataset = (
         tf_dataset
-        .shuffle(buffer_size=shuffle_buffer, reshuffle_each_iteration=True)
+        .shuffle(
+            buffer_size=pool_size,
+            seed=shuffle_seed,
+            reshuffle_each_iteration=True,
+        )
         .batch(batch_size, drop_remainder=True)
         .repeat()
         .prefetch(tf.data.AUTOTUNE)

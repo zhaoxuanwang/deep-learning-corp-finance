@@ -23,7 +23,7 @@ import numpy as np
 from src.v2.trainers.config import SHACVanillaConfig
 from src.v2.trainers.core import (
     polyak_update, build_target_value, warm_start_value_net,
-    evaluate_euler_residual, evaluate_bellman_residual_v,
+    evaluate_euler_residual, evaluate_bellman_residual,
 )
 from src.v2.data.pipeline import (
     build_iterator, validate_dataset_keys, fit_normalizer_traj,
@@ -69,8 +69,7 @@ def train_shac_vanilla(env, policy, value_net, train_dataset: dict,
     # Reward normalization
     # ------------------------------------------------------------------
     if config.reward_scale is None:
-        reward_scale = float(env.compute_reward_scale(
-            seed=tf.constant(list(config.master_seed), dtype=tf.int32)))
+        reward_scale = float(env.reward_scale())
         print(f"SHAC-vanilla: auto reward_scale = {reward_scale:.6f} "
               f"(1/|V*| ≈ {1.0/reward_scale:.1f})")
     else:
@@ -288,7 +287,7 @@ def train_shac_vanilla(env, policy, value_net, train_dataset: dict,
                 if val_dataset is not None:
                     er = evaluate_euler_residual(
                         env, policy, val_dataset, temperature=temperature)
-                    br = evaluate_bellman_residual_v(
+                    br = evaluate_bellman_residual(
                         env, policy, value_net, val_dataset,
                         temperature=temperature)
                 history["step"].append(step)
@@ -297,8 +296,8 @@ def train_shac_vanilla(env, policy, value_net, train_dataset: dict,
                 history["euler_residual"].append(er)
                 history["bellman_residual"].append(br)
                 print(f"SHAC-vanilla step {step:5d} | "
-                      f"L_actor={float(loss_actor):.4f} | "
-                      f"L_critic={avg_critic_loss:.6f} | "
+                      f"loss_actor={float(loss_actor):.4f} | "
+                      f"loss_critic={avg_critic_loss:.6f} | "
                       f"euler={er:.6f} | bellman={br:.6f}")
 
             step += 1

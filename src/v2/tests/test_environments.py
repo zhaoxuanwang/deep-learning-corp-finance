@@ -21,7 +21,11 @@ def env():
 @pytest.fixture
 def custom_env():
     """BasicInvestmentEnv with custom parameters."""
-    econ = EconomicParams(r_rate=0.04, delta=0.1, theta=0.7)
+    econ = EconomicParams(
+        interest_rate=0.04,
+        depreciation_rate=0.1,
+        production_elasticity=0.7,
+    )
     shock = ShockParams(rho=0.7, sigma=0.1)
     return BasicInvestmentEnv(econ_params=econ, shock_params=shock)
 
@@ -54,7 +58,7 @@ class TestMDPInterface:
 
     def test_discount_is_beta(self, env):
         """Discount factor is 1/(1+r)."""
-        expected_beta = 1.0 / (1.0 + env.econ.r_rate)
+        expected_beta = 1.0 / (1.0 + env.econ.interest_rate)
         assert env.discount() == pytest.approx(expected_beta, rel=1e-6)
 
 
@@ -121,7 +125,7 @@ class TestDynamics:
         assert s_next.shape == (32, 2)
 
     def test_capital_accumulation(self, env):
-        """k' = (1-delta)*k + I when result is above k_min."""
+        """k' = (1-depreciation_rate)*k + I when result is above k_min."""
         # Use k_val well within valid bounds.
         k_val = float(env.k_star)  # steady-state capital
         z_val = 1.0
@@ -131,7 +135,7 @@ class TestDynamics:
         eps = tf.constant([[0.0]])  # no shock
         s_next = env.transition(s, a, eps)
         k_next = float(s_next[0, 0])
-        expected = (1.0 - env.econ.delta) * k_val + I_val
+        expected = (1.0 - env.econ.depreciation_rate) * k_val + I_val
         assert k_next == pytest.approx(expected, rel=1e-5)
 
     def test_capital_floor(self, env):
@@ -180,6 +184,120 @@ class TestDynamics:
         grad = tape.gradient(loss, a)
         assert grad is not None
 
+    def test_adjustment_indicator_supports_hard_and_soft_modes(self):
+        """Fixed-cost gate can be queried in either hard or soft mode."""
+        env = BasicInvestmentEnv(
+            econ_params=EconomicParams(cost_convex=0.2, cost_fixed=0.02))
+        s = tf.constant([[env.k_star, 1.0]], dtype=tf.float32)
+
+        no_adjust = tf.constant([[0.0]], dtype=tf.float32)
+        invest = tf.constant([[0.5]], dtype=tf.float32)
+
+        hard_no_adjust = env.adjustment_indicator(
+            s, no_adjust, gate_mode="hard")
+        soft_no_adjust = env.adjustment_indicator(
+            s, no_adjust, temperature=1e-6, gate_mode="soft")
+        hard_invest = env.adjustment_indicator(
+            s, invest, gate_mode="hard")
+        soft_invest = env.adjustment_indicator(
+            s, invest, temperature=1e-6, gate_mode="soft")
+
+        assert float(hard_no_adjust[0]) == pytest.approx(0.0)
+        assert 0.45 < float(soft_no_adjust[0]) < 0.55
+        assert float(hard_invest[0]) == pytest.approx(1.0)
+        assert float(soft_invest[0]) > 1.0 - 1e-6
+
+    def test_reward_accepts_hard_gate_mode(self):
+        """Hard-gate reward evaluation is available for discrete solvers."""
+        env = BasicInvestmentEnv(
+            econ_params=EconomicParams(cost_convex=0.2, cost_fixed=0.02))
+        s = tf.constant([[env.k_star, 1.0]], dtype=tf.float32)
+        a = tf.constant([[0.25]], dtype=tf.float32)
+        reward = env.reward(s, a, gate_mode="hard")
+        assert np.isfinite(float(tf.squeeze(reward)))
+
+    def test_economic_params_accept_legacy_aliases(self):
+        """Legacy aliases still map onto the renamed public fields."""
+        econ = EconomicParams(r_rate=0.03, delta=0.2, theta=0.65)
+        assert econ.interest_rate == pytest.approx(0.03)
+        assert econ.depreciation_rate == pytest.approx(0.2)
+        assert econ.production_elasticity == pytest.approx(0.65)
+        assert econ.r_rate == pytest.approx(0.03)
+        assert econ.delta == pytest.approx(0.2)
+        assert econ.theta == pytest.approx(0.65)
+
+    def test_adjustment_epsilon_is_configurable(self):
+        """The fixed-cost gate tolerance can be varied explicitly."""
+        env = BasicInvestmentEnv(
+            econ_params=EconomicParams(
+                cost_convex=0.2,
+                cost_fixed=0.02,
+                adjustment_epsilon=1e-3,
+            )
+        )
+        s = tf.constant([[env.k_star, 1.0]], dtype=tf.float32)
+        a_small = tf.constant([[5e-4 * env.k_star]], dtype=tf.float32)
+        hard_gate = env.adjustment_indicator(s, a_small, gate_mode="hard")
+        assert float(hard_gate[0]) == pytest.approx(0.0)
+
+    def test_soft_adjustment_epsilon_overrides_soft_gate_only(self):
+        """Soft/STE gates can use a training-only epsilon without changing hard mode."""
+        env = BasicInvestmentEnv(
+            econ_params=EconomicParams(
+                cost_convex=0.2,
+                cost_fixed=0.02,
+                adjustment_epsilon=1e-8,
+            ),
+            soft_adjustment_epsilon=5e-3,
+        )
+        s = tf.constant([[env.k_star, 1.0]], dtype=tf.float32)
+        no_adjust = tf.constant([[0.0]], dtype=tf.float32)
+
+        soft_gate = env.adjustment_indicator(
+            s, no_adjust, temperature=1e-3, gate_mode="soft"
+        )
+        hard_gate = env.adjustment_indicator(
+            s, no_adjust, gate_mode="hard"
+        )
+        assert float(hard_gate[0]) == pytest.approx(0.0)
+        assert float(soft_gate[0]) < 0.01
+
+    def test_default_gate_mode_applies_when_gate_mode_omitted(self):
+        """Env-level gate mode lets trainers switch from soft to STE generically."""
+        env = BasicInvestmentEnv(
+            econ_params=EconomicParams(cost_convex=0.2, cost_fixed=0.02),
+            soft_adjustment_epsilon=5e-3,
+            default_gate_mode="ste",
+        )
+        s = tf.constant([[env.k_star, 1.0]], dtype=tf.float32)
+        no_adjust = tf.constant([[0.0]], dtype=tf.float32)
+
+        gate = env.adjustment_indicator(s, no_adjust, temperature=1e-3)
+        reward = env.reward(s, no_adjust, temperature=1e-3)
+
+        assert float(gate[0]) == pytest.approx(0.0)
+        assert np.isfinite(float(tf.squeeze(reward)))
+
+    def test_soft_adjustment_epsilon_factor_tracks_temperature(self):
+        """Dynamic soft epsilon can stay proportional to the current temperature."""
+        env = BasicInvestmentEnv(
+            econ_params=EconomicParams(cost_convex=0.2, cost_fixed=0.02),
+            soft_adjustment_epsilon_factor=5.0,
+        )
+        s = tf.constant([[env.k_star, 1.0]], dtype=tf.float32)
+        no_adjust = tf.constant([[0.0]], dtype=tf.float32)
+
+        gate_hi = env.adjustment_indicator(
+            s, no_adjust, temperature=1e-2, gate_mode="soft"
+        )
+        gate_lo = env.adjustment_indicator(
+            s, no_adjust, temperature=1e-3, gate_mode="soft"
+        )
+
+        target = float(tf.sigmoid(-5.0))
+        assert float(gate_hi[0]) == pytest.approx(target)
+        assert float(gate_lo[0]) == pytest.approx(target)
+
 
 # =============================================================================
 # Euler residual
@@ -227,7 +345,7 @@ class TestTerminalValue:
         s_endo = tf.constant([[3.0]])
         v = env.terminal_value(s_endo)
         # Reconstruct what terminal_value computes internally
-        z_bar = env.exo_stationary_mean()
+        z_bar = env.stationary_exo()
         s_bar = env.merge_state(s_endo, tf.reshape(z_bar, [1, -1]))
         a_bar = env.stationary_action(s_endo)
         r = env.reward(s_bar, a_bar)
@@ -241,33 +359,35 @@ class TestTerminalValue:
 # =============================================================================
 
 class TestRewardScale:
-    """Tests for compute_reward_scale (λ-preprocessing)."""
+    """Tests for reward_scale (λ-preprocessing)."""
 
     def test_reward_scale_positive(self, env):
-        """compute_reward_scale returns a positive scalar."""
-        seed = tf.constant([42, 0], dtype=tf.int32)
-        lam = env.compute_reward_scale(seed=seed)
+        """reward_scale returns a positive scalar."""
+        lam = env.reward_scale()
         assert lam > 0
 
-    def test_reward_scale_requires_seed_on_base(self, env):
-        """Generic compute_reward_scale raises if seed not provided."""
+    def test_reward_scale_no_seed_required(self, env):
+        """reward_scale works without seed (analytical override ignores it)."""
+        lam = env.reward_scale()
+        assert lam > 0
+
+    def test_reward_scale_base_uses_fixed_seed_when_none(self, env):
+        """Base class reward_scale uses fixed internal seed when called without seed."""
         from src.v2.environments.base import MDPEnvironment
-        with pytest.raises(ValueError, match="seed is required"):
-            MDPEnvironment.compute_reward_scale(env)
+        lam1 = MDPEnvironment.reward_scale(env)
+        lam2 = MDPEnvironment.reward_scale(env)
+        assert lam1 == pytest.approx(lam2, rel=1e-6)
 
     def test_reward_scale_analytical_inverse_of_v_star(self, env):
         """Analytical override equals 1 / |V*(k*, z_mean)|."""
         s_endo_ss = tf.constant([[env.k_star]])
         abs_v_star = float(tf.abs(env.terminal_value(s_endo_ss)[0]))
         expected = 1.0 / abs_v_star
-        seed = tf.constant([42, 0], dtype=tf.int32)
-        assert env.compute_reward_scale(seed=seed) == pytest.approx(
-            expected, rel=1e-5)
+        assert env.reward_scale() == pytest.approx(expected, rel=1e-5)
 
     def test_reward_scale_makes_q_order_one(self, env):
         """λ · |V*| ≈ 1 — the whole point of the normalizer."""
-        seed = tf.constant([42, 0], dtype=tf.int32)
-        lam = env.compute_reward_scale(seed=seed)
+        lam = env.reward_scale()
         s_endo_ss = tf.constant([[env.k_star]])
         abs_v_star = float(tf.abs(env.terminal_value(s_endo_ss)[0]))
         assert lam * abs_v_star == pytest.approx(1.0, rel=0.01)
@@ -276,8 +396,8 @@ class TestRewardScale:
         """Generic and analytical λ should be same order of magnitude."""
         from src.v2.environments.base import MDPEnvironment
         seed = tf.constant([42, 0], dtype=tf.int32)
-        lam_analytical = env.compute_reward_scale(seed=seed)
-        lam_generic = MDPEnvironment.compute_reward_scale(
+        lam_analytical = env.reward_scale()
+        lam_generic = MDPEnvironment.reward_scale(
             env, n_samples=2000, seed=seed)
         # Both positive, analytical is tighter (larger λ = smaller C).
         assert lam_analytical > lam_generic, (
@@ -326,3 +446,45 @@ class TestAnnealingSchedule:
         """MDPEnvironment base default is None."""
         env = BasicInvestmentEnv()  # cost_fixed=0 by default
         assert MDPEnvironment.annealing_schedule(env) is None
+
+
+# =============================================================================
+# Analytical policy
+# =============================================================================
+
+class TestAnalyticalPolicy:
+    """Tests for env.analytical_policy()."""
+
+    def test_output_shape(self, env):
+        """analytical_policy returns shape (batch, 1)."""
+        s = env.sample_initial_states(32, seed=tf.constant([50, 51]))
+        a = env.analytical_policy(s)
+        assert a.shape == (32, 1)
+
+    def test_differentiable(self, env):
+        """analytical_policy is differentiable w.r.t. state."""
+        s = tf.Variable(env.sample_initial_states(4, seed=tf.constant([52, 53])))
+        with tf.GradientTape() as tape:
+            a = env.analytical_policy(s)
+            loss = tf.reduce_sum(a)
+        grad = tape.gradient(loss, s)
+        assert grad is not None
+
+    def test_base_class_raises(self, env):
+        """Base class analytical_policy raises NotImplementedError."""
+        from src.v2.environments.base import MDPEnvironment
+        with pytest.raises(NotImplementedError):
+            MDPEnvironment.analytical_policy(env, tf.zeros((1, 2)))
+
+    def test_frictionless_policy_matches_compute_frictionless_policy(self, env):
+        """analytical_policy matches the module-level compute_frictionless_policy."""
+        from src.v2.environments.basic_investment import compute_frictionless_policy
+        z_vals = np.array([0.8, 1.0, 1.2])
+        k_star_val = env.k_star
+        s = tf.constant(
+            [[k_star_val, z] for z in z_vals], dtype=tf.float32)
+        I_analytical = env.analytical_policy(s).numpy().reshape(-1)
+        kprime_analytical = (1.0 - env.econ.depreciation_rate) * k_star_val + I_analytical
+        kprime_reference = compute_frictionless_policy(z_vals, env.econ, env.shocks)
+        kprime_reference = np.clip(kprime_reference, env.k_min, env.k_max)
+        np.testing.assert_allclose(kprime_analytical, kprime_reference, rtol=1e-5)

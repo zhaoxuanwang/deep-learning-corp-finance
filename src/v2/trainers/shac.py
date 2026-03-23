@@ -53,15 +53,21 @@ Xu, J., Makoviychuk, V., Narang, Y., Ramos, F., Matusik, W., Garg, A.,
 Differentiable Simulation. ICLR 2022.
 """
 
+import time
+
 import tensorflow as tf
 from src.v2.trainers.config import SHACConfig
 from src.v2.trainers.core import (
     polyak_update, build_target_value, build_target_policy,
-    evaluate_euler_residual, evaluate_bellman_residual_v,
+    StopTracker,
+    append_history_row,
+    capture_checkpoint,
+    run_eval_callback,
 )
 from src.v2.data.pipeline import (
     build_iterator, validate_dataset_keys, fit_normalizer_traj,
 )
+from src.v2.utils.seeding import make_seed_int, seed_runtime
 
 
 _TRAIN_KEYS = ["s_endo_0", "z_path"]
@@ -73,7 +79,8 @@ _VAL_KEYS   = ["s_endo", "z", "z_next_main"]
 # ---------------------------------------------------------------------------
 
 def train_shac(env, policy, value_net, train_dataset: dict,
-               val_dataset: dict = None, config: SHACConfig = None):
+               val_dataset: dict = None, config: SHACConfig = None,
+               eval_callback=None):
     """Train policy and value networks using SHAC (DDPG-style variant).
 
     Actor (h-step BPTT, current π + current V):
@@ -94,11 +101,16 @@ def train_shac(env, policy, value_net, train_dataset: dict,
         train_dataset: Trajectory-format dataset dict (see module docstring).
         val_dataset:   Flattened-format dataset for evaluation (optional).
         config:        SHACConfig with hyperparameters.
+        eval_callback: Optional callable returning eval metrics at checkpoints.
 
     Returns:
         dict with keys: policy, value_net, history, config.
     """
     config      = config or SHACConfig()
+    seed_runtime(
+        config.master_seed, "train_shac",
+        strict_reproducibility=config.strict_reproducibility,
+    )
     gamma       = env.discount()
     horizon     = config.horizon
     window_len  = config.short_horizon
@@ -124,6 +136,13 @@ def train_shac(env, policy, value_net, train_dataset: dict,
     if val_dataset is not None:
         validate_dataset_keys(val_dataset, _VAL_KEYS,
                               "train_shac", "val_dataset")
+    if config.monitor is not None and eval_callback is None and val_dataset is None:
+        raise ValueError(
+            "train_shac requires val_dataset when monitor is set and no "
+            "eval_callback is provided."
+        )
+
+    train_start = time.perf_counter()
 
     horizon_data = train_dataset["z_path"].shape[1] - 1
     if horizon > horizon_data:
@@ -270,13 +289,25 @@ def train_shac(env, policy, value_net, train_dataset: dict,
     # ------------------------------------------------------------------
     # Training loop
     # ------------------------------------------------------------------
-    train_iter = build_iterator(train_dataset, config.batch_size)
-    history = {
-        "step": [], "loss_actor": [], "loss_critic": [],
-        "euler_residual": [], "bellman_residual": [],
-    }
+    train_iter = build_iterator(
+        train_dataset, config.batch_size,
+        shuffle_seed=make_seed_int(
+            config.master_seed, "train_shac", "batch_shuffle"),
+    )
+    history = {}
+    stop_tracker = StopTracker(
+        monitor=config.monitor,
+        mode=config.mode,
+        threshold=config.threshold,
+        threshold_patience=config.threshold_patience,
+        plateau_patience=config.plateau_patience,
+        plateau_min_delta=config.plateau_min_delta,
+        plateau_rel_delta=config.plateau_rel_delta,
+        min_steps_before_stop=config.min_steps_before_stop,
+    )
 
     step = 0
+    last_step = -1
 
     for batch in train_iter:
         if step >= config.n_steps:
@@ -290,6 +321,7 @@ def train_shac(env, policy, value_net, train_dataset: dict,
         for win_idx in range(n_windows):
             if step >= config.n_steps:
                 break
+            last_step = step
 
             t0 = win_idx * window_len
             z_window = z_path[:, t0:t0 + window_len + 1, :]
@@ -326,32 +358,83 @@ def train_shac(env, policy, value_net, train_dataset: dict,
                 temp_var.assign(schedule.value)
 
             # Logging
-            if step % config.eval_interval == 0 or step == config.n_steps - 1:
-                temperature = float(temp_var)
-                euler_res = bellman_res = float("nan")
-                if val_dataset is not None:
-                    euler_res = evaluate_euler_residual(
-                        env, policy, val_dataset, temperature=temperature)
-                    bellman_res = evaluate_bellman_residual_v(
-                        env, policy, value_net, val_dataset,
-                        temperature=temperature)
-                history["step"].append(step)
-                history["loss_actor"].append(float(loss_actor))
-                history["loss_critic"].append(float(loss_c))
-                history["euler_residual"].append(euler_res)
-                history["bellman_residual"].append(bellman_res)
-                print(f"SHAC step {step:5d} | "
-                      f"L_actor={float(loss_actor):.4f} | "
-                      f"L_critic={float(loss_c):.6f} | "
-                      f"euler={euler_res:.6f} | bellman={bellman_res:.6f}")
+            elapsed_sec = time.perf_counter() - train_start
+            cap_reached = (
+                config.max_wall_time_sec is not None
+                and elapsed_sec >= config.max_wall_time_sec
+            )
+            if step % config.eval_interval == 0 or step == config.n_steps - 1 or cap_reached:
+                train_temperature = float(temp_var)
+                eval_metrics = run_eval_callback(
+                    step,
+                    env,
+                    policy,
+                    value_net,
+                    val_dataset,
+                    train_temperature,
+                    eval_callback=eval_callback,
+                    eval_temperature=(
+                        config.eval_temperature
+                        if eval_callback is None else None
+                    ),
+                )
+                elapsed_sec = time.perf_counter() - train_start
+                stop_on_threshold = stop_tracker.record_eval(
+                    step, elapsed_sec, eval_metrics)
+                if not stop_on_threshold and cap_reached:
+                    stop_tracker.finalize("max_wall_time", step, elapsed_sec)
+                elif not stop_on_threshold and step == config.n_steps - 1:
+                    stop_tracker.finalize("max_steps", step, elapsed_sec)
+
+                append_history_row(
+                    history,
+                    step,
+                    elapsed_sec,
+                    train_temperature,
+                    base_scalars={
+                        "loss_actor": float(loss_actor),
+                        "loss_critic": float(loss_c),
+                    },
+                    eval_metrics=eval_metrics,
+                )
+                status = ""
+                if stop_on_threshold:
+                    status = f" | stop={stop_tracker.stop_reason}"
+                elif cap_reached:
+                    status = " | stop=max_wall_time"
+                monitor_name = stop_tracker.monitor or next(iter(eval_metrics), None)
+                monitor_text = ""
+                if monitor_name is not None and monitor_name in eval_metrics:
+                    monitor_text = (
+                        f" | {monitor_name}={float(eval_metrics[monitor_name]):.6f}"
+                    )
+                print(
+                    f"SHAC step {step:5d} | "
+                    f"loss_actor={float(loss_actor):.4f} | "
+                    f"loss_critic={float(loss_c):.6f}"
+                    f"{monitor_text} | temp={train_temperature:.6g} | "
+                    f"elapsed={elapsed_sec:.1f}s{status}"
+                )
+                capture_checkpoint(step, config, policy=policy, value_net=value_net)
+                if stop_on_threshold or cap_reached:
+                    step += 1
+                    break
 
             step += 1
+        if stop_tracker.stop_reason in {"converged", "plateau", "max_wall_time"}:
+            break
+
+    wall_time_sec = time.perf_counter() - train_start
+    if stop_tracker.stop_reason is None and last_step >= 0:
+        stop_tracker.finalize("max_steps", last_step, wall_time_sec)
 
     return {
         "policy":    policy,
         "value_net": value_net,
         "history":   history,
         "config":    config,
+        "wall_time_sec": wall_time_sec,
+        **stop_tracker.result_dict(),
     }
 
 
@@ -370,8 +453,7 @@ def _resolve_reward_scale(env, config: SHACConfig) -> float:
         return reward_scale
 
     if config.normalize_rewards:
-        reward_scale = float(env.compute_reward_scale(
-            seed=tf.constant(list(config.master_seed), dtype=tf.int32)))
+        reward_scale = float(env.reward_scale())
         print(f"SHAC: auto reward_scale = {reward_scale:.6f} "
               f"(1/|V*| ≈ {1.0/reward_scale:.1f})")
         return reward_scale

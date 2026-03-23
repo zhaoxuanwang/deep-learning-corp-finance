@@ -18,7 +18,7 @@ from src.v2.data.pipeline import (
 )
 from src.v2.trainers.core import (
     polyak_update, hard_update, build_target_policy, build_target_value,
-    evaluate_euler_residual, evaluate_bellman_residual_v,
+    evaluate_euler_residual, evaluate_bellman_residual, StopTracker,
 )
 from src.v2.trainers.config import (
     LRConfig, ERConfig, BRMConfig, SHACConfig, OptimizerConfig,
@@ -27,6 +27,7 @@ from src.v2.trainers.lr import train_lr
 from src.v2.trainers.er import train_er
 from src.v2.trainers.brm import train_brm
 from src.v2.trainers.shac import train_shac
+from src.v2.experimental.brm_joint import train_brm_joint
 
 
 # =============================================================================
@@ -201,11 +202,97 @@ class TestEvaluationMetrics:
         er = evaluate_euler_residual(env, policy, val_dataset)
         assert np.isfinite(er)
 
-    def test_evaluate_bellman_residual_v_finite(self, env, policy,
-                                                value_net, val_dataset):
-        """evaluate_bellman_residual_v returns a finite number."""
-        br = evaluate_bellman_residual_v(env, policy, value_net, val_dataset)
+    def test_evaluate_bellman_residual_finite(self, env, policy,
+                                              value_net, val_dataset):
+        """evaluate_bellman_residual returns a finite number."""
+        br = evaluate_bellman_residual(env, policy, value_net, val_dataset)
         assert np.isfinite(br)
+
+
+class TestStopTracker:
+    """Unit tests for shared threshold / stopping metadata."""
+
+    def test_stop_tracker_confirms_on_consecutive_hits(self):
+        tracker = StopTracker(monitor="metric", threshold=0.1, threshold_patience=2)
+
+        assert not tracker.record_eval(
+            step=0, elapsed_sec=1.0, metrics={"metric": 0.09})
+        assert tracker.record_eval(
+            step=1, elapsed_sec=2.0, metrics={"metric": 0.08})
+        assert tracker.converged is True
+        assert tracker.stop_reason == "converged"
+        assert tracker.threshold_step == 0
+        assert tracker.stop_step == 1
+        assert tracker.threshold_elapsed_sec == 1.0
+        assert tracker.stop_elapsed_sec == 2.0
+
+    def test_stop_tracker_plateau_after_patience(self):
+        tracker = StopTracker(
+            monitor="metric",
+            mode="min",
+            plateau_patience=2,
+            plateau_min_delta=0.01,
+        )
+
+        assert not tracker.record_eval(
+            step=0, elapsed_sec=1.0, metrics={"metric": 1.00})
+        assert not tracker.record_eval(
+            step=1, elapsed_sec=2.0, metrics={"metric": 0.90})
+        assert not tracker.record_eval(
+            step=2, elapsed_sec=3.0, metrics={"metric": 0.905})
+        assert tracker.record_eval(
+            step=3, elapsed_sec=4.0, metrics={"metric": 0.908})
+
+        assert tracker.converged is False
+        assert tracker.stop_reason == "plateau"
+        assert tracker.best_step == 1
+        assert tracker.best_elapsed_sec == 2.0
+        assert tracker.best_metric_value == pytest.approx(0.90)
+
+    def test_stop_tracker_relative_plateau_after_patience(self):
+        tracker = StopTracker(
+            monitor="metric",
+            mode="min",
+            plateau_patience=2,
+            plateau_min_delta=0.0,
+            plateau_rel_delta=0.05,
+        )
+
+        assert not tracker.record_eval(
+            step=0, elapsed_sec=1.0, metrics={"metric": 100.0})
+        assert not tracker.record_eval(
+            step=1, elapsed_sec=2.0, metrics={"metric": 97.0})  # < 5% improvement
+        assert tracker.record_eval(
+            step=2, elapsed_sec=3.0, metrics={"metric": 96.5})
+
+        assert tracker.stop_reason == "plateau"
+        assert tracker.best_step == 2
+        assert tracker.best_metric_value == pytest.approx(96.5)
+
+    def test_stop_tracker_freezes_terminal_plateau_metadata(self):
+        tracker = StopTracker(
+            monitor="metric",
+            mode="min",
+            plateau_patience=2,
+            plateau_min_delta=0.01,
+        )
+
+        assert not tracker.record_eval(
+            step=0, elapsed_sec=1.0, metrics={"metric": 1.00})
+        assert not tracker.record_eval(
+            step=1, elapsed_sec=2.0, metrics={"metric": 0.90})
+        assert not tracker.record_eval(
+            step=2, elapsed_sec=3.0, metrics={"metric": 0.905})
+        assert tracker.record_eval(
+            step=3, elapsed_sec=4.0, metrics={"metric": 0.908})
+
+        # Later accidental calls should preserve the original terminal state.
+        assert tracker.record_eval(
+            step=4, elapsed_sec=5.0, metrics={"metric": 0.50})
+        assert tracker.stop_reason == "plateau"
+        assert tracker.stop_step == 3
+        assert tracker.best_step == 1
+        assert tracker.best_metric_value == pytest.approx(0.90)
 
 
 # =============================================================================
@@ -248,6 +335,86 @@ class TestTrainLR:
                           policy_optimizer=_small_optimizer())
         with pytest.raises(ValueError, match="horizon"):
             train_lr(env, policy, traj_dataset, config=config)
+
+    def test_train_lr_threshold_stop_records_metadata(self, env, policy,
+                                                      traj_dataset, val_dataset):
+        """LR records elapsed time and stops on confirmed threshold hits."""
+        config = LRConfig(
+            n_steps=5, batch_size=16, horizon=4,
+            eval_interval=1,
+            stop_euler_threshold=1.0,
+            threshold_patience=2,
+            policy_optimizer=_small_optimizer(),
+        )
+        result = train_lr(env, policy, traj_dataset, val_dataset=val_dataset,
+                          config=config)
+        hist = result["history"]
+        assert result["converged"] is True
+        assert result["stop_reason"] == "converged"
+        assert result["threshold_step"] == 0
+        assert result["stop_step"] == 1
+        assert len(hist["elapsed_sec"]) == len(hist["step"])
+        assert len(hist["train_temperature"]) == len(hist["step"])
+        assert hist["elapsed_sec"][0] <= hist["elapsed_sec"][-1]
+
+    def test_train_lr_eval_temperature_override(self, env, policy, traj_dataset,
+                                                val_dataset, monkeypatch):
+        """LR validation uses eval_temperature when provided."""
+        seen = []
+
+        def fake_eval(_env, _policy, _val_dataset, temperature=0.0):
+            seen.append(float(temperature))
+            return 2.0
+
+        monkeypatch.setattr("src.v2.trainers.core.evaluate_euler_residual", fake_eval)
+        config = LRConfig(
+            n_steps=1, batch_size=16, horizon=4,
+            eval_interval=1,
+            eval_temperature=1e-6,
+            policy_optimizer=_small_optimizer(),
+        )
+        train_lr(env, policy, traj_dataset, val_dataset=val_dataset, config=config)
+        assert seen == [pytest.approx(1e-6)]
+
+    def test_train_lr_callback_metric_supports_plateau_stopping(self, env, policy,
+                                                                traj_dataset):
+        """LR can stop on a custom eval callback without a validation dataset."""
+        series = {
+            0: 5.0,
+            1: 4.0,
+            2: 4.03,
+            3: 4.05,
+        }
+
+        def eval_callback(step, _env, _policy, _value_net, _val_dataset,
+                          train_temperature):
+            assert train_temperature > 0.0
+            return {
+                "benchmark_policy_mae": series[step],
+                "lifetime_reward_val": 10.0 - 0.1 * step,
+            }
+
+        config = LRConfig(
+            n_steps=6,
+            batch_size=16,
+            horizon=4,
+            eval_interval=1,
+            monitor="benchmark_policy_mae",
+            mode="min",
+            plateau_patience=2,
+            plateau_min_delta=0.01,
+            policy_optimizer=_small_optimizer(),
+        )
+        result = train_lr(
+            env, policy, traj_dataset, config=config, eval_callback=eval_callback)
+        hist = result["history"]
+        assert result["converged"] is False
+        assert result["stop_reason"] == "plateau"
+        assert result["best_step"] == 1
+        assert result["stop_step"] == 3
+        assert hist["benchmark_policy_mae"] == pytest.approx([5.0, 4.0, 4.03, 4.05])
+        assert hist["lifetime_reward_val"] == pytest.approx([10.0, 9.9, 9.8, 9.7])
+        assert len(hist["train_temperature"]) == 4
 
 
 # =============================================================================
@@ -292,6 +459,24 @@ class TestTrainER:
                           policy_optimizer=_small_optimizer())
         with pytest.raises(ValueError, match="missing required keys"):
             train_er(env, policy, bad_dataset, config=config)
+
+    def test_train_er_threshold_stop_records_metadata(self, env, policy,
+                                                      flat_dataset, val_dataset):
+        """ER records threshold-stop metadata and elapsed history."""
+        config = ERConfig(
+            n_steps=5, batch_size=16,
+            eval_interval=1,
+            stop_euler_threshold=1.0,
+            threshold_patience=2,
+            policy_optimizer=_small_optimizer(),
+        )
+        result = train_er(env, policy, flat_dataset, val_dataset=val_dataset,
+                          config=config)
+        assert result["converged"] is True
+        assert result["stop_reason"] == "converged"
+        assert result["stop_step"] == 1
+        assert len(result["history"]["elapsed_sec"]) == 2
+        assert len(result["history"]["train_temperature"]) == 2
 
 
 # =============================================================================
@@ -368,6 +553,82 @@ class TestTrainBRM:
         result = train_brm(env, p, v, flat_dataset, config=config)
         assert all(np.isfinite(l) for l in result["history"]["loss_foc"])
 
+    def test_train_brm_threshold_stop_records_metadata(self, env, policy,
+                                                       value_net, flat_dataset,
+                                                       val_dataset):
+        """BRM exposes stop metadata and elapsed seconds."""
+        config = BRMConfig(
+            n_steps=5, batch_size=16,
+            eval_interval=1,
+            stop_euler_threshold=1.0,
+            threshold_patience=2,
+            warm_start_steps=0,
+            policy_optimizer=_small_optimizer(),
+        )
+        result = train_brm(env, policy, value_net, flat_dataset,
+                           val_dataset=val_dataset, config=config)
+        assert result["converged"] is True
+        assert result["stop_reason"] == "converged"
+        assert result["stop_step"] == 1
+        assert len(result["history"]["elapsed_sec"]) == 2
+        assert len(result["history"]["train_temperature"]) == 2
+
+
+class TestTrainBRMJoint:
+    """Smoke tests for the experimental joint-update BRM control."""
+
+    def test_train_brm_joint_runs(self, env, policy, value_net, flat_dataset):
+        config = BRMConfig(
+            n_steps=4,
+            batch_size=16,
+            eval_interval=2,
+            warm_start_steps=0,
+            policy_optimizer=_small_optimizer(),
+            critic_optimizer=_small_optimizer(),
+        )
+        result = train_brm_joint(env, policy, value_net, flat_dataset, config=config)
+        assert "policy" in result
+        assert "value_net" in result
+        assert len(result["history"]["step"]) > 0
+        assert all(np.isfinite(x) for x in result["history"]["loss"])
+
+    def test_train_brm_joint_supports_eval_callback_and_checkpoints(
+        self, env, policy, value_net, flat_dataset
+    ):
+        checkpoint_history = []
+
+        def eval_callback(step, _env, _policy, _value_net, _val_dataset,
+                          train_temperature):
+            assert train_temperature > 0.0
+            return {
+                "benchmark_policy_mae": 10.0 - step,
+                "lifetime_reward_val": train_temperature,
+            }
+
+        config = BRMConfig(
+            n_steps=3,
+            batch_size=16,
+            eval_interval=1,
+            warm_start_steps=0,
+            checkpoint_history=checkpoint_history,
+            snapshot_targets=("policy", "value_net"),
+            policy_optimizer=_small_optimizer(),
+            critic_optimizer=_small_optimizer(),
+        )
+        result = train_brm_joint(
+            env,
+            policy,
+            value_net,
+            flat_dataset,
+            config=config,
+            eval_callback=eval_callback,
+        )
+        hist = result["history"]
+        assert hist["benchmark_policy_mae"] == pytest.approx([10.0, 9.0, 8.0])
+        assert len(checkpoint_history) == 3
+        assert "policy" in checkpoint_history[0]["models"]
+        assert "value_net" in checkpoint_history[0]["models"]
+
 
 # =============================================================================
 # SHAC trainer (DDPG-style variant) tests
@@ -423,8 +684,9 @@ class TestTrainSHAC:
         assert len(hist["loss_actor"]) == 4
         assert all(np.isfinite(l) for l in hist["loss_actor"])
         assert all(np.isfinite(l) for l in hist["loss_critic"])
-        assert all(np.isfinite(r) for r in hist["euler_residual"])
+        assert all(np.isfinite(r) for r in hist["euler_residual_val"])
         assert all(np.isfinite(r) for r in hist["bellman_residual"])
+        assert len(hist["train_temperature"]) == len(hist["step"])
 
     # ---- Input validation ----
 
@@ -455,6 +717,63 @@ class TestTrainSHAC:
         steps = result["history"]["step"]
         assert steps[0] == 0
         assert steps[-1] == 5  # 0-indexed, last step is n_steps - 1
+
+    def test_train_shac_threshold_stop_records_metadata(self, env, traj_dataset,
+                                                        val_dataset):
+        """SHAC can stop early on confirmed threshold hits."""
+        p, v = _make_policy_and_value(env)
+        config = _shac_config(
+            n_steps=6,
+            eval_interval=1,
+            stop_euler_threshold=1.0,
+            threshold_patience=2,
+        )
+        result = train_shac(env, p, v, traj_dataset,
+                            val_dataset=val_dataset, config=config)
+        assert result["converged"] is True
+        assert result["stop_reason"] == "converged"
+        assert result["stop_step"] == 1
+        assert len(result["history"]["elapsed_sec"]) == 2
+
+    def test_train_shac_callback_metric_supports_plateau_stopping(
+        self, env, traj_dataset
+    ):
+        """SHAC must exit immediately once plateau stopping triggers."""
+        p, v = _make_policy_and_value(env)
+        series = {
+            0: 5.0,
+            1: 4.0,
+            2: 4.03,
+            3: 4.05,
+        }
+
+        def eval_callback(step, _env, _policy, _value_net, _val_dataset,
+                          train_temperature):
+            assert train_temperature > 0.0
+            return {
+                "benchmark_policy_mae": series[step],
+                "lifetime_reward_val": 10.0 - 0.1 * step,
+            }
+
+        config = _shac_config(
+            n_steps=10,
+            n_critic=1,
+            eval_interval=1,
+            monitor="benchmark_policy_mae",
+            mode="min",
+            plateau_patience=2,
+            plateau_min_delta=0.01,
+        )
+        result = train_shac(
+            env, p, v, traj_dataset, config=config, eval_callback=eval_callback)
+        hist = result["history"]
+        assert result["converged"] is False
+        assert result["stop_reason"] == "plateau"
+        assert result["best_step"] == 1
+        assert result["stop_step"] == 3
+        assert hist["step"] == [0, 1, 2, 3]
+        assert hist["benchmark_policy_mae"] == pytest.approx([5.0, 4.0, 4.03, 4.05])
+        assert hist["lifetime_reward_val"] == pytest.approx([10.0, 9.9, 9.8, 9.7])
 
     # ---- Config shape ----
 

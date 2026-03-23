@@ -169,7 +169,9 @@ class MDPEnvironment(ABC):
 
     @abstractmethod
     def reward(
-        self, s: tf.Tensor, a: tf.Tensor, temperature: float = 1e-6
+        self, s: tf.Tensor, a: tf.Tensor,
+        temperature: float = 1e-6,
+        gate_mode: str = "soft",
     ) -> tf.Tensor:
         """Scalar reward r(s, a).
 
@@ -177,6 +179,8 @@ class MDPEnvironment(ABC):
             s:           state tensor, shape (batch, state_dim).
             a:           action tensor, shape (batch, action_dim).
             temperature: smoothing for non-differentiable gates.
+            gate_mode:   how non-differentiable gates are handled.
+                         Environments without such gates may ignore this.
 
         Returns:
             Reward tensor, shape (batch,) or (batch, 1).
@@ -271,7 +275,7 @@ class MDPEnvironment(ABC):
     def sample_shocks(self, n: int, seed: tf.Tensor) -> tf.Tensor:
         """Sample n exogenous shocks (default: N(0,1), shape (n, shock_dim)).
 
-        Used by MVE trainer and compute_reward_scale. Override if the
+        Used by MVE trainer and reward_scale. Override if the
         shock distribution is non-Gaussian.
 
         Args:
@@ -348,16 +352,39 @@ class MDPEnvironment(ABC):
         raise NotImplementedError(
             f"{self.__class__.__name__} does not support the ER method.")
 
-    def compute_reward_scale(
+    def analytical_policy(
+        self, s: tf.Tensor, training: bool = False
+    ) -> tf.Tensor:
+        """Closed-form optimal policy a*(s), if available.
+
+        Optional benchmark for eval metrics (policy_mae).  Not required for
+        training — trainers must never call this method.
+
+        Args:
+            s:        state tensor, shape (batch, state_dim).
+            training: included for interface consistency with PolicyNetwork.
+
+        Returns:
+            a*: shape (batch, action_dim).
+
+        Raises:
+            NotImplementedError: if no analytical policy is available.
+        """
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not implement analytical_policy().")
+
+    def reward_scale(
         self, n_samples: int = 1000, seed: tf.Tensor = None
     ) -> float:
-        """Compute reward normalizer λ = (1-γ) / E[|r|] for MVE.
+        """Reward normalizer λ = (1-γ) / E[|r|].
 
         Default: MC estimate over random (s, a) pairs.
         Override with an analytical estimate when available.
+        If seed is None, a fixed internal seed [0, 0] is used — sufficient
+        for computing a normalization constant.
         """
         if seed is None:
-            raise ValueError("seed is required.")
+            seed = tf.constant([0, 0], dtype=tf.int32)
         s = self.sample_initial_states(n_samples, seed=seed)
         low, high = self.action_bounds()
         a = tf.random.stateless_uniform(
@@ -369,14 +396,14 @@ class MDPEnvironment(ABC):
         mean_abs_r = max(float(tf.reduce_mean(tf.abs(r))), 1e-8)
         return (1.0 - self.discount()) / mean_abs_r
 
-    def exo_stationary_mean(self) -> tf.Tensor:
+    def stationary_exo(self) -> tf.Tensor:
         """Stationary mean of the exogenous state, shape (exo_dim,).
 
         Used by terminal_value (LR method) to construct s̄ = [s_endo | s̄_exo].
         Override in subclass.
         """
         raise NotImplementedError(
-            f"{self.__class__.__name__} must implement exo_stationary_mean().")
+            f"{self.__class__.__name__} must implement stationary_exo().")
 
     def stationary_action(self, s_endo: tf.Tensor) -> tf.Tensor:
         """Action that holds the endogenous state constant: f_endo(s_endo, ā) = s_endo.
@@ -391,7 +418,8 @@ class MDPEnvironment(ABC):
             f"{self.__class__.__name__} must implement stationary_action().")
 
     def terminal_value(
-        self, s_endo: tf.Tensor, temperature: float = 1e-6
+        self, s_endo: tf.Tensor, temperature: float = 1e-6,
+        gate_mode: str = "soft",
     ) -> tf.Tensor:
         """Analytical terminal value V^term(s_endo) = r(s̄, ā) / (1-γ).
 
@@ -411,11 +439,12 @@ class MDPEnvironment(ABC):
         Returns:
             Scalar terminal value per sample, shape (batch,).
         """
-        z_bar = self.exo_stationary_mean()
+        z_bar = self.stationary_exo()
         z_bar = tf.broadcast_to(z_bar, tf.concat([tf.shape(s_endo)[:-1],
                                                    tf.shape(z_bar)], 0))
         s_bar = self.merge_state(s_endo, z_bar)
         a_bar = self.stationary_action(s_endo)
-        r = self.reward(s_bar, a_bar, temperature=temperature)
+        r = self.reward(s_bar, a_bar, temperature=temperature,
+                        gate_mode=gate_mode)
         r = tf.squeeze(r, axis=-1) if r.shape.rank > 1 else r
         return r / (1.0 - self.discount())

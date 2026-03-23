@@ -167,7 +167,7 @@ class TestDatasetStorage:
         with tempfile.TemporaryDirectory() as tmpdir:
             ds_dir = os.path.join(tmpdir, "ds")
             save_dataset(data, ds_dir, fmt="trajectory",
-                         env_config={"theta": 0.7})
+                         env_config={"production_elasticity": 0.7})
 
             loaded = load_dataset(ds_dir, fmt="trajectory")
             for key in data:

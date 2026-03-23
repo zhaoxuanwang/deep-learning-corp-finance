@@ -2,7 +2,7 @@
 
 The policy maps states to actions. The output head is affine-rescaled:
   action = center + scale * raw
-where scale = sqrt(half_range) provides moderate gradient amplification.
+where scale = half_range so that raw in (-1, 1) covers the full action range.
 
 When action bounds are finite, center and half_range are derived from
 the bounds automatically.  When bounds are infinite (unbounded actions),
@@ -16,6 +16,7 @@ environment's _apply_action().
 
 import tensorflow as tf
 from src.v2.networks.base import GenericNetwork
+from src.v2.utils.seeding import make_seed_int
 
 
 class PolicyNetwork(GenericNetwork):
@@ -39,15 +40,17 @@ class PolicyNetwork(GenericNetwork):
                  action_center: tf.Tensor = None,
                  action_half_range: tf.Tensor = None,
                  n_layers: int = 2, n_neurons: int = 128,
-                 name: str = "policy", **kwargs):
+                 name: str = "policy", seed: tuple = None,
+                 activation: str = "silu", **kwargs):
         super().__init__(input_dim=state_dim, n_layers=n_layers,
                          n_neurons=n_neurons,
-                         name=name, **kwargs)
+                         name=name, seed=seed,
+                         activation=activation, **kwargs)
         self.action_dim = action_dim
         self.action_low = tf.cast(action_low, tf.float32)
         self.action_high = tf.cast(action_high, tf.float32)
 
-        # Affine rescaling: sqrt-scale for moderate gradient amplification.
+        # Affine rescaling: linear scale so raw ∈ (-1,1) ≈ full action range.
         if action_center is not None and action_half_range is not None:
             self.action_center = tf.cast(action_center, tf.float32)
             self.action_half_range = tf.cast(action_half_range, tf.float32)
@@ -61,12 +64,18 @@ class PolicyNetwork(GenericNetwork):
                 )
             self.action_center = (self.action_low + self.action_high) / 2.0
             self.action_half_range = (self.action_high - self.action_low) / 2.0
-        self.action_scale = tf.sqrt(self.action_half_range)
+        self.action_scale = self.action_half_range
 
         # Small kernel init so initial raw ≈ 0 → action ≈ center.
+        head_init = tf.keras.initializers.Orthogonal(gain=0.01)
+        if self.seed is not None:
+            head_init = tf.keras.initializers.Orthogonal(
+                gain=0.01,
+                seed=make_seed_int(self.seed, "output_head"),
+            )
         self.output_head = tf.keras.layers.Dense(
             action_dim, use_bias=True, name="output_head",
-            kernel_initializer=tf.keras.initializers.Orthogonal(gain=0.01),
+            kernel_initializer=head_init,
             bias_initializer="zeros")
 
     def call(self, s, training=False, return_raw=False):
@@ -99,5 +108,7 @@ class PolicyNetwork(GenericNetwork):
             "action_dim": self.action_dim,
             "action_low": self.action_low.numpy().tolist(),
             "action_high": self.action_high.numpy().tolist(),
+            "seed": list(self.seed) if self.seed is not None else None,
+            "activation": self.activation,
         })
         return config

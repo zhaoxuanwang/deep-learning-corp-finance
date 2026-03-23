@@ -8,7 +8,7 @@ affect another.
 """
 
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Literal, Optional
 
 
 @dataclass
@@ -43,14 +43,128 @@ class TrainingConfig:
     # Evaluation
     eval_interval: int = 500
     eval_size:     int = 2560       # typically 10 * batch_size
+    eval_temperature: Optional[float] = None
 
     # Smooth gate temperature for non-differentiable reward components.
     temperature: float = 1e-6
+
+    # Weight history: if not None, appends (step, weights) at eval points
+    weight_history: list = None
+    checkpoint_history: list = None
+    snapshot_targets: tuple = ("policy",)
+
+    # ── Early stopping ────────────────────────────────────────
+    # Two independent rules, checked in order (first to fire wins):
+    #
+    # 1. THRESHOLD (convergence):
+    #    Stop when `monitor` metric satisfies `threshold` for
+    #    `threshold_patience` consecutive eval checkpoints.
+    #    → stop_reason = "converged"
+    #
+    # 2. PLATEAU (fallback, only checked when threshold fails):
+    #    Stop when `monitor` metric has not improved by at least
+    #    max(plateau_min_delta, plateau_rel_delta * |best|) for
+    #    `plateau_patience` consecutive eval checkpoints.
+    #    → stop_reason = "plateau"
+    #    Set plateau_patience = None to disable (default).
+    #
+    # Both rules share: monitor, mode, min_steps_before_stop.
+    monitor: Optional[str] = None
+    mode: Literal["min", "max"] = "min"
+    threshold: Optional[float] = None
+    threshold_patience: int = 2        # consecutive evals satisfying threshold
+    plateau_patience: Optional[int] = None  # evals w/o improvement; None=disabled
+    plateau_min_delta: float = 0.0     # absolute improvement margin
+    plateau_rel_delta: float = 0.0     # relative improvement margin
+    min_steps_before_stop: int = 0
+
+    # Legacy alias for Euler-specific threshold stopping.
+    stop_euler_threshold: Optional[float] = None
+
+    # Optional safety cap on total wall-clock time inside the trainer call.
+    max_wall_time_sec: Optional[float] = None
+
+    # Optional exact-kernel mode for debugging / paper-grade reruns.
+    strict_reproducibility: bool = False
 
     # Network architecture
     network:          NetworkConfig   = field(default_factory=NetworkConfig)
     policy_optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
     critic_optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
+
+    def __post_init__(self):
+        if self.n_steps < 1:
+            raise ValueError(f"n_steps must be >= 1. Got {self.n_steps}")
+        if self.batch_size < 1:
+            raise ValueError(f"batch_size must be >= 1. Got {self.batch_size}")
+        if self.eval_interval < 1:
+            raise ValueError(
+                f"eval_interval must be >= 1. Got {self.eval_interval}")
+        if self.eval_size < 1:
+            raise ValueError(f"eval_size must be >= 1. Got {self.eval_size}")
+        if self.eval_temperature is not None and self.eval_temperature <= 0:
+            raise ValueError(
+                "eval_temperature must be > 0 when provided. "
+                f"Got {self.eval_temperature}")
+        if self.mode not in {"min", "max"}:
+            raise ValueError(
+                f"mode must be 'min' or 'max'. Got {self.mode!r}")
+        if self.threshold_patience < 1:
+            raise ValueError(
+                f"threshold_patience must be >= 1. Got {self.threshold_patience}")
+        if self.plateau_patience is not None and self.plateau_patience < 1:
+            raise ValueError(
+                f"plateau_patience must be >= 1 or None. Got {self.plateau_patience}")
+        if self.plateau_min_delta < 0:
+            raise ValueError(
+                "plateau_min_delta must be >= 0. "
+                f"Got {self.plateau_min_delta}")
+        if self.plateau_rel_delta < 0:
+            raise ValueError(
+                "plateau_rel_delta must be >= 0. "
+                f"Got {self.plateau_rel_delta}")
+        if self.min_steps_before_stop < 0:
+            raise ValueError(
+                "min_steps_before_stop must be >= 0. "
+                f"Got {self.min_steps_before_stop}")
+        if self.threshold is not None and not isinstance(self.threshold, (int, float)):
+            raise ValueError(
+                "threshold must be a number when provided. "
+                f"Got {self.threshold!r}")
+        if self.threshold is not None and self.mode == "min" and self.threshold < 0:
+            raise ValueError(
+                "threshold must be >= 0 for mode='min'. "
+                f"Got {self.threshold}")
+        if self.stop_euler_threshold is not None and self.stop_euler_threshold < 0:
+            raise ValueError(
+                "stop_euler_threshold must be >= 0 when provided. "
+                f"Got {self.stop_euler_threshold}")
+        if self.max_wall_time_sec is not None and self.max_wall_time_sec <= 0:
+            raise ValueError(
+                "max_wall_time_sec must be > 0 when provided. "
+                f"Got {self.max_wall_time_sec}")
+        if not isinstance(self.snapshot_targets, tuple):
+            raise ValueError(
+                "snapshot_targets must be a tuple of model names. "
+                f"Got {type(self.snapshot_targets)!r}")
+        allowed_targets = {"policy", "value_net"}
+        unknown_targets = set(self.snapshot_targets) - allowed_targets
+        if unknown_targets:
+            raise ValueError(
+                "snapshot_targets contains unsupported model names: "
+                f"{sorted(unknown_targets)}"
+            )
+        if not isinstance(self.strict_reproducibility, bool):
+            raise ValueError(
+                "strict_reproducibility must be a bool. "
+                f"Got {self.strict_reproducibility!r}")
+
+        # Backward-compatible alias for legacy Euler-threshold usage.
+        if self.stop_euler_threshold is not None:
+            if self.monitor is None:
+                self.monitor = "euler_residual_val"
+            if self.threshold is None:
+                self.threshold = float(self.stop_euler_threshold)
 
 
 @dataclass
@@ -87,8 +201,10 @@ class BRMConfig(TrainingConfig):
     weight_foc: float = 1.0           # FOC loss weight
     br_scale:   float = 1.0           # Bellman residual normalizer (set to |V*|)
 
-    # Warm-start: pre-train critic on analytical V before training
-    warm_start_steps: int = 200   # 0 to disable
+    # Warm-start: pre-train critic on analytical V before joint training.
+    # Priority: warm_start_epochs > warm_start_steps > cold start (both 0).
+    warm_start_steps: int = 0    # legacy exact step count; 0 = disabled
+    warm_start_epochs: int = 0   # epoch-based (preferred); auto-sizes to dataset
 
 
 @dataclass
@@ -156,7 +272,7 @@ class SHACVanillaConfig(TrainingConfig):
     n_mb:          int   = 1
 
     reward_scale: Optional[float] = None
-    warm_start_steps: int = 200
+    warm_start_steps: int = 0    # 0 = cold start (archived default)
 
     policy_optimizer: OptimizerConfig = field(
         default_factory=lambda: OptimizerConfig(learning_rate=2e-3))

@@ -68,6 +68,12 @@ class TestHiddenStack:
         stack = HiddenStack(n_layers=4, n_neurons=16)
         assert len(stack.dense_layers) == 4
 
+    def test_relu_activation_supported(self):
+        """HiddenStack supports ReLU as an optional activation."""
+        stack = HiddenStack(n_layers=2, n_neurons=8, activation="relu")
+        out = stack(tf.random.normal((4, 3)))
+        assert out.shape == (4, 8)
+
 
 # =============================================================================
 # PolicyNetwork

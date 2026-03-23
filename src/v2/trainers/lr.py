@@ -21,12 +21,20 @@ Only the endogenous state k is evolved endogenously under the policy,
 so BPTT flows through k but not z.
 """
 
+import time
+
 import tensorflow as tf
 from src.v2.trainers.config import LRConfig
-from src.v2.trainers.core import evaluate_euler_residual
+from src.v2.trainers.core import (
+    StopTracker,
+    append_history_row,
+    capture_checkpoint,
+    run_eval_callback,
+)
 from src.v2.data.pipeline import (
     build_iterator, validate_dataset_keys, fit_normalizer_traj,
 )
+from src.v2.utils.seeding import make_seed_int, seed_runtime
 
 
 _TRAIN_KEYS = ["s_endo_0", "z_path", "z_fork"]
@@ -34,7 +42,7 @@ _VAL_KEYS   = ["s_endo", "z", "z_next_main", "z_next_fork"]
 
 
 def train_lr(env, policy, train_dataset: dict, val_dataset: dict = None,
-             config: LRConfig = None):
+             config: LRConfig = None, eval_callback=None):
     """Train a policy using the Lifetime Reward method on a fixed dataset.
 
     Args:
@@ -42,13 +50,17 @@ def train_lr(env, policy, train_dataset: dict, val_dataset: dict = None,
         policy:        PolicyNetwork instance.
         train_dataset: Trajectory-format dataset dict (see module docstring).
         val_dataset:   Flattened-format dataset for evaluation (optional).
-                       If None, Euler residual is not reported.
         config:        LRConfig with hyperparameters.
+        eval_callback: Optional callable returning eval metrics at checkpoints.
 
     Returns:
         dict with keys: policy, history, config.
     """
     config      = config or LRConfig()
+    seed_runtime(
+        config.master_seed, "train_lr",
+        strict_reproducibility=config.strict_reproducibility,
+    )
     gamma       = env.discount()
     T           = config.horizon
 
@@ -61,6 +73,11 @@ def train_lr(env, policy, train_dataset: dict, val_dataset: dict = None,
     validate_dataset_keys(train_dataset, _TRAIN_KEYS, "train_lr", "train_dataset")
     if val_dataset is not None:
         validate_dataset_keys(val_dataset, _VAL_KEYS, "train_lr", "val_dataset")
+    if config.monitor is not None and eval_callback is None and val_dataset is None:
+        raise ValueError(
+            "train_lr requires val_dataset when monitor is set and no "
+            "eval_callback is provided."
+        )
 
     T_data = train_dataset["z_path"].shape[1] - 1
     if T > T_data:
@@ -120,10 +137,27 @@ def train_lr(env, policy, train_dataset: dict, val_dataset: dict = None,
     # ------------------------------------------------------------------
     # Training loop
     # ------------------------------------------------------------------
-    train_iter = build_iterator(train_dataset, config.batch_size)
-    history = {"step": [], "loss": [], "euler_residual": []}
+    train_iter = build_iterator(
+        train_dataset, config.batch_size,
+        shuffle_seed=make_seed_int(
+            config.master_seed, "train_lr", "batch_shuffle"),
+    )
+    history = {}
+    stop_tracker = StopTracker(
+        monitor=config.monitor,
+        mode=config.mode,
+        threshold=config.threshold,
+        threshold_patience=config.threshold_patience,
+        plateau_patience=config.plateau_patience,
+        plateau_min_delta=config.plateau_min_delta,
+        plateau_rel_delta=config.plateau_rel_delta,
+        min_steps_before_stop=config.min_steps_before_stop,
+    )
+    train_start = time.perf_counter()
+    last_step = -1
 
     for step, batch in enumerate(train_iter.take(config.n_steps)):
+        last_step = step
         loss = train_step(batch["s_endo_0"], batch["z_path"])
 
         if schedule:
@@ -131,15 +165,70 @@ def train_lr(env, policy, train_dataset: dict, val_dataset: dict = None,
             temp_var.assign(schedule.value)
 
         # Evaluation
-        if step % config.eval_interval == 0 or step == config.n_steps - 1:
-            temperature = float(temp_var)
-            er = (evaluate_euler_residual(env, policy, val_dataset,
-                                          temperature=temperature)
-                  if val_dataset is not None else float("nan"))
-            history["step"].append(step)
-            history["loss"].append(float(loss))
-            history["euler_residual"].append(er)
-            print(f"LR step {step:5d} | loss={float(loss):.4f} | "
-                  f"euler_resid={er:.6f}")
+        elapsed_sec = time.perf_counter() - train_start
+        cap_reached = (
+            config.max_wall_time_sec is not None
+            and elapsed_sec >= config.max_wall_time_sec
+        )
+        if step % config.eval_interval == 0 or step == config.n_steps - 1 or cap_reached:
+            train_temperature = float(temp_var)
+            eval_metrics = run_eval_callback(
+                step,
+                env,
+                policy,
+                None,
+                val_dataset,
+                train_temperature,
+                eval_callback=eval_callback,
+                eval_temperature=(
+                    config.eval_temperature
+                    if eval_callback is None else None
+                ),
+            )
+            elapsed_sec = time.perf_counter() - train_start
+            stop_on_threshold = stop_tracker.record_eval(
+                step, elapsed_sec, eval_metrics)
+            if not stop_on_threshold and cap_reached:
+                stop_tracker.finalize("max_wall_time", step, elapsed_sec)
+            elif not stop_on_threshold and step == config.n_steps - 1:
+                stop_tracker.finalize("max_steps", step, elapsed_sec)
 
-    return {"policy": policy, "history": history, "config": config}
+            append_history_row(
+                history,
+                step,
+                elapsed_sec,
+                train_temperature,
+                base_scalars={"loss": float(loss)},
+                eval_metrics=eval_metrics,
+            )
+            status = ""
+            if stop_on_threshold:
+                status = f" | stop={stop_tracker.stop_reason}"
+            elif cap_reached:
+                status = " | stop=max_wall_time"
+            monitor_name = stop_tracker.monitor or next(iter(eval_metrics), None)
+            monitor_text = ""
+            if monitor_name is not None and monitor_name in eval_metrics:
+                monitor_text = (
+                    f" | {monitor_name}={float(eval_metrics[monitor_name]):.6f}"
+                )
+            print(
+                f"LR step {step:5d} | loss={float(loss):.4f}"
+                f"{monitor_text} | temp={train_temperature:.6g} | "
+                f"elapsed={elapsed_sec:.1f}s{status}"
+            )
+            capture_checkpoint(step, config, policy=policy)
+            if stop_on_threshold or cap_reached:
+                break
+
+    wall_time_sec = time.perf_counter() - train_start
+    if stop_tracker.stop_reason is None and last_step >= 0:
+        stop_tracker.finalize("max_steps", last_step, wall_time_sec)
+
+    return {
+        "policy": policy,
+        "history": history,
+        "config": config,
+        "wall_time_sec": wall_time_sec,
+        **stop_tracker.result_dict(),
+    }
