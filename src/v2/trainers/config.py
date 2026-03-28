@@ -1,0 +1,248 @@
+"""Configuration dataclasses for v2 trainers.
+
+Each method has its own config with method-specific defaults.  The shared
+TrainingConfig base provides structural inheritance (field names, types)
+but each subclass overrides defaults appropriate to that method.  This
+avoids unintended coupling — changing a default for one method cannot
+affect another.
+"""
+
+from dataclasses import dataclass, field
+from typing import Literal, Optional
+
+
+@dataclass
+class NetworkConfig:
+    """Network architecture configuration."""
+    n_layers:  int = 2
+    n_neurons: int = 128
+
+
+@dataclass
+class OptimizerConfig:
+    """Optimizer configuration."""
+    learning_rate: float           = 1e-3
+    clipnorm:      Optional[float] = 100.0   # DreamerV3 default safety net
+
+
+@dataclass
+class TrainingConfig:
+    """Core training configuration (base class).
+
+    Subclasses override defaults as needed.  master_seed must match
+    DataGeneratorConfig.master_seed so that RNG streams are consistent
+    across data generation and training.
+    """
+    n_steps:     int   = 10000
+    batch_size:  int   = 256
+    master_seed: tuple = field(default_factory=lambda: (20, 26))
+
+    # Target network
+    polyak_rate: float = 0.995
+
+    # Evaluation
+    eval_interval: int = 500
+    eval_size:     int = 2560       # typically 10 * batch_size
+
+    # Weight history: if not None, appends (step, weights) at eval points
+    weight_history: list = None
+    checkpoint_history: list = None
+    snapshot_targets: tuple = ("policy",)
+
+    # ── Early stopping ────────────────────────────────────────
+    # Two independent rules, checked in order (first to fire wins):
+    #
+    # 1. THRESHOLD (convergence):
+    #    Stop when `monitor` metric satisfies `threshold` for
+    #    `threshold_patience` consecutive eval checkpoints.
+    #    → stop_reason = "converged"
+    #
+    # 2. PLATEAU (fallback, only checked when threshold fails):
+    #    Stop when `monitor` metric has not improved by at least
+    #    max(plateau_min_delta, plateau_rel_delta * |best|) for
+    #    `plateau_patience` consecutive eval checkpoints.
+    #    → stop_reason = "plateau"
+    #    Set plateau_patience = None to disable (default).
+    #
+    # Both rules share: monitor, mode, min_steps_before_stop.
+    monitor: Optional[str] = None
+    mode: Literal["min", "max"] = "min"
+    threshold: Optional[float] = None
+    threshold_patience: int = 2        # consecutive evals satisfying threshold
+    plateau_patience: Optional[int] = None  # evals w/o improvement; None=disabled
+    plateau_min_delta: float = 0.0     # absolute improvement margin
+    plateau_rel_delta: float = 0.0     # relative improvement margin
+    min_steps_before_stop: int = 0
+
+    # Legacy alias for Euler-specific threshold stopping.
+    stop_euler_threshold: Optional[float] = None
+
+    # Optional safety cap on total wall-clock time inside the trainer call.
+    max_wall_time_sec: Optional[float] = None
+
+    # Optional exact-kernel mode for debugging / paper-grade reruns.
+    strict_reproducibility: bool = False
+
+    # Network architecture
+    network:          NetworkConfig   = field(default_factory=NetworkConfig)
+    policy_optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
+    critic_optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
+
+    def __post_init__(self):
+        if self.n_steps < 1:
+            raise ValueError(f"n_steps must be >= 1. Got {self.n_steps}")
+        if self.batch_size < 1:
+            raise ValueError(f"batch_size must be >= 1. Got {self.batch_size}")
+        if self.eval_interval < 1:
+            raise ValueError(
+                f"eval_interval must be >= 1. Got {self.eval_interval}")
+        if self.eval_size < 1:
+            raise ValueError(f"eval_size must be >= 1. Got {self.eval_size}")
+        if self.mode not in {"min", "max"}:
+            raise ValueError(
+                f"mode must be 'min' or 'max'. Got {self.mode!r}")
+        if self.threshold_patience < 1:
+            raise ValueError(
+                f"threshold_patience must be >= 1. Got {self.threshold_patience}")
+        if self.plateau_patience is not None and self.plateau_patience < 1:
+            raise ValueError(
+                f"plateau_patience must be >= 1 or None. Got {self.plateau_patience}")
+        if self.plateau_min_delta < 0:
+            raise ValueError(
+                "plateau_min_delta must be >= 0. "
+                f"Got {self.plateau_min_delta}")
+        if self.plateau_rel_delta < 0:
+            raise ValueError(
+                "plateau_rel_delta must be >= 0. "
+                f"Got {self.plateau_rel_delta}")
+        if self.min_steps_before_stop < 0:
+            raise ValueError(
+                "min_steps_before_stop must be >= 0. "
+                f"Got {self.min_steps_before_stop}")
+        if self.threshold is not None and not isinstance(self.threshold, (int, float)):
+            raise ValueError(
+                "threshold must be a number when provided. "
+                f"Got {self.threshold!r}")
+        if self.threshold is not None and self.mode == "min" and self.threshold < 0:
+            raise ValueError(
+                "threshold must be >= 0 for mode='min'. "
+                f"Got {self.threshold}")
+        if self.stop_euler_threshold is not None and self.stop_euler_threshold < 0:
+            raise ValueError(
+                "stop_euler_threshold must be >= 0 when provided. "
+                f"Got {self.stop_euler_threshold}")
+        if self.max_wall_time_sec is not None and self.max_wall_time_sec <= 0:
+            raise ValueError(
+                "max_wall_time_sec must be > 0 when provided. "
+                f"Got {self.max_wall_time_sec}")
+        if not isinstance(self.snapshot_targets, tuple):
+            raise ValueError(
+                "snapshot_targets must be a tuple of model names. "
+                f"Got {type(self.snapshot_targets)!r}")
+        allowed_targets = {"policy", "value_net"}
+        unknown_targets = set(self.snapshot_targets) - allowed_targets
+        if unknown_targets:
+            raise ValueError(
+                "snapshot_targets contains unsupported model names: "
+                f"{sorted(unknown_targets)}"
+            )
+        if not isinstance(self.strict_reproducibility, bool):
+            raise ValueError(
+                "strict_reproducibility must be a bool. "
+                f"Got {self.strict_reproducibility!r}")
+
+        # Backward-compatible alias for legacy Euler-threshold usage.
+        if self.stop_euler_threshold is not None:
+            if self.monitor is None:
+                self.monitor = "euler_residual_val"
+            if self.threshold is None:
+                self.threshold = float(self.stop_euler_threshold)
+
+
+@dataclass
+class LRConfig(TrainingConfig):
+    """Lifetime Reward method configuration.
+
+    Defaults: batch_size=256, policy_lr=1e-3 (inherited from base).
+    LR does not use a critic or target network.
+    """
+    horizon:        int  = 64    # rollout horizon T; must be <= DataGeneratorConfig.horizon
+    terminal_value: bool = True  # analytical V_term = r(s̄, ā) / (1-γ); LR-specific
+
+
+@dataclass
+class ERConfig(TrainingConfig):
+    """Euler Residual method configuration.
+
+    Defaults: batch_size=256, policy_lr=1e-3 (inherited from base).
+    ER uses a target policy network for stable next-action computation.
+    """
+    loss_type:  str = "crossprod"   # "crossprod" (AiO) or "mse"
+    n_mc_draws: int = 2             # informational; AiO uses both z_next_main and z_next_fork
+
+
+@dataclass
+class BRMConfig(TrainingConfig):
+    """Bellman Residual Minimization configuration.
+
+    Defaults: batch_size=256, policy_lr=1e-3, critic_lr=1e-3 (inherited).
+    L_BR trains V via Bellman residual.  L_FOC trains π via autodiff FOC:
+      ∂r/∂a + γ(∂f_endo/∂a)^T ∇V  (two independent shock draws, AiO).
+    """
+    loss_type:  str   = "crossprod"   # "crossprod" (AiO) or "mse"
+    weight_foc: float = 1.0           # FOC loss weight
+    br_scale:   float = 1.0           # Bellman residual normalizer (set to |V*|)
+
+    # Warm-start: pre-train critic on analytical V before joint training.
+    # Priority: warm_start_epochs > warm_start_steps > cold start (both 0).
+    warm_start_steps: int = 0    # legacy exact step count; 0 = disabled
+    warm_start_epochs: int = 0   # epoch-based (preferred); auto-sizes to dataset
+
+
+@dataclass
+class SHACConfig(TrainingConfig):
+    """Short-Horizon Actor-Critic configuration — DDPG-style variant.
+
+    A variant of Xu et al. (2022) adapted for economic environments.
+    Retains SHAC's core structure (h-step actor BPTT with windowed
+    continuation), but replaces the critic with a DDPG-style 1-step
+    Bellman target using target π̄ + target V̄.  This breaks the
+    on-policy critic feedback loop that causes divergence in the
+    original algorithm.
+
+    Key differences from vanilla SHAC (Xu et al., 2022):
+      - Actor bootstrap: current V (not target V̄)
+      - Critic target:   1-step Bellman with target π̄ + target V̄
+                          (not TD-λ with on-policy data)
+      - Target networks: both π̄ and V̄ (not V̄ only)
+      - Cold start only: no warm-start or oracle V dependency
+
+    Reward normalization
+    --------------------
+    The paper's hyperparameters assume rewards/values of O(1).  When the
+    environment has larger reward/value scales (e.g. V ≈ 200-500 for
+    BasicInvestment), the critic diverges with paper defaults.  Setting
+    normalize_rewards=True (default) auto-computes 1/|V*| via the
+    environment so that V ≈ O(1).  Set normalize_rewards=False to
+    disable scaling.  For advanced use (e.g. reproducing a specific
+    experiment), set reward_scale_override to an explicit float.
+
+    Step counting: 1 window = 1 step = 1 actor gradient update.
+    Each mini-batch of B trajectories yields horizon / short_horizon steps.
+    Total critic gradient steps per window = n_critic.
+    """
+    # --- SHAC-specific defaults (override TrainingConfig) ---
+    batch_size:    int = 64      # paper default; smaller than LR/ER (256)
+    horizon:       int = 192     # total rollout horizon T; γ^192 ≈ 0
+    short_horizon: int = 32      # window length h (paper default)
+    n_critic:      int = 16      # critic gradient steps per window
+
+    # Reward normalization: scales all rewards by 1/|V*| so V ≈ O(1).
+    normalize_rewards:      bool           = True   # auto-compute via env
+    reward_scale_override:  Optional[float] = None  # manual override (advanced)
+
+    # SHAC-specific optimizer defaults (higher lr than LR/ER)
+    policy_optimizer: OptimizerConfig = field(
+        default_factory=lambda: OptimizerConfig(learning_rate=2e-3))
+    critic_optimizer: OptimizerConfig = field(
+        default_factory=lambda: OptimizerConfig(learning_rate=5e-3))

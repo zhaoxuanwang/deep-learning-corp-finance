@@ -1,0 +1,181 @@
+{
+  "pipeline_name": "part1_baseline",
+  "run_name_prefix": "run",
+  "output_root": "results",
+  "run_layout": "notebook",
+  "datasets_dirname": "datasets",
+  "base_params": {
+    "r_rate": 0.04,
+    "delta": 0.15,
+    "theta": 0.7,
+    "cost_convex": 0.0,
+    "cost_fixed": 0.0,
+    "tax": 0.3,
+    "cost_default": 0.4,
+    "cost_inject_fixed": 0.0,
+    "cost_inject_linear": 0.0,
+    "frac_liquid": 0.5
+  },
+  "shock_params": {
+    "rho": 0.7,
+    "sigma": 0.15,
+    "mu": 0.0
+  },
+  "data": {
+    "master_seed": [
+      20,
+      26
+    ],
+    "T": 32,
+    "sim_batch_size": 10,
+    "n_sim_batches": 5,
+    "N_val": 100,
+    "N_test": 500,
+    "auto_compute_bounds": true,
+    "std_dev_multiplier": 3.0,
+    "k_min_multiplier": 0.2,
+    "k_max_multiplier": 4.0,
+    "k_star_override": null,
+    "custom_bounds": null,
+    "cache_dir": null,
+    "save_to_disk": false
+  },
+  "basic_baseline_params": {
+    "cost_convex": 0.0,
+    "cost_fixed": 0.0,
+    "cost_inject_fixed": 0.0,
+    "cost_inject_linear": 0.0
+  },
+  "risky_baseline_params": {
+    "cost_convex": 0.01,
+    "cost_fixed": 0.01,
+    "cost_inject_fixed": 0.02,
+    "cost_inject_linear": 0.02,
+    "cost_default": 0.4,
+    "tax": 0.3
+  },
+  "nn": {
+    "network": {
+      "n_layers": 2,
+      "n_neurons": 32,
+      "hidden_activation": "swish"
+    },
+    "basic_optimization": {
+      "learning_rate": 0.001,
+      "learning_rate_critic": 0.005,
+      "batch_size": 64,
+      "n_iter": 500,
+      "log_every": 50,
+      "early_stopping": {
+        "enabled": true,
+        "patience": 5,
+        "eval_freq": 50,
+        "lr_epsilon": 0.01,
+        "lr_window": 10,
+        "er_epsilon": 0.01,
+        "br_critic_epsilon": 0.001,
+        "br_actor_epsilon": 0.001
+      },
+      "optimizer": {
+        "optimizer_type": "adam",
+        "clipnorm": 1.0,
+        "clipvalue": null
+      }
+    },
+    "basic_annealing": {
+      "temperature_init": 1.0,
+      "temperature_min": 0.0001,
+      "decay": 0.99,
+      "schedule": "exponential",
+      "logit_clip": 20.0
+    },
+    "basic_methods": {
+      "lr": {
+        "name": "basic_lr"
+      },
+      "er": {
+        "name": "basic_er",
+        "polyak_tau": 0.995,
+        "loss_type": "crossprod"
+      },
+      "br": {
+        "name": "basic_br_actor_critic",
+        "n_critic": 5,
+        "polyak_tau": 0.95,
+        "loss_type": "crossprod"
+      },
+    },
+    "risky_optimization": {
+      "learning_rate": 0.0001,
+      "learning_rate_critic": 0.001,
+      "batch_size": 64,
+      "n_iter": 500,
+      "log_every": 50,
+      "early_stopping": {
+        "enabled": true,
+        "patience": 5,
+        "eval_freq": 50,
+        "br_critic_epsilon": 1e-05,
+        "br_actor_epsilon": 0.0001
+      },
+      "optimizer": {
+        "optimizer_type": "adam",
+        "clipnorm": 1.0,
+        "clipvalue": null
+      }
+    },
+    "risky_annealing": {
+      "temperature_init": 1.0,
+      "temperature_min": 0.0001,
+      "decay": 0.995,
+      "schedule": "exponential",
+      "logit_clip": 5.0
+    },
+    "risky_method": {
+      "name": "risky_br_actor_critic",
+      "n_critic": 10,
+      "polyak_tau": 0.995,
+      "loss_type": "crossprod",
+      "risky": {
+        "weight_br": 0.1,
+        "loss_type": "crossprod"
+      }
+    }
+  },
+  "ddp": {
+    "grid_basic": {
+      "z_size": 7,
+      "k_size": 40,
+      "b_size": 2,
+      "capital_grid_type": "multiplicative"
+    },
+    "grid_risky": {
+      "z_size": 7,
+      "k_size": 40,
+      "b_size": 25,
+      "capital_grid_type": "multiplicative"
+    },
+    "basic_vfi": {
+      "tol": 1e-06,
+      "max_iter": 2000
+    },
+    "basic_pfi": {
+      "max_iter": 200,
+      "eval_steps": 400
+    },
+    "risky_vfi": {
+      "tol": 0.0001,
+      "max_iter": 20,
+      "damping_weight": 0.7,
+      "inner_vfi_tol": 1e-05,
+      "inner_vfi_max_iter": 1200
+    },
+    "risky_pfi": {
+      "tol": 0.0001,
+      "max_iter": 20,
+      "damping_weight": 0.7,
+      "inner_pfi_max_iter": 120,
+      "inner_pfi_eval_steps": 300
+    }
+  }
+}

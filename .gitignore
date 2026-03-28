@@ -3,7 +3,9 @@ archive/
 notebooks/
 .venv/
 .DS_Store
-docs/
+experiments/
+production/
+notes/
 
 # --- Python Standard Exclusions ---
 __pycache__/
@@ -23,6 +25,7 @@ __pycache__/
 *.npz
 *.csv
 *.png
+outputs/
 
 # --- Model Checkpoints ---
 *.keras

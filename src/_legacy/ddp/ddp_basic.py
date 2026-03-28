@@ -1,0 +1,345 @@
+"""
+Offline basic-model DDP solver.
+
+Implements a discrete dynamic programming solver for the basic investment
+model using TensorFlow on a fixed, pre-generated dataset.
+
+Transition probabilities are estimated from observed (z, z_next_main) samples.
+No internal shock simulation is performed.
+"""
+
+from typing import Any, Callable, Dict, Literal, Optional, Tuple
+
+import tensorflow as tf
+
+from src.economy.data import DatasetBundle
+from src.economy.parameters import EconomicParams, convert_to_tf
+from src.ddp.ddp_config import (
+    DDPGridConfig,
+    estimate_transition_matrix_from_dataset,
+    extract_bounds_from_metadata,
+)
+from src.economy import logic
+
+
+class BasicModelDDP:
+    """
+    Solves the basic firm investment problem in dynamic models
+    using Discrete Dynamic Programming (DDP)
+    accelerated by TensorFlow.
+
+    Attributes:
+        params (EconomicParams): The economic configuration.
+        grid_config (DDPGridConfig): Grid discretization settings.
+        beta (tf.Tensor): Discount factor.
+        z_grid (tf.Tensor): Productivity state grid (nz,).
+        prob_matrix (tf.Tensor): Transition probability matrix (nz, nz).
+        k_grid (tf.Tensor): Capital stock grid (nk,).
+        nz (int): Number of productivity states.
+        nk (int): Number of capital grid points.
+        reward_matrix (tf.Tensor): Precomputed payoff matrix of shape (nz, nk, nk).
+    """
+
+    def __init__(
+        self, 
+        params: EconomicParams,
+        shock_params: Optional[Any] = None,
+        grid_config: Optional[DDPGridConfig] = None,
+        *,
+        dataset: Optional[Dict[str, tf.Tensor]] = None,
+        dataset_metadata: Optional[Dict[str, Any]] = None,
+        delta: Optional[float] = None,
+        reward_fn: Optional[Callable[..., tf.Tensor]] = None,
+    ):
+        """
+        Initialize offline DDP components from a fixed dataset.
+
+        Args:
+            params: Economic parameters used by the default reward function.
+            dataset: Flattened dataset containing at least 'z' and 'z_next_main'.
+            dataset_metadata: Metadata dictionary containing canonical bounds.
+            grid_config: Numerical grid settings.
+            delta: Optional depreciation override for grid construction.
+            reward_fn: Optional custom reward function. Signature:
+                reward_fn(k_curr, k_next, z_curr, params, temperature, logit_clip)
+        """
+        self.params = params
+        self.shock_params = shock_params
+        self.grid_config = grid_config or DDPGridConfig()
+        self.beta = tf.constant(1 / (1 + params.r_rate), dtype=tf.float32)
+        self.reward_fn = reward_fn or logic.compute_cash_flow_basic
+
+        if dataset is None or dataset_metadata is None:
+            raise ValueError(
+                "BasicModelDDP requires dataset + dataset_metadata for offline construction. "
+                "Use BasicModelDDP.from_dataset_bundle(...) for metadata-first workflows."
+            )
+
+        self.dataset = dataset
+        self.dataset_metadata = dataset_metadata
+        bounds = extract_bounds_from_metadata(dataset_metadata)
+        delta_val = float(params.delta if delta is None else delta)
+
+        # Build grids and data-estimated Markov transition.
+        k_grid_np, _, _ = self.grid_config.generate_grids(bounds, delta=delta_val)
+        z_grid_np, prob_matrix_np = estimate_transition_matrix_from_dataset(
+            dataset,
+            bounds,
+            z_size=self.grid_config.z_size,
+        )
+
+        # Convert to TensorFlow Constants
+        self.z_grid, self.prob_matrix, self.k_grid = convert_to_tf(
+            z_grid_np, prob_matrix_np, k_grid_np
+        )
+
+        # Store dimensions
+        self.nz = self.grid_config.z_size
+        self.nk = len(k_grid_np)
+
+        # Precompute the Reward Matrix
+        self.reward_matrix = self._compute_reward_matrix()
+
+    @classmethod
+    def from_dataset_bundle(
+        cls,
+        params: EconomicParams,
+        bundle: DatasetBundle,
+        *,
+        grid_config: Optional[DDPGridConfig] = None,
+        delta: Optional[float] = None,
+        reward_fn: Optional[Callable[..., tf.Tensor]] = None,
+    ) -> "BasicModelDDP":
+        """
+        Convenience constructor for metadata-first offline workflows.
+        """
+        return cls(
+            params,
+            dataset=bundle.data,
+            dataset_metadata=bundle.metadata,
+            grid_config=grid_config,
+            delta=delta,
+            reward_fn=reward_fn,
+        )
+
+    def _compute_reward_matrix(self) -> tf.Tensor:
+        """
+        Computes the 3D Reward Matrix R(z, k, k').
+
+        This matrix represents the instantaneous payoff for every possible
+        combination of current state (z, k) and choice (k').
+
+        Returns:
+            tf.Tensor: A 3D tensor of shape (nz, nk, nk).
+                       Axis 0: Current productivity z
+                       Axis 1: Current capital k
+                       Axis 2: Next period capital k'
+        """
+        # Reshape for broadcasting
+        # z: (nz, 1, 1)
+        z_mesh = tf.reshape(self.z_grid, [self.nz, 1, 1])
+        # k: (1, nk, 1)
+        k_mesh = tf.reshape(self.k_grid, [1, self.nk, 1])
+        # k': (1, 1, nk)
+        k_next_mesh = tf.reshape(self.k_grid, [1, 1, self.nk])
+
+        # --- Economic Logic ---
+        
+        # 1. Calculate Reward Components using shared 'logic' module
+        # Note: logic functions support broadcasting.
+        # k_mesh: (1, nk, 1) -> Current K
+        # k_next_mesh: (1, 1, nk) -> Next K
+        # z_mesh: (nz, 1, 1) -> Current Z
+        
+        # Use configurable reward primitive (defaults to basic cash flow).
+        # Small temperature keeps soft gates near discrete behavior.
+        net_cash_flow = self.reward_fn(
+            k_mesh, k_next_mesh, z_mesh, self.params,
+            temperature=1e-6,  # Near-hard gate for discrete DP
+            logit_clip=20.0
+        )
+
+        return net_cash_flow
+
+    @tf.function
+    def bellman_step(self, v_guess: tf.Tensor) -> Tuple[tf.Tensor, tf.Tensor]:
+        """
+        Applies the Bellman Operator T(V) once.
+
+        T(V)(z, k) = max_{k'} [ R(z, k, k') + beta * E[V(z', k') | z] ]
+
+        Args:
+            v_guess (tf.Tensor): The current value function guess of shape (nz, nk).
+
+        Returns:
+            Tuple[tf.Tensor, tf.Tensor]:
+                - v_new: Updated value function of shape (nz, nk).
+                - policy_idx: Indices of optimal k' for each state, shape (nz, nk).
+        """
+        # 1. Expected Continuation Value: E[V(z', k')]
+        # Matrix multiply: (nz, nz) @ (nz, nk) -> (nz, nk)
+        expected_v = tf.matmul(self.prob_matrix, v_guess)
+
+        # 2. Expand for broadcasting: (nz, nk) -> (nz, 1, nk)
+        # Expand axis 1: E[V(z', k')] depends on chosen k' (axis 2)
+        # but is independent of current k (axis 1).
+        # This step aligns E[V] with the 'next capital' axis of the reward matrix
+        expected_v_expanded = tf.expand_dims(expected_v, axis=1)
+
+        # 3. Construct RHS: R + beta * E[V]
+        # Shape: (nz, nk, nk)
+        rhs = self.reward_matrix + self.beta * expected_v_expanded
+
+        # 4. Maximization
+        # v_new contains the max value across axis 2 (k')
+        v_new = tf.reduce_max(rhs, axis=2)
+        # policy_idx contains the index of that max value
+        policy_idx = tf.argmax(rhs, axis=2)
+
+        return v_new, policy_idx
+
+    @tf.function
+    def _evaluate_policy(self, policy_idx: tf.Tensor, v_init: tf.Tensor, steps: int = 100) -> tf.Tensor:
+        """
+        Policy Evaluation: Computes V_h for a fixed policy index h.
+
+        Iterates T_h(V) = R_h + beta * P * V repeatedly to compute
+        the infinite horizon value of a specific policy.
+
+        Args:
+            policy_idx (tf.Tensor): Indices of the fixed policy k'(z, k).
+            v_init (tf.Tensor): Initial guess for value function.
+            steps (int): Number of iterations for policy evaluation.
+
+        Returns:
+            tf.Tensor: The approximated value function for the given policy.
+        """
+        # 1. Extract Reward R(z, k) implied by policy h(z, k)
+        # We need to grab one value per (z, k) pair from the 3rd dimension (k').
+        # batch_dims=2 tells TF: For each (z, k) location, look at the index in policy_idx,
+        # and pick the corresponding value from the axis 2 of reward_matrix.
+        # Input Shapes: reward_matrix (nz, nk, nk), policy_idx (nz, nk)
+        # Output Shape: (nz, nk)
+        reward_policy = tf.gather(self.reward_matrix, policy_idx, axis=2, batch_dims=2)
+
+        value = v_init
+
+        # Calculate discounted PV over k-periods
+        for _ in range(steps):
+            # 2. Expected Continuation Value: E[V(z',k') | z]
+            expected_v_grid = tf.matmul(self.prob_matrix, value)
+
+            # 3. Select specific k_next.
+            # We align the 'z' dimension (Axis 0) using batch_dims=1.
+            # Inside each 'z', we have a row of future values (over k').
+            # We use indices from policy_idx to select from these columns (Axis 1).
+            # Input: expected_v_grid (nz, nk'), indices (nz, nk) -> Output: (nz, nk)
+            expected_v_choice = tf.gather(expected_v_grid, policy_idx, axis=1, batch_dims=1)
+
+            # 4. Update value
+            value = reward_policy + self.beta * expected_v_choice
+
+        return value
+
+    def solve_basic_vfi(
+        self, tol: float = 1e-6, max_iter: int = 1000
+    ) -> Tuple[tf.Tensor, tf.Tensor]:
+        """
+        Solves the model using Value Function Iteration (VFI).
+
+        VFI is stable and reliable but converges linearly (slow).
+
+        Args:
+            tol (float): Convergence tolerance for the sup norm.
+            max_iter (int): Maximum number of iterations.
+
+        Returns:
+            Tuple[tf.Tensor, tf.Tensor]:
+                - v_star: Optimal value function (nz, nk).
+                - policy_star: Optimal capital choices (nz, nk).
+        """
+        v_current = tf.zeros((self.nz, self.nk), dtype=tf.float32)
+        policy_idx = tf.zeros((self.nz, self.nk), dtype=tf.int64)
+
+        i = 0
+        error = tol + 1.0
+
+        while error > tol and i < max_iter:
+            v_next, policy_idx = self.bellman_step(v_current)
+            error = float(tf.reduce_max(tf.abs(v_next - v_current)).numpy())
+            v_current = v_next
+            i += 1
+
+        if i >= max_iter:
+            print(f"VFI Warning: Max iter {max_iter} reached. Error: {error:.2e}")
+        else:
+            print(f"VFI Converged in {i} steps. Error: {error:.2e}")
+
+        # Map indices to actual capital values
+        # Shape of k_grid: (nk,)
+        # Shape of policy_idx (nz,nk)
+        # Output: (nz,nk) filled with values from k_grid according to policy_idx
+        policy_k = tf.gather(self.k_grid, policy_idx)
+        return v_current, policy_k
+
+    def solve_basic_pfi(
+        self, max_iter: int = 100, eval_steps: int = 200
+    ) -> Tuple[tf.Tensor, tf.Tensor]:
+        """
+        Solves the model using Policy Function Iteration (PFI).
+
+        Also known as Howard's Improvement Algorithm. Generally converges
+        faster (quadratic rates) than VFI.
+
+        Args:
+            max_iter (int): Maximum number of policy improvement steps.
+            eval_steps (int): Number of steps for partial policy evaluation.
+
+        Returns:
+            Tuple[tf.Tensor, tf.Tensor]:
+                - v_star: Optimal value function (nz, nk).
+                - policy_star: Optimal capital choices (nz, nk).
+        """
+        # Initialize with a zero policy
+        policy_idx = tf.zeros((self.nz, self.nk), dtype=tf.int32)
+        v_current = tf.zeros((self.nz, self.nk), dtype=tf.float32)
+
+        i = 0
+        policy_stable = False
+
+        while not policy_stable and i < max_iter:
+            # A. Policy Evaluation (Get precise V for current policy)
+            v_eval = self._evaluate_policy(policy_idx, v_current, steps=eval_steps)
+
+            # B. Policy Improvement (Greedy Step)
+            v_greedy, new_policy_idx = self.bellman_step(v_eval)
+            new_policy_idx = tf.cast(new_policy_idx, tf.int32)
+
+            # C. Check Stability (Has the policy changed?)
+            diff = int(tf.reduce_sum(tf.abs(new_policy_idx - policy_idx)).numpy())
+
+            if diff == 0:
+                policy_stable = True
+                print(f"PFI Converged in {i + 1} steps.")
+
+            policy_idx = new_policy_idx
+            v_current = v_greedy
+            i += 1
+
+        # Map indices to actual capital values
+        policy_k = tf.gather(self.k_grid, policy_idx)
+        return v_current, policy_k
+
+    def solve_basic(
+        self,
+        method: Literal["vfi", "pfi"] = "vfi",
+        **kwargs,
+    ) -> Tuple[tf.Tensor, tf.Tensor]:
+        """
+        Unified dispatcher for basic-model DDP solve method.
+        """
+        if method == "vfi":
+            return self.solve_basic_vfi(**kwargs)
+        if method == "pfi":
+            return self.solve_basic_pfi(**kwargs)
+        raise ValueError(f"Unknown method '{method}'. Supported: 'vfi', 'pfi'.")
