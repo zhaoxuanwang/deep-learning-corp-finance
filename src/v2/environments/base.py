@@ -168,19 +168,12 @@ class MDPEnvironment(ABC):
     # ------------------------------------------------------------------
 
     @abstractmethod
-    def reward(
-        self, s: tf.Tensor, a: tf.Tensor,
-        temperature: float = 1e-6,
-        gate_mode: str = "soft",
-    ) -> tf.Tensor:
+    def reward(self, s: tf.Tensor, a: tf.Tensor) -> tf.Tensor:
         """Scalar reward r(s, a).
 
         Args:
-            s:           state tensor, shape (batch, state_dim).
-            a:           action tensor, shape (batch, action_dim).
-            temperature: smoothing for non-differentiable gates.
-            gate_mode:   how non-differentiable gates are handled.
-                         Environments without such gates may ignore this.
+            s: state tensor, shape (batch, state_dim).
+            a: action tensor, shape (batch, action_dim).
 
         Returns:
             Reward tensor, shape (batch,) or (batch, 1).
@@ -292,23 +285,6 @@ class MDPEnvironment(ABC):
     # Optional methods — override as needed
     # ------------------------------------------------------------------
 
-    def annealing_schedule(self):
-        """Return a fresh AnnealingSchedule if reward has non-differentiable gates.
-
-        Factory method — each call returns a **new** instance so that
-        separate training runs on the same env do not share state.
-
-        The environment decides whether annealing is needed based on its
-        own domain knowledge (e.g. whether fixed-cost indicators are
-        active).  Trainers call this once at the start of training and
-        step the returned schedule each iteration.
-
-        Returns:
-            AnnealingSchedule instance, or None if no annealing is needed
-            (trainer will use a fixed config.temperature instead).
-        """
-        return None
-
     def grid_spec(self):
         """Per-variable grid discretization hints for discrete solvers.
 
@@ -317,9 +293,10 @@ class MDPEnvironment(ABC):
         reads this spec and builds grids mechanically — all domain knowledge
         stays inside the environment.
 
-        Two spacing options:
+        Common spacing options:
             - "linear": uniform spacing (default for actions).
-            - "log":    denser at low values (use for capital, productivity).
+            - "log":    denser at low values in geometric percentage steps.
+            - "geometric": alias for "log", often clearer for capital grids.
 
         Return None (default) to let the solver fall back to linspace grids
         derived from action_bounds() and sampled state ranges.
@@ -329,7 +306,7 @@ class MDPEnvironment(ABC):
             from src.v2.solvers.grid import GridAxis
             def grid_spec(self):
                 return {
-                    "endo":   [GridAxis(self.k_min, self.k_max, spacing="log")],
+                    "endo":   [GridAxis(self.k_min, self.k_max, spacing="geometric")],
                     "exo":    [GridAxis(self.z_min, self.z_max, spacing="log")],
                     "action": [GridAxis(-self.k_max, self.k_max)],
                 }
@@ -342,7 +319,6 @@ class MDPEnvironment(ABC):
     def euler_residual(
         self, s: tf.Tensor, a: tf.Tensor,
         s_next: tf.Tensor, a_next: tf.Tensor,
-        temperature: float = 1e-6,
     ) -> tf.Tensor:
         """Model-specific Euler equation residual for the ER method.
 
@@ -351,6 +327,10 @@ class MDPEnvironment(ABC):
         """
         raise NotImplementedError(
             f"{self.__class__.__name__} does not support the ER method.")
+
+    def validate_nn_training_support(self, trainer_name: str) -> None:
+        """Raise when the environment is unsupported by the active NN trainers."""
+        del trainer_name
 
     def analytical_policy(
         self, s: tf.Tensor, training: bool = False
@@ -417,10 +397,25 @@ class MDPEnvironment(ABC):
         raise NotImplementedError(
             f"{self.__class__.__name__} must implement stationary_action().")
 
-    def terminal_value(
-        self, s_endo: tf.Tensor, temperature: float = 1e-6,
-        gate_mode: str = "soft",
-    ) -> tf.Tensor:
+    def continuation_transform(self, v_next: tf.Tensor) -> tf.Tensor:
+        """Transform continuation value before use in Bellman/bootstrap.
+
+        Override to apply limited liability (ReLU) or other transforms.
+        Default: identity (standard MDP).
+
+        Args:
+            v_next: Raw value predictions, shape (batch,) or (batch, 1).
+
+        Returns:
+            Transformed values, same shape.
+        """
+        return v_next
+
+    # ------------------------------------------------------------------
+    # Terminal value — optional, for LR method
+    # ------------------------------------------------------------------
+
+    def terminal_value(self, s_endo: tf.Tensor) -> tf.Tensor:
         """Analytical terminal value V^term(s_endo) = r(s̄, ā) / (1-γ).
 
         LR-method specific.  This is an analytical steady-state perpetuity
@@ -444,7 +439,6 @@ class MDPEnvironment(ABC):
                                                    tf.shape(z_bar)], 0))
         s_bar = self.merge_state(s_endo, z_bar)
         a_bar = self.stationary_action(s_endo)
-        r = self.reward(s_bar, a_bar, temperature=temperature,
-                        gate_mode=gate_mode)
+        r = self.reward(s_bar, a_bar)
         r = tf.squeeze(r, axis=-1) if r.shape.rank > 1 else r
         return r / (1.0 - self.discount())

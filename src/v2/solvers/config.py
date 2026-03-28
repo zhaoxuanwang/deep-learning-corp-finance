@@ -1,13 +1,13 @@
 """
 src/v2/solvers/config.py
 
-Configuration dataclasses for discrete VFI and PFI solvers.
+Configuration dataclasses for the supported discrete solvers.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import List, Literal, Optional
+from typing import List, Optional
 
 
 @dataclass
@@ -59,11 +59,7 @@ class VFIConfig:
         eval_interval:      Evaluate via eval_callback every N Bellman iterations.
         monitor:            Metric name to watch for early stopping (optional).
         threshold:          Stop when monitor metric satisfies the criterion.
-        threshold_patience:     Consecutive eval checkpoints that must satisfy rule.
-        reward_temperature: Temperature passed into env.reward() when building
-                            reward tables.
-        reward_gate_mode:   Gate mode passed into env.reward() when building
-                            reward tables.
+        threshold_patience: Consecutive eval checkpoints that must satisfy rule.
     """
     grid:               GridConfig = field(default_factory=GridConfig)
     tol:                float      = 1e-6
@@ -71,9 +67,7 @@ class VFIConfig:
     eval_interval:      int        = 50
     monitor:            Optional[str]   = None
     threshold:          Optional[float] = None
-    threshold_patience:     int        = 1
-    reward_temperature: float      = 1e-6
-    reward_gate_mode:   Literal["hard", "soft", "ste"] = "hard"
+    threshold_patience: int = 1
 
     def __post_init__(self):
         if self.tol <= 0:
@@ -84,18 +78,6 @@ class VFIConfig:
             raise ValueError(f"eval_interval must be >= 1. Got {self.eval_interval}")
         if self.threshold_patience < 1:
             raise ValueError(f"threshold_patience must be >= 1. Got {self.threshold_patience}")
-        if self.reward_temperature <= 0:
-            raise ValueError(
-                "reward_temperature must be > 0. "
-                f"Got {self.reward_temperature}"
-            )
-        if self.reward_gate_mode not in {"hard", "soft", "ste"}:
-            raise ValueError(
-                "reward_gate_mode must be one of {'hard', 'soft', 'ste'}. "
-                f"Got {self.reward_gate_mode!r}"
-            )
-
-
 @dataclass
 class PFIConfig:
     """Configuration for Policy Function Iteration (Howard's method).
@@ -107,20 +89,14 @@ class PFIConfig:
                             evaluation step.
         monitor:            Metric name to watch for early stopping (optional).
         threshold:          Stop when monitor metric satisfies the criterion.
-        threshold_patience:     Consecutive eval checkpoints that must satisfy rule.
-        reward_temperature: Temperature passed into env.reward() when building
-                            reward tables.
-        reward_gate_mode:   Gate mode passed into env.reward() when building
-                            reward tables.
+        threshold_patience: Consecutive eval checkpoints that must satisfy rule.
     """
     grid:               GridConfig = field(default_factory=GridConfig)
     max_iter:           int        = 200
     eval_steps:         int        = 400
     monitor:            Optional[str]   = None
     threshold:          Optional[float] = None
-    threshold_patience:     int        = 1
-    reward_temperature: float      = 1e-6
-    reward_gate_mode:   Literal["hard", "soft", "ste"] = "hard"
+    threshold_patience: int = 1
 
     def __post_init__(self):
         if self.max_iter < 1:
@@ -129,13 +105,115 @@ class PFIConfig:
             raise ValueError(f"eval_steps must be >= 1. Got {self.eval_steps}")
         if self.threshold_patience < 1:
             raise ValueError(f"threshold_patience must be >= 1. Got {self.threshold_patience}")
-        if self.reward_temperature <= 0:
+@dataclass
+class NestedVFIGridConfig:
+    """Grid sizes for the canonical risky-debt nested VFI.
+
+    Unlike the generic grid solvers, the risky-debt benchmark searches
+    directly over the endogenous next-state grid (k', b'). There is no
+    separate action grid in this algorithm.
+
+    The environment remains the authority for bounds, but the solver config
+    may override how each axis is sampled via per-axis spacing rules.
+    """
+
+    exo_sizes:  List[int] = field(default_factory=lambda: [7])
+    endo_sizes: List[int] = field(default_factory=lambda: [25, 20])
+    exo_spacings: Optional[List[str]] = None
+    endo_spacings: Optional[List[str]] = None
+    exo_powers: Optional[List[float]] = None
+    endo_powers: Optional[List[float]] = None
+
+    def __post_init__(self):
+        for name, sizes in [("exo_sizes", self.exo_sizes),
+                            ("endo_sizes", self.endo_sizes)]:
+            if not sizes:
+                raise ValueError(f"{name} must be non-empty.")
+            for i, s in enumerate(sizes):
+                if s < 2:
+                    raise ValueError(
+                        f"{name}[{i}] must be >= 2. Got {s}")
+        valid_spacings = {"linear", "log", "geometric", "zero_power"}
+        for name, spacings, dims in [
+            ("exo_spacings", self.exo_spacings, len(self.exo_sizes)),
+            ("endo_spacings", self.endo_spacings, len(self.endo_sizes)),
+        ]:
+            if spacings is None:
+                continue
+            if len(spacings) != dims:
+                raise ValueError(
+                    f"{name} must have length {dims}. Got {len(spacings)}."
+                )
+            for i, spacing in enumerate(spacings):
+                if spacing not in valid_spacings:
+                    raise ValueError(
+                        f"{name}[{i}] has unknown spacing {spacing!r}. "
+                        f"Valid: {sorted(valid_spacings)}"
+                    )
+        for name, powers, dims in [
+            ("exo_powers", self.exo_powers, len(self.exo_sizes)),
+            ("endo_powers", self.endo_powers, len(self.endo_sizes)),
+        ]:
+            if powers is None:
+                continue
+            if len(powers) != dims:
+                raise ValueError(
+                    f"{name} must have length {dims}. Got {len(powers)}."
+                )
+            for i, power in enumerate(powers):
+                if power <= 0:
+                    raise ValueError(
+                        f"{name}[{i}] must be > 0. Got {power}."
+                    )
+
+
+@dataclass
+class NestedVFIConfig:
+    """Configuration for the canonical risky-debt nested VFI benchmark.
+
+    The implementation follows docs/environments/risky_debt.md:
+    one discrete Markov transition matrix, standard Bellman iteration
+    with post-max clamping, hard outer updates of r_tilde, and outer
+    convergence monitored on consecutive value-function iterates.
+    """
+
+    grid:               NestedVFIGridConfig = field(default_factory=NestedVFIGridConfig)
+    max_iter_inner:     int = 2000
+    tol_inner:          float = 1e-6
+    max_iter_outer:     int = 50
+    tol_outer_value:    float = 1e-4
+
+    def __post_init__(self):
+        if self.max_iter_inner < 1:
             raise ValueError(
-                "reward_temperature must be > 0. "
-                f"Got {self.reward_temperature}"
+                f"max_iter_inner must be >= 1. Got {self.max_iter_inner}")
+        if self.tol_inner <= 0:
+            raise ValueError(f"tol_inner must be > 0. Got {self.tol_inner}")
+        if self.max_iter_outer < 1:
+            raise ValueError(
+                f"max_iter_outer must be >= 1. Got {self.max_iter_outer}")
+        if self.tol_outer_value <= 0:
+            raise ValueError(
+                f"tol_outer_value must be > 0. Got {self.tol_outer_value}")
+
+
+@dataclass
+class NestedVFITFRuntimeConfig:
+    """Backend-only runtime settings for the TF-native nested VFI solver."""
+
+    dtype: str = "float32"
+    choice_block_size: int = 128
+    jit_compile: bool = True
+    device: Optional[str] = None
+    record_inner_history: bool = False
+
+    def __post_init__(self):
+        if self.dtype not in {"float32", "float64"}:
+            raise ValueError(
+                f"dtype must be 'float32' or 'float64'. Got {self.dtype!r}"
             )
-        if self.reward_gate_mode not in {"hard", "soft", "ste"}:
+        if self.choice_block_size < 1:
             raise ValueError(
-                "reward_gate_mode must be one of {'hard', 'soft', 'ste'}. "
-                f"Got {self.reward_gate_mode!r}"
+                "choice_block_size must be >= 1. "
+                f"Got {self.choice_block_size}"
             )

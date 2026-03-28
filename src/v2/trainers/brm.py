@@ -39,7 +39,7 @@ from src.v2.utils.seeding import make_seed_int, seed_runtime
 _DATASET_KEYS = ["s_endo", "z", "z_next_main", "z_next_fork"]
 
 
-def _autodiff_foc(env, s, s_endo, a, z, z_next, dV_ds_next, gamma, temperature):
+def _autodiff_foc(env, s, s_endo, a, z, z_next, dV_ds_next, gamma):
     """FOC residual via auto-diff: ∂r/∂a + γ·(∂s_next/∂a)^T·dV_ds_next.
 
     s_next = merge_state(endogenous_transition(s_endo, a, z), z_next)
@@ -54,14 +54,13 @@ def _autodiff_foc(env, s, s_endo, a, z, z_next, dV_ds_next, gamma, temperature):
         z_next:      Next exogenous state (batch, exo_dim) — fixed.
         dV_ds_next:  ∇_s' V(s') (batch, state_dim) — VJP direction.
         gamma:       Discount factor.
-        temperature: Smooth-gate temperature.
 
     Returns:
         FOC residual: shape (batch, action_dim).
     """
     with tf.GradientTape() as tape:
         tape.watch(a)
-        r = env.reward(s, a, temperature=temperature)
+        r = env.reward(s, a)
     dr_da = tape.gradient(r, a)
 
     with tf.GradientTape() as tape:
@@ -91,12 +90,12 @@ def train_brm(env, policy, value_net, train_dataset: dict,
         dict with keys: policy, value_net, history, config.
     """
     config      = config or BRMConfig()
+    env.validate_nn_training_support("train_brm")
     seed_runtime(
         config.master_seed, "train_brm",
         strict_reproducibility=config.strict_reproducibility,
     )
     gamma       = env.discount()
-    schedule    = env.annealing_schedule()
 
     validate_dataset_keys(train_dataset, _DATASET_KEYS, "train_brm", "train_dataset")
     if val_dataset is not None:
@@ -162,7 +161,6 @@ def train_brm(env, policy, value_net, train_dataset: dict,
 
     for step, batch in enumerate(train_iter.take(config.n_steps)):
         last_step = step
-        temperature = schedule.value if schedule else config.temperature
 
         s_endo      = batch["s_endo"]        # (B, endo_dim)
         z           = batch["z"]             # (B, exo_dim)
@@ -176,7 +174,7 @@ def train_brm(env, policy, value_net, train_dataset: dict,
             a     = policy(s, training=False)
             v_s   = tf.squeeze(value_net(s, training=True))
 
-            r     = env.reward(s, a, temperature=temperature)
+            r     = env.reward(s, a)
             r     = tf.squeeze(r) if r.shape.rank > 1 else r
 
             k_next      = env.endogenous_transition(s_endo, a, z)
@@ -215,10 +213,8 @@ def train_brm(env, policy, value_net, train_dataset: dict,
                 vf = value_net(s_next_fork, training=False)
             dV_fork = t2.gradient(vf, s_next_fork)
 
-            f1 = _autodiff_foc(env, s, s_endo, a, z, z_next_main,
-                               dV_main, gamma, temperature)
-            f2 = _autodiff_foc(env, s, s_endo, a, z, z_next_fork,
-                               dV_fork, gamma, temperature)
+            f1 = _autodiff_foc(env, s, s_endo, a, z, z_next_main, dV_main, gamma)
+            f2 = _autodiff_foc(env, s, s_endo, a, z, z_next_fork, dV_fork, gamma)
 
             if config.loss_type == "crossprod":
                 loss_foc = tf.reduce_mean(tf.reduce_sum(f1 * f2, axis=-1))
@@ -229,9 +225,6 @@ def train_brm(env, policy, value_net, train_dataset: dict,
         policy_optimizer.apply_gradients(zip(grads_p, policy.trainable_variables))
 
         loss = loss_br + config.weight_foc * loss_foc
-
-        if schedule:
-            schedule.update()
 
         # Evaluation
         elapsed_sec = time.perf_counter() - train_start
@@ -246,12 +239,7 @@ def train_brm(env, policy, value_net, train_dataset: dict,
                 policy,
                 value_net,
                 val_dataset,
-                float(temperature),
                 eval_callback=eval_callback,
-                eval_temperature=(
-                    config.eval_temperature
-                    if eval_callback is None else None
-                ),
             )
             elapsed_sec = time.perf_counter() - train_start
             stop_on_threshold = stop_tracker.record_eval(
@@ -265,7 +253,6 @@ def train_brm(env, policy, value_net, train_dataset: dict,
                 history,
                 step,
                 elapsed_sec,
-                float(temperature),
                 base_scalars={
                     "loss": float(loss),
                     "loss_br": float(loss_br),
@@ -288,8 +275,7 @@ def train_brm(env, policy, value_net, train_dataset: dict,
                 f"BRM step {step:5d} | loss={float(loss):.6f} | "
                 f"loss_br={float(loss_br):.6f} | "
                 f"loss_foc={float(loss_foc):.6f}"
-                f"{monitor_text} | temp={float(temperature):.6g} | "
-                f"elapsed={elapsed_sec:.1f}s{status}"
+                f"{monitor_text} | elapsed={elapsed_sec:.1f}s{status}"
             )
             capture_checkpoint(step, config, policy=policy, value_net=value_net)
             if stop_on_threshold or cap_reached:

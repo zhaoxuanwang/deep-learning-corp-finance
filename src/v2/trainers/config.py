@@ -43,10 +43,6 @@ class TrainingConfig:
     # Evaluation
     eval_interval: int = 500
     eval_size:     int = 2560       # typically 10 * batch_size
-    eval_temperature: Optional[float] = None
-
-    # Smooth gate temperature for non-differentiable reward components.
-    temperature: float = 1e-6
 
     # Weight history: if not None, appends (step, weights) at eval points
     weight_history: list = None
@@ -102,10 +98,6 @@ class TrainingConfig:
                 f"eval_interval must be >= 1. Got {self.eval_interval}")
         if self.eval_size < 1:
             raise ValueError(f"eval_size must be >= 1. Got {self.eval_size}")
-        if self.eval_temperature is not None and self.eval_temperature <= 0:
-            raise ValueError(
-                "eval_temperature must be > 0 when provided. "
-                f"Got {self.eval_temperature}")
         if self.mode not in {"min", "max"}:
             raise ValueError(
                 f"mode must be 'min' or 'max'. Got {self.mode!r}")
@@ -254,35 +246,3 @@ class SHACConfig(TrainingConfig):
         default_factory=lambda: OptimizerConfig(learning_rate=2e-3))
     critic_optimizer: OptimizerConfig = field(
         default_factory=lambda: OptimizerConfig(learning_rate=5e-3))
-
-
-@dataclass
-class SHACVanillaConfig(TrainingConfig):
-    """Vanilla SHAC configuration — faithful to Xu et al. (2022).
-
-    Archived for reference.  Uses TD-λ critic targets with on-policy data,
-    which diverges in economic environments.  See SHACConfig for the
-    production variant.
-    """
-    batch_size:    int   = 64
-    horizon:       int   = 192
-    short_horizon: int   = 32
-    td_lambda:     float = 0.95
-    n_critic:      int   = 16
-    n_mb:          int   = 1
-
-    reward_scale: Optional[float] = None
-    warm_start_steps: int = 0    # 0 = cold start (archived default)
-
-    policy_optimizer: OptimizerConfig = field(
-        default_factory=lambda: OptimizerConfig(learning_rate=2e-3))
-    critic_optimizer: OptimizerConfig = field(
-        default_factory=lambda: OptimizerConfig(learning_rate=5e-3))
-
-
-@dataclass
-class MVEConfig(TrainingConfig):
-    """MVE-DDPG method configuration."""
-    mve_horizon:             int            = 10    # MVE rollout depth
-    critic_updates_per_step: int            = 1     # critic updates per actor update
-    reward_scale:            Optional[float] = None  # λ; None = auto via env

@@ -1,1 +1,1 @@
-# v2 utility modules: normalization, smooth indicators, annealing, seeding.
+# v2 utility modules: normalization, seeding.

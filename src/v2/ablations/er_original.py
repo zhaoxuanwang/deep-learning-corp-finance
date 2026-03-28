@@ -1,18 +1,15 @@
-"""Euler Residual (ER) trainer — offline, generic.
+"""Supported ER control used by the ablation notebook.
 
-Minimizes squared Euler equation residuals using AiO cross-product
-or MSE loss. Requires the environment to implement euler_residual().
+Faithful control implementation of the original Euler Residual method:
+the same policy network is used for both sides of the Euler equation,
+with no target network or Polyak averaging.  This creates a moving-target
+bias — the loss landscape shifts every gradient step because the "target"
+next-period actions change with the policy.
 
-Data contract
--------------
-Both train_dataset and val_dataset are in flattened format:
-    s_endo:       (N, endo_dim)    endogenous state k (i.i.d. uniform)
-    z:            (N, exo_dim)     current exogenous state
-    z_next_main:  (N, exo_dim)     next z from main AR(1) path
-    z_next_fork:  (N, exo_dim)     next z from fork path (AiO second draw)
-
-No shocks are sampled inside this trainer — all transition data comes
-from the pre-generated dataset.
+This trainer stays outside ``src/v2/trainers`` because it is a comparison
+method for notebook 02 rather than part of the core production trainer set.
+The implementation reuses the modern v2 infrastructure so comparisons against
+the refined ER are fair.
 """
 
 import time
@@ -20,8 +17,6 @@ import time
 import tensorflow as tf
 from src.v2.trainers.config import ERConfig
 from src.v2.trainers.core import (
-    polyak_update,
-    build_target_policy,
     StopTracker,
     append_history_row,
     capture_checkpoint,
@@ -36,38 +31,40 @@ from src.v2.utils.seeding import make_seed_int, seed_runtime
 _DATASET_KEYS = ["s_endo", "z", "z_next_main", "z_next_fork"]
 
 
-def train_er(env, policy, train_dataset: dict, val_dataset: dict = None,
-             config: ERConfig = None, eval_callback=None):
-    """Train a policy using the Euler Residual method on a fixed dataset.
+def train_er_original(env, policy, train_dataset: dict, val_dataset: dict = None,
+                      config: ERConfig = None, eval_callback=None):
+    """Train a policy using the original (single-network) ER method.
+
+    Unlike the refined ER trainer, this uses the *same* policy for both
+    current and next-period action evaluation — no target network, no
+    Polyak updates.
 
     Args:
         env:           MDPEnvironment instance (must implement euler_residual).
         policy:        PolicyNetwork instance.
         train_dataset: Flattened dataset dict (see module docstring).
         val_dataset:   Flattened dataset for evaluation (optional).
-        config:        ERConfig with hyperparameters.
+        config:        ERConfig with hyperparameters (polyak_rate is ignored).
         eval_callback: Optional callable returning eval metrics at checkpoints.
 
     Returns:
         dict with keys: policy, history, config.
     """
     config = config or ERConfig()
-    env.validate_nn_training_support("train_er")
+    env.validate_nn_training_support("train_er_original")
     seed_runtime(
-        config.master_seed, "train_er",
+        config.master_seed, "train_er_original",
         strict_reproducibility=config.strict_reproducibility,
     )
 
-    validate_dataset_keys(train_dataset, _DATASET_KEYS, "train_er", "train_dataset")
+    validate_dataset_keys(train_dataset, _DATASET_KEYS, "train_er_original", "train_dataset")
     if val_dataset is not None:
-        validate_dataset_keys(val_dataset, _DATASET_KEYS, "train_er", "val_dataset")
+        validate_dataset_keys(val_dataset, _DATASET_KEYS, "train_er_original", "val_dataset")
     if config.monitor is not None and eval_callback is None and val_dataset is None:
         raise ValueError(
-            "train_er requires val_dataset when monitor is set and no "
+            "train_er_original requires val_dataset when monitor is set and no "
             "eval_callback is provided."
         )
-
-    target_policy = build_target_policy(policy)
 
     optimizer = tf.keras.optimizers.Adam(
         learning_rate=config.policy_optimizer.learning_rate,
@@ -76,7 +73,7 @@ def train_er(env, policy, train_dataset: dict, val_dataset: dict = None,
     # ------------------------------------------------------------------
     # Fit normalizer from full dataset (once, before gradient steps)
     # ------------------------------------------------------------------
-    fit_normalizer_flat(env, train_dataset, policy, target_policy)
+    fit_normalizer_flat(env, train_dataset, policy)
 
     # ------------------------------------------------------------------
     # Training loop
@@ -84,7 +81,7 @@ def train_er(env, policy, train_dataset: dict, val_dataset: dict = None,
     train_iter = build_iterator(
         train_dataset, config.batch_size,
         shuffle_seed=make_seed_int(
-            config.master_seed, "train_er", "batch_shuffle"),
+            config.master_seed, "train_er_original", "batch_shuffle"),
     )
     history = {}
     stop_tracker = StopTracker(
@@ -119,9 +116,9 @@ def train_er(env, policy, train_dataset: dict, val_dataset: dict = None,
             s_next_main = env.merge_state(k_next, z_next_main)
             s_next_fork = env.merge_state(k_next, z_next_fork)
 
-            # Next actions from TARGET policy (no gradient)
-            a_next_main = target_policy(s_next_main, training=False)
-            a_next_fork = target_policy(s_next_fork, training=False)
+            # Next actions from SAME policy (no target network)
+            a_next_main = policy(s_next_main, training=False)
+            a_next_fork = policy(s_next_fork, training=False)
 
             # Euler residuals
             f1 = env.euler_residual(s, a, s_next_main, a_next_main)
@@ -134,7 +131,6 @@ def train_er(env, policy, train_dataset: dict, val_dataset: dict = None,
 
         grads = tape.gradient(loss, policy.trainable_variables)
         optimizer.apply_gradients(zip(grads, policy.trainable_variables))
-        polyak_update(policy, target_policy, tau=config.polyak_rate)
 
         # Evaluation
         elapsed_sec = time.perf_counter() - train_start
@@ -178,7 +174,7 @@ def train_er(env, policy, train_dataset: dict, val_dataset: dict = None,
                     f" | {monitor_name}={float(eval_metrics[monitor_name]):.6f}"
                 )
             print(
-                f"ER step {step:5d} | loss={float(loss):.6f}"
+                f"ER-Orig step {step:5d} | loss={float(loss):.6f}"
                 f"{monitor_text} | elapsed={elapsed_sec:.1f}s{status}"
             )
             capture_checkpoint(step, config, policy=policy)

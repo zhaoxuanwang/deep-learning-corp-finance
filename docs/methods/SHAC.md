@@ -369,28 +369,54 @@ initialization basin within a practical training budget.
 | `train_dataset` | `dict` | Trajectory format: `s_endo_0` (N, endo_dim), `z_path` (N, T+1, exo_dim). Requires T >= `SHACConfig.horizon` |
 | `val_dataset` | `dict` or `None` | Flattened format: `s_endo`, `z`, `z_next_main`. Used for Euler/Bellman evaluation only |
 | `config` | `SHACConfig` | See Section 5 for defaults |
+| `eval_callback` | callable or `None` | Custom validation metrics.  See [training_infrastructure.md](training_infrastructure.md) §1. |
 
 Target networks ($\bar{\pi}_\theta$, $\bar{V}_\phi$) and input
 normalizers are created internally by the trainer.
 
 ### Output
 
-Returns a dict with keys `policy`, `value_net` (both updated in-place),
-`history`, and `config`.  The `history` dict contains per-evaluation-step
-lists: `step`, `loss_actor`, `loss_critic`, `euler_residual`,
-`bellman_residual`.
+See [training_infrastructure.md](training_infrastructure.md) §3 for the
+full output schema (history keys, early-stopping metadata, wall time).
+SHAC records `loss_actor`, `loss_critic` in history.
 
 ### Minimal example
 
 ```python
-config = SHACConfig(n_steps=3000, eval_interval=500)
+from src.v2.trainers.shac import train_shac
+from src.v2.trainers.config import SHACConfig
+
+config = SHACConfig(
+    n_steps=3000,
+    eval_interval=500,
+    horizon=192,           # total trajectory length T
+    short_horizon=32,      # actor rollout window h (T must be divisible by h)
+    # normalize_rewards=True,       # auto reward scaling (default)
+    # reward_scale_override=None,   # manual override if needed
+)
 
 result = train_shac(env, policy, value_net,
                     train_traj, val_flat, config=config)
 ```
 
-The primary convergence signal is `euler_residual`.  `loss_actor` is in
-scaled reward units (O(1) due to reward normalization).
+**Key config choices:**
+- `horizon` / `short_horizon` control trajectory slicing: each mini-batch
+  of B trajectories is split into T/h windows, each yielding one actor
+  gradient step.  Shorter windows (smaller h) reduce BPTT depth but
+  increase reliance on the critic bootstrap.
+- `normalize_rewards=True` (default) auto-scales rewards by
+  `env.reward_scale()` so that value predictions are O(1).  This prevents
+  the critic from producing large bootstrap values that destabilize the
+  actor.  Set `reward_scale_override` to provide a manual scale.
+
+### Relationship to Xu et al. (2022)
+
+This is a **DDPG-style variant** of the original SHAC algorithm.  The key
+modifications (1-step Bellman critic with target networks instead of TD-λ,
+reward normalization) are described in Section 4.  The original TD-λ
+variant is archived in `src/v2/experimental/shac_vanilla.py` and diverges
+in the offline setting due to a positive feedback loop between actor drift
+and on-policy critic targets.
 
 ### Reference
 

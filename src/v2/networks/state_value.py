@@ -1,7 +1,7 @@
-"""Generic state-value network: s → V(s) scalar.
+"""Generic state-value network: s -> V(s) scalar.
 
-Distinct from CriticNetwork (Q-critic: (s, a) → Q(s, a)).
-Used by the BRM trainer which learns V(s) directly, not Q(s, a).
+Used by the BRM and SHAC trainers, which learn V(s) directly rather than a
+state-action Q-function.
 """
 
 import tensorflow as tf

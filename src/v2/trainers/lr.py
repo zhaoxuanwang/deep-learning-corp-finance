@@ -57,18 +57,13 @@ def train_lr(env, policy, train_dataset: dict, val_dataset: dict = None,
         dict with keys: policy, history, config.
     """
     config      = config or LRConfig()
+    env.validate_nn_training_support("train_lr")
     seed_runtime(
         config.master_seed, "train_lr",
         strict_reproducibility=config.strict_reproducibility,
     )
     gamma       = env.discount()
     T           = config.horizon
-
-    # Annealing: env decides; tf.Variable so @tf.function reads it live.
-    schedule = env.annealing_schedule()
-    temp_var = tf.Variable(
-        schedule.value if schedule else config.temperature,
-        dtype=tf.float32, trainable=False)
 
     validate_dataset_keys(train_dataset, _TRAIN_KEYS, "train_lr", "train_dataset")
     if val_dataset is not None:
@@ -115,8 +110,7 @@ def train_lr(env, policy, train_dataset: dict, val_dataset: dict = None,
                 z_t = z_path[:, t, :]
                 s_t = env.merge_state(k, z_t)
                 a_t = policy(s_t, training=False)
-                r_t = tf.reshape(
-                    env.reward(s_t, a_t, temperature=temp_var), [-1])
+                r_t = tf.reshape(env.reward(s_t, a_t), [-1])
                 total_reward = total_reward + discount_t * r_t
                 k = env.endogenous_transition(k, a_t, z_t)
                 discount_t = discount_t * gamma
@@ -124,8 +118,7 @@ def train_lr(env, policy, train_dataset: dict, val_dataset: dict = None,
             # Terminal value: V^term(s_endo_T) = r(s̄, ā) / (1-γ).
             # Gradients flow through k_T but not through the policy.
             if use_terminal:
-                v_term = tf.reshape(
-                    env.terminal_value(k, temperature=temp_var), [-1])
+                v_term = tf.reshape(env.terminal_value(k), [-1])
                 total_reward = total_reward + discount_t * v_term
 
             loss = -tf.reduce_mean(total_reward)
@@ -160,10 +153,6 @@ def train_lr(env, policy, train_dataset: dict, val_dataset: dict = None,
         last_step = step
         loss = train_step(batch["s_endo_0"], batch["z_path"])
 
-        if schedule:
-            schedule.update()
-            temp_var.assign(schedule.value)
-
         # Evaluation
         elapsed_sec = time.perf_counter() - train_start
         cap_reached = (
@@ -171,19 +160,13 @@ def train_lr(env, policy, train_dataset: dict, val_dataset: dict = None,
             and elapsed_sec >= config.max_wall_time_sec
         )
         if step % config.eval_interval == 0 or step == config.n_steps - 1 or cap_reached:
-            train_temperature = float(temp_var)
             eval_metrics = run_eval_callback(
                 step,
                 env,
                 policy,
                 None,
                 val_dataset,
-                train_temperature,
                 eval_callback=eval_callback,
-                eval_temperature=(
-                    config.eval_temperature
-                    if eval_callback is None else None
-                ),
             )
             elapsed_sec = time.perf_counter() - train_start
             stop_on_threshold = stop_tracker.record_eval(
@@ -197,7 +180,6 @@ def train_lr(env, policy, train_dataset: dict, val_dataset: dict = None,
                 history,
                 step,
                 elapsed_sec,
-                train_temperature,
                 base_scalars={"loss": float(loss)},
                 eval_metrics=eval_metrics,
             )
@@ -214,8 +196,7 @@ def train_lr(env, policy, train_dataset: dict, val_dataset: dict = None,
                 )
             print(
                 f"LR step {step:5d} | loss={float(loss):.4f}"
-                f"{monitor_text} | temp={train_temperature:.6g} | "
-                f"elapsed={elapsed_sec:.1f}s{status}"
+                f"{monitor_text} | elapsed={elapsed_sec:.1f}s{status}"
             )
             capture_checkpoint(step, config, policy=policy)
             if stop_on_threshold or cap_reached:

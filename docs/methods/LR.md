@@ -216,21 +216,36 @@ Validation dataset uses flattened format: `{s_endo, z, z_next_main, z_next_fork}
 | `train_dataset` | `dict` | Trajectory format: `s_endo_0` (N, endo_dim), `z_path` (N, T+1, exo_dim).  Requires dataset horizon $\geq$ `LRConfig.horizon`. |
 | `val_dataset` | `dict` or `None` | Flattened format: `s_endo`, `z`, `z_next_main`, `z_next_fork`.  Used for Euler residual evaluation only. |
 | `config` | `LRConfig` | See Section 5 for defaults. |
+| `eval_callback` | callable or `None` | Custom validation metrics.  See [training_infrastructure.md](training_infrastructure.md) §1. |
 
 ### Output
 
-Returns a dict with keys `policy` (updated in-place), `history`, and
-`config`.  The `history` dict contains per-evaluation-step lists: `step`,
-`loss`, `euler_residual`.
+See [training_infrastructure.md](training_infrastructure.md) §3 for the
+full output schema (history keys, early-stopping metadata, wall time).
+LR records `loss` (negative mean lifetime reward) in history.
 
 ### Minimal example
 
 ```python
-config = LRConfig(n_steps=3000, horizon=64, eval_interval=500)
+from src.v2.trainers.lr import train_lr
+from src.v2.trainers.config import LRConfig
+
+config = LRConfig(
+    n_steps=3000,
+    horizon=64,            # rollout length T (must be <= dataset horizon)
+    terminal_value=True,   # analytical V^term correction (recommended)
+    eval_interval=500,
+)
 
 result = train_lr(env, policy,
                   train_traj, val_flat, config=config)
 ```
 
-The primary convergence signal is `euler_residual`.  `loss` is in reward
-units (negative expected lifetime reward).
+**Key config choices:**
+- `terminal_value=True` adds the analytical perpetuity
+  $V^{term}(k_T) = r(\bar{s}, \bar{a}) / (1 - \gamma)$ at the end of each
+  rollout.  Without it, the truncated sum undervalues long-horizon states
+  and the policy systematically under-invests.
+- `horizon` controls the BPTT depth.  Longer horizons reduce truncation
+  bias but increase memory and compilation time (the loop is statically
+  unrolled into the TF graph).

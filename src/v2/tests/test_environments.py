@@ -184,37 +184,44 @@ class TestDynamics:
         grad = tape.gradient(loss, a)
         assert grad is not None
 
-    def test_adjustment_indicator_supports_hard_and_soft_modes(self):
-        """Fixed-cost gate can be queried in either hard or soft mode."""
+    def test_fixed_cost_reward_uses_exact_hard_indicator(self):
+        """The fixed cost is paid iff effective investment is nonzero."""
         env = BasicInvestmentEnv(
-            econ_params=EconomicParams(cost_convex=0.2, cost_fixed=0.02))
+            econ_params=EconomicParams(cost_convex=0.2, cost_fixed=0.02)
+        )
         s = tf.constant([[env.k_star, 1.0]], dtype=tf.float32)
 
         no_adjust = tf.constant([[0.0]], dtype=tf.float32)
-        invest = tf.constant([[0.5]], dtype=tf.float32)
+        invest = tf.constant([[0.25]], dtype=tf.float32)
 
-        hard_no_adjust = env.adjustment_indicator(
-            s, no_adjust, gate_mode="hard")
-        soft_no_adjust = env.adjustment_indicator(
-            s, no_adjust, temperature=1e-6, gate_mode="soft")
-        hard_invest = env.adjustment_indicator(
-            s, invest, gate_mode="hard")
-        soft_invest = env.adjustment_indicator(
-            s, invest, temperature=1e-6, gate_mode="soft")
+        reward_no_adjust = float(tf.squeeze(env.reward(s, no_adjust)))
+        reward_invest = float(tf.squeeze(env.reward(s, invest)))
 
-        assert float(hard_no_adjust[0]) == pytest.approx(0.0)
-        assert 0.45 < float(soft_no_adjust[0]) < 0.55
-        assert float(hard_invest[0]) == pytest.approx(1.0)
-        assert float(soft_invest[0]) > 1.0 - 1e-6
+        k = float(s[0, 0])
+        z = float(s[0, 1])
+        investment = float(invest[0, 0])
+        profit = z * (k ** env.econ.production_elasticity)
+        convex_cost = 0.5 * env.econ.cost_convex * investment ** 2 / k
+        fixed_cost = env.econ.cost_fixed * k
+        expected_gap = investment + convex_cost + fixed_cost
 
-    def test_reward_accepts_hard_gate_mode(self):
-        """Hard-gate reward evaluation is available for discrete solvers."""
+        assert reward_invest == pytest.approx(
+            reward_no_adjust - expected_gap, rel=1e-5
+        )
+
+    def test_fixed_cost_uses_effective_post_constraint_investment(self):
+        """The fixed-cost indicator is based on constrained investment."""
         env = BasicInvestmentEnv(
-            econ_params=EconomicParams(cost_convex=0.2, cost_fixed=0.02))
-        s = tf.constant([[env.k_star, 1.0]], dtype=tf.float32)
-        a = tf.constant([[0.25]], dtype=tf.float32)
-        reward = env.reward(s, a, gate_mode="hard")
-        assert np.isfinite(float(tf.squeeze(reward)))
+            econ_params=EconomicParams(cost_convex=0.0, cost_fixed=0.5)
+        )
+        s = tf.constant([[env.k_min, 1.0]], dtype=tf.float32)
+        disinvest = tf.constant([[-100.0]], dtype=tf.float32)
+        hold = tf.constant([[0.0]], dtype=tf.float32)
+
+        reward_hold = float(tf.squeeze(env.reward(s, hold)))
+        reward_disinvest = float(tf.squeeze(env.reward(s, disinvest)))
+
+        assert reward_disinvest == pytest.approx(reward_hold, rel=1e-6)
 
     def test_economic_params_accept_legacy_aliases(self):
         """Legacy aliases still map onto the renamed public fields."""
@@ -226,77 +233,18 @@ class TestDynamics:
         assert econ.delta == pytest.approx(0.2)
         assert econ.theta == pytest.approx(0.65)
 
-    def test_adjustment_epsilon_is_configurable(self):
-        """The fixed-cost gate tolerance can be varied explicitly."""
+    def test_validate_nn_training_support_allows_smooth_model(self):
         env = BasicInvestmentEnv(
-            econ_params=EconomicParams(
-                cost_convex=0.2,
-                cost_fixed=0.02,
-                adjustment_epsilon=1e-3,
-            )
+            econ_params=EconomicParams(cost_convex=0.2, cost_fixed=0.0)
         )
-        s = tf.constant([[env.k_star, 1.0]], dtype=tf.float32)
-        a_small = tf.constant([[5e-4 * env.k_star]], dtype=tf.float32)
-        hard_gate = env.adjustment_indicator(s, a_small, gate_mode="hard")
-        assert float(hard_gate[0]) == pytest.approx(0.0)
+        env.validate_nn_training_support("train_lr")
 
-    def test_soft_adjustment_epsilon_overrides_soft_gate_only(self):
-        """Soft/STE gates can use a training-only epsilon without changing hard mode."""
+    def test_validate_nn_training_support_rejects_fixed_cost_model(self):
         env = BasicInvestmentEnv(
-            econ_params=EconomicParams(
-                cost_convex=0.2,
-                cost_fixed=0.02,
-                adjustment_epsilon=1e-8,
-            ),
-            soft_adjustment_epsilon=5e-3,
+            econ_params=EconomicParams(cost_convex=0.2, cost_fixed=0.02)
         )
-        s = tf.constant([[env.k_star, 1.0]], dtype=tf.float32)
-        no_adjust = tf.constant([[0.0]], dtype=tf.float32)
-
-        soft_gate = env.adjustment_indicator(
-            s, no_adjust, temperature=1e-3, gate_mode="soft"
-        )
-        hard_gate = env.adjustment_indicator(
-            s, no_adjust, gate_mode="hard"
-        )
-        assert float(hard_gate[0]) == pytest.approx(0.0)
-        assert float(soft_gate[0]) < 0.01
-
-    def test_default_gate_mode_applies_when_gate_mode_omitted(self):
-        """Env-level gate mode lets trainers switch from soft to STE generically."""
-        env = BasicInvestmentEnv(
-            econ_params=EconomicParams(cost_convex=0.2, cost_fixed=0.02),
-            soft_adjustment_epsilon=5e-3,
-            default_gate_mode="ste",
-        )
-        s = tf.constant([[env.k_star, 1.0]], dtype=tf.float32)
-        no_adjust = tf.constant([[0.0]], dtype=tf.float32)
-
-        gate = env.adjustment_indicator(s, no_adjust, temperature=1e-3)
-        reward = env.reward(s, no_adjust, temperature=1e-3)
-
-        assert float(gate[0]) == pytest.approx(0.0)
-        assert np.isfinite(float(tf.squeeze(reward)))
-
-    def test_soft_adjustment_epsilon_factor_tracks_temperature(self):
-        """Dynamic soft epsilon can stay proportional to the current temperature."""
-        env = BasicInvestmentEnv(
-            econ_params=EconomicParams(cost_convex=0.2, cost_fixed=0.02),
-            soft_adjustment_epsilon_factor=5.0,
-        )
-        s = tf.constant([[env.k_star, 1.0]], dtype=tf.float32)
-        no_adjust = tf.constant([[0.0]], dtype=tf.float32)
-
-        gate_hi = env.adjustment_indicator(
-            s, no_adjust, temperature=1e-2, gate_mode="soft"
-        )
-        gate_lo = env.adjustment_indicator(
-            s, no_adjust, temperature=1e-3, gate_mode="soft"
-        )
-
-        target = float(tf.sigmoid(-5.0))
-        assert float(gate_hi[0]) == pytest.approx(target)
-        assert float(gate_lo[0]) == pytest.approx(target)
+        with pytest.raises(ValueError, match="solve_vfi\\(\\) or solve_pfi\\(\\)"):
+            env.validate_nn_training_support("train_lr")
 
 
 # =============================================================================
@@ -325,6 +273,16 @@ class TestEulerResidual:
         a_next = tf.constant([[0.3]])
         er = env.euler_residual(s, a, s_next, a_next)
         assert np.all(np.isfinite(er.numpy()))
+
+    def test_euler_residual_rejects_fixed_cost_model(self):
+        env = BasicInvestmentEnv(
+            econ_params=EconomicParams(cost_convex=0.2, cost_fixed=0.02)
+        )
+        s = tf.constant([[env.k_star, 1.0]], dtype=tf.float32)
+        a = tf.constant([[0.1]], dtype=tf.float32)
+        s_next = env.transition(s, a, tf.constant([[0.0]], dtype=tf.float32))
+        with pytest.raises(NotImplementedError, match="cost_fixed == 0"):
+            env.euler_residual(s, a, s_next, a)
 
 
 # =============================================================================
@@ -405,47 +363,6 @@ class TestRewardScale:
         ratio = lam_generic / lam_analytical
         assert ratio > 0.01, (
             f"Ratio {ratio:.4f} too small — estimates diverge excessively")
-
-
-# =============================================================================
-# Annealing schedule
-# =============================================================================
-
-class TestAnnealingSchedule:
-    """Tests for env.annealing_schedule() factory method."""
-
-    def test_none_when_no_fixed_cost(self):
-        """No annealing needed when cost_fixed == 0."""
-        env = BasicInvestmentEnv(
-            econ_params=EconomicParams(cost_fixed=0.0))
-        assert env.annealing_schedule() is None
-
-    def test_returns_schedule_with_fixed_cost(self):
-        """Annealing schedule returned when cost_fixed > 0."""
-        from src.v2.utils.annealing import AnnealingSchedule
-        env = BasicInvestmentEnv(
-            econ_params=EconomicParams(cost_fixed=0.02))
-        sched = env.annealing_schedule()
-        assert isinstance(sched, AnnealingSchedule)
-        assert sched.init_temp == 1.0
-        assert sched.min_temp == 1e-6
-
-    def test_returns_fresh_instance(self):
-        """Each call returns a new schedule (no shared state)."""
-        env = BasicInvestmentEnv(
-            econ_params=EconomicParams(cost_fixed=0.02))
-        s1 = env.annealing_schedule()
-        s2 = env.annealing_schedule()
-        assert s1 is not s2
-        # Mutating s1 doesn't affect s2
-        s1.update()
-        assert s1.step == 1
-        assert s2.step == 0
-
-    def test_base_class_returns_none(self):
-        """MDPEnvironment base default is None."""
-        env = BasicInvestmentEnv()  # cost_fixed=0 by default
-        assert MDPEnvironment.annealing_schedule(env) is None
 
 
 # =============================================================================

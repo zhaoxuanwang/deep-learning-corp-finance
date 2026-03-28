@@ -252,23 +252,39 @@ Validation dataset uses the same format.
 | `train_dataset` | `dict` | Flattened format: `s_endo`, `z`, `z_next_main`, `z_next_fork`. |
 | `val_dataset` | `dict` or `None` | Same flattened format.  Used for Euler residual evaluation only. |
 | `config` | `ERConfig` | See Section 5 for defaults. |
+| `eval_callback` | callable or `None` | Custom validation metrics.  See [training_infrastructure.md](training_infrastructure.md) §1. |
 
-The target network is created internally by the trainer.
+The target network is created internally by the trainer via
+`build_target_policy(policy)` and updated with Polyak averaging after
+each gradient step.
 
 ### Output
 
-Returns a dict with keys `policy` (updated in-place), `history`, and
-`config`.  The `history` dict contains per-evaluation-step lists: `step`,
-`loss`, `euler_residual`.
+See [training_infrastructure.md](training_infrastructure.md) §3 for the
+full output schema (history keys, early-stopping metadata, wall time).
+ER records `loss` (AiO cross-product of Euler residuals) in history.
 
 ### Minimal example
 
 ```python
-config = ERConfig(n_steps=3000, eval_interval=500)
+from src.v2.trainers.er import train_er
+from src.v2.trainers.config import ERConfig
+
+config = ERConfig(
+    n_steps=3000,
+    eval_interval=500,
+    # polyak_rate=0.995,  # target network EMA rate (default)
+    # loss_type="crossprod",  # AiO cross-product (default) or "mse"
+)
 
 result = train_er(env, policy,
                   train_flat, val_flat, config=config)
 ```
 
-The primary convergence signal is `euler_residual`.  `loss` is the AiO
-cross-product of Euler residuals (should converge toward zero).
+**Key config choices:**
+- `polyak_rate` controls target network lag.  Higher values (closer to 1)
+  make the target more stable but slower to track the current policy.
+  The default 0.995 works well across tested environments.
+- `loss_type="crossprod"` (default) uses the AiO estimator with two
+  independent shock draws for unbiased squared-expectation estimation.
+  `"mse"` uses a single draw (biased but simpler).

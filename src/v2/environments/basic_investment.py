@@ -36,7 +36,6 @@ from typing import Optional
 import tensorflow as tf
 
 from src.v2.environments.base import MDPEnvironment
-from src.v2.utils.smooth_indicators import indicator_abs_gt
 
 
 # =====================================================================
@@ -92,9 +91,6 @@ class EconomicParams:
                             Production elasticity (Cobb-Douglas).
         cost_convex:        Convex adjustment cost coefficient (φ₀).
         cost_fixed:         Fixed adjustment cost coefficient (φ₁).
-        adjustment_epsilon: Numerical tolerance in the fixed-cost gate
-                            1{|I/k| > eps}. Defaults to a tiny value so the
-                            economic trigger remains effectively 1{I != 0}.
         tax:                Corporate income tax rate.
         cost_default:       Default / bankruptcy cost (α).
         cost_inject_fixed:  Fixed external equity cost (η₀).
@@ -108,7 +104,6 @@ class EconomicParams:
     # Adjustment costs
     cost_convex:  float = 0.0
     cost_fixed:   float = 0.0
-    adjustment_epsilon: float = 1e-8
     # Risky debt (unused by basic model, kept for reuse by future envs)
     tax:                float = 0.3
     cost_default:       float = 0.4
@@ -123,7 +118,6 @@ class EconomicParams:
         production_elasticity: float = 0.7,
         cost_convex: float = 0.0,
         cost_fixed: float = 0.0,
-        adjustment_epsilon: float = 1e-8,
         tax: float = 0.3,
         cost_default: float = 0.4,
         cost_inject_fixed: float = 0.0,
@@ -150,7 +144,6 @@ class EconomicParams:
         object.__setattr__(self, "production_elasticity", production_elasticity)
         object.__setattr__(self, "cost_convex", cost_convex)
         object.__setattr__(self, "cost_fixed", cost_fixed)
-        object.__setattr__(self, "adjustment_epsilon", adjustment_epsilon)
         object.__setattr__(self, "tax", tax)
         object.__setattr__(self, "cost_default", cost_default)
         object.__setattr__(self, "cost_inject_fixed", cost_inject_fixed)
@@ -190,12 +183,7 @@ class EconomicParams:
             raise ValueError(f"cost_convex must be >= 0. Got {self.cost_convex}")
         if self.cost_fixed < 0:
             raise ValueError(f"cost_fixed must be >= 0. Got {self.cost_fixed}")
-        if self.adjustment_epsilon < 0:
-            raise ValueError(
-                "adjustment_epsilon must be >= 0. "
-                f"Got {self.adjustment_epsilon}"
-            )
-
+        
 
 # =====================================================================
 # Domain-specific economic functions (inlined from v1 economy/logic.py)
@@ -206,53 +194,13 @@ def _production(k, z, production_elasticity):
     return z * (k ** production_elasticity)
 
 
-def _investment_rate(k, k_next, params):
-    """Normalized investment rate I / k used by the fixed-cost gate."""
-    I = k_next - (1.0 - params.depreciation_rate) * k
+def _adjustment_costs(k, investment, params):
+    """Total adjustment costs: convex plus exact hard fixed cost."""
     safe_k = tf.maximum(k, 1e-8)
-    return I / safe_k
-
-
-def _adjustment_gate(k, k_next, params, temperature, logit_clip,
-                     gate_mode: str = "soft",
-                     threshold: Optional[float] = None):
-    """Fixed-cost gate 1{|I/k| > eps} with explicit hard/soft mode."""
-    i_norm = _investment_rate(k, k_next, params)
-    return indicator_abs_gt(
-        i_norm,
-        threshold=(
-            params.adjustment_epsilon if threshold is None else float(threshold)
-        ),
-        temperature=temperature,
-        logit_clip=logit_clip,
-        mode=gate_mode,
+    adj_convex = 0.5 * params.cost_convex * tf.square(investment) / safe_k
+    adj_fixed = params.cost_fixed * safe_k * tf.cast(
+        tf.not_equal(investment, 0.0), tf.float32
     )
-
-
-def _adjustment_costs(k, k_next, params, temperature, logit_clip,
-                      gate_mode: str = "soft",
-                      threshold: Optional[float] = None):
-    """Total adjustment costs: convex + fixed.
-
-    Convex: (φ₀/2) · I² / k
-    Fixed:  φ₁ · k · 1{|I/k| > ε}   (smooth indicator)
-    """
-    I = k_next - (1.0 - params.depreciation_rate) * k
-    safe_k = tf.maximum(k, 1e-8)
-
-    # Convex
-    adj_convex = (params.cost_convex / 2.0) * (I ** 2) / safe_k
-
-    # Fixed (gate mode chosen by caller)
-    is_investing = _adjustment_gate(
-        k, k_next, params,
-        temperature=temperature,
-        logit_clip=logit_clip,
-        gate_mode=gate_mode,
-        threshold=threshold,
-    )
-    adj_fixed = params.cost_fixed * safe_k * is_investing
-
     return adj_convex + adj_fixed
 
 
@@ -263,13 +211,18 @@ def _adjustment_costs(k, k_next, params, temperature, logit_clip,
 class BasicInvestmentEnv(MDPEnvironment):
     """Corporate finance basic model: optimal capital investment.
 
+    The environment is the canonical economic model. When ``cost_fixed > 0``,
+    the reward uses the exact hard indicator ``1{I_eff != 0}`` computed from
+    the effective post-constraint investment. This is supported by the
+    discrete solvers and intentionally rejected by the active NN trainers.
+
     Args:
-        econ_params:  economic parameters (interest, depreciation,
-                      production elasticity, costs).
-        shock_params: AR(1) shock parameters (rho, sigma, mu).
-        k_min_mult:   lower capital bound as multiplier on k*.
-        k_max_mult:   upper capital bound as multiplier on k*.
-        z_sd_mult:    number of ergodic std devs for z bounds.
+        econ_params:       Economic parameters (interest, depreciation,
+                           production elasticity, costs).
+        shock_params:      AR(1) shock parameters (rho, sigma, mu).
+        k_min_mult:        Lower capital bound as multiplier on k*.
+        k_max_mult:        Upper capital bound as multiplier on k*.
+        z_sd_mult:         Number of ergodic std devs for z bounds.
     """
 
     def __init__(
@@ -279,41 +232,10 @@ class BasicInvestmentEnv(MDPEnvironment):
         k_min_mult:   float          = 0.25,
         k_max_mult:   float          = 6.0,
         z_sd_mult:    float          = 3.0,
-        soft_adjustment_epsilon: Optional[float] = None,
-        soft_adjustment_epsilon_factor: Optional[float] = None,
-        default_gate_mode: str = "soft",
     ):
         self.econ   = econ_params  or EconomicParams()
         self.shocks = shock_params or ShockParams()
-        self.soft_adjustment_epsilon = (
-            None if soft_adjustment_epsilon is None
-            else float(soft_adjustment_epsilon)
-        )
-        self.soft_adjustment_epsilon_factor = (
-            None if soft_adjustment_epsilon_factor is None
-            else float(soft_adjustment_epsilon_factor)
-        )
-        self.default_gate_mode = str(default_gate_mode)
         self.beta   = 1.0 / (1.0 + self.econ.interest_rate)
-
-        if self.soft_adjustment_epsilon is not None and self.soft_adjustment_epsilon < 0:
-            raise ValueError(
-                "soft_adjustment_epsilon must be >= 0. "
-                f"Got {self.soft_adjustment_epsilon}"
-            )
-        if (
-            self.soft_adjustment_epsilon_factor is not None
-            and self.soft_adjustment_epsilon_factor < 0
-        ):
-            raise ValueError(
-                "soft_adjustment_epsilon_factor must be >= 0. "
-                f"Got {self.soft_adjustment_epsilon_factor}"
-            )
-        if self.default_gate_mode not in {"soft", "hard", "ste"}:
-            raise ValueError(
-                "default_gate_mode must be one of {'soft', 'hard', 'ste'}. "
-                f"Got {self.default_gate_mode!r}"
-            )
 
         # z bounds in levels
         rho, sigma, mu = self.shocks.rho, self.shocks.sigma, self.shocks.mu
@@ -362,17 +284,9 @@ class BasicInvestmentEnv(MDPEnvironment):
     def action_scale_reference(self) -> tuple:
         """Policy output-head scaling: center=0, scale=max(|I_min|, I_max).
 
-        Center at zero so the policy initializes in the transition band
-        of any smooth surrogate for the adjustment-cost indicator
-        1{|I/k| > eps}.  Most differentiable approximations have peak
-        gradient near |I/k| = 0 and vanishing gradient far from it.
-        Centering at I_ss would place the init deep in the saturated
-        region, hiding the fixed-cost structure from early training.
-
-        For the frictionless model (cost_fixed=0) the indicator is
-        multiplied by zero, so the center choice has no effect on the
-        loss landscape — only a mild transient as the policy discovers
-        I ≈ I_ss.
+        Centering at zero keeps the policy output symmetric around the
+        no-adjustment action and works well for the supported smooth model
+        with convex costs only.
         """
         half_range = tf.constant([max(abs(self.I_min), self.I_max)],
                                  dtype=tf.float32)
@@ -401,15 +315,6 @@ class BasicInvestmentEnv(MDPEnvironment):
         k_next = tf.clip_by_value(k_next, self.k_min, self.k_max)
         I_eff  = k_next - (1.0 - self.econ.depreciation_rate) * k
         return k_next, I_eff
-
-    def _gate_threshold(self, gate_mode: str, temperature: float) -> float:
-        """Return the epsilon used by the chosen gate mode."""
-        if gate_mode in {"soft", "ste"}:
-            if self.soft_adjustment_epsilon is not None:
-                return float(self.soft_adjustment_epsilon)
-            if self.soft_adjustment_epsilon_factor is not None:
-                return float(self.soft_adjustment_epsilon_factor) * float(temperature)
-        return float(self.econ.adjustment_epsilon)
 
     # ------------------------------------------------------------------
     # Transitions
@@ -458,40 +363,18 @@ class BasicInvestmentEnv(MDPEnvironment):
     # Reward
     # ------------------------------------------------------------------
 
-    def reward(self, s: tf.Tensor, a: tf.Tensor,
-               temperature: float = 1e-6,
-               gate_mode: Optional[str] = None) -> tf.Tensor:
+    def reward(self, s: tf.Tensor, a: tf.Tensor) -> tf.Tensor:
         """Cash flow: profit - adjustment_cost - I_effective.
 
         s = merge_state(k, z), so s[..., 0] = k, s[..., 1] = z.
         """
         k = s[..., 0]
         z = s[..., 1]
-        k_next, I_eff = self._apply_action(k, a)
-        gate_mode = self.default_gate_mode if gate_mode is None else gate_mode
+        _, investment = self._apply_action(k, a)
 
         profit = _production(k, z, self.econ.production_elasticity)
-        adj_cost = _adjustment_costs(k, k_next, self.econ,
-                                     temperature=temperature,
-                                     logit_clip=20.0,
-                                     gate_mode=gate_mode,
-                                     threshold=self._gate_threshold(gate_mode, temperature))
-        return profit - adj_cost - I_eff
-
-    def adjustment_indicator(self, s: tf.Tensor, a: tf.Tensor,
-                             temperature: float = 1e-6,
-                             gate_mode: Optional[str] = None) -> tf.Tensor:
-        """Fixed-cost gate implied by action a at state s."""
-        k = s[..., 0]
-        k_next, _ = self._apply_action(k, a)
-        gate_mode = self.default_gate_mode if gate_mode is None else gate_mode
-        return _adjustment_gate(
-            k, k_next, self.econ,
-            temperature=temperature,
-            logit_clip=20.0,
-            gate_mode=gate_mode,
-            threshold=self._gate_threshold(gate_mode, temperature),
-        )
+        adj_cost = _adjustment_costs(k, investment, self.econ)
+        return profit - adj_cost - investment
 
     def stationary_exo(self) -> tf.Tensor:
         """Stationary mean of z: exp(μ), shape (1,)."""
@@ -504,6 +387,14 @@ class BasicInvestmentEnv(MDPEnvironment):
 
     def discount(self) -> float:
         return self.beta
+
+    def validate_nn_training_support(self, trainer_name: str) -> None:
+        if self.econ.cost_fixed > 0.0:
+            raise ValueError(
+                f"{trainer_name} does not support BasicInvestmentEnv with "
+                "cost_fixed > 0. Use solve_vfi() or solve_pfi() for the "
+                "fixed-cost model."
+            )
 
     # ------------------------------------------------------------------
     # Initial state sampling
@@ -538,23 +429,6 @@ class BasicInvestmentEnv(MDPEnvironment):
     # Analytical overrides
     # ------------------------------------------------------------------
 
-    def annealing_schedule(self):
-        """Return an annealing schedule when fixed costs are active.
-
-        Fixed adjustment costs use a smooth indicator 1{|I/k| > ε} that
-        requires temperature annealing for effective training.  When
-        cost_fixed == 0 the indicator is multiplied by zero, so annealing
-        is unnecessary and a fixed cold temperature suffices.
-
-        Returns a fresh instance each call (factory method) so that
-        separate training runs on the same env do not share state.
-        """
-        if self.econ.cost_fixed > 0:
-            from src.v2.utils.annealing import AnnealingSchedule
-            return AnnealingSchedule(
-                init_temp=1.0, min_temp=1e-6, decay_rate=0.995)
-        return None
-
     def grid_spec(self):
         """Grid discretization hints for discrete solvers (VFI/PFI).
 
@@ -578,7 +452,7 @@ class BasicInvestmentEnv(MDPEnvironment):
             action_axis = GridAxis(
                 self.I_min, self.I_max, spacing="zero_power", power=2.0)
         return {
-            "endo":   [GridAxis(self.k_min, self.k_max, spacing="log")],
+            "endo":   [GridAxis(self.k_min, self.k_max, spacing="geometric")],
             "exo":    [GridAxis(self.z_min, self.z_max, spacing="log")],
             "action": [action_axis],
         }
@@ -592,7 +466,6 @@ class BasicInvestmentEnv(MDPEnvironment):
     def euler_residual(
         self, s: tf.Tensor, a: tf.Tensor,
         s_next: tf.Tensor, a_next: tf.Tensor,
-        temperature: float = 1e-6,
     ) -> tf.Tensor:
         """Unit-free Euler residual: 1 - β·m/χ.
 
@@ -601,6 +474,13 @@ class BasicInvestmentEnv(MDPEnvironment):
 
         At optimum: E[residual] = 0.
         """
+        if self.econ.cost_fixed > 0.0:
+            raise NotImplementedError(
+                "BasicInvestmentEnv.euler_residual() is only supported when "
+                "cost_fixed == 0. The fixed-cost model should be solved with "
+                "solve_vfi() or solve_pfi()."
+            )
+
         k      = s[..., 0]
         z_next = s_next[..., 1]
         k_next, _      = self._apply_action(k, a)
@@ -617,26 +497,18 @@ class BasicInvestmentEnv(MDPEnvironment):
         # χ = 1 + ∂ψ(k, k')/∂k'
         with tf.GradientTape() as tape:
             tape.watch(k_next)
-            psi = _adjustment_costs(
-                k, k_next, self.econ,
-                temperature=temperature,
-                logit_clip=20.0,
-                gate_mode="soft",
-                threshold=self._gate_threshold("soft", temperature),
-            )
+            investment = k_next - (1.0 - self.econ.depreciation_rate) * k
+            psi = _adjustment_costs(k, investment, self.econ)
         chi = 1.0 + tape.gradient(psi, k_next)
 
         # m via derivatives of next-period adjustment cost
         with tf.GradientTape(persistent=True) as tape:
             tape.watch(k_next)
             tape.watch(k_next_next)
-            psi_next = _adjustment_costs(
-                k_next, k_next_next, self.econ,
-                temperature=temperature,
-                logit_clip=20.0,
-                gate_mode="soft",
-                threshold=self._gate_threshold("soft", temperature),
+            investment_next = (
+                k_next_next - (1.0 - self.econ.depreciation_rate) * k_next
             )
+            psi_next = _adjustment_costs(k_next, investment_next, self.econ)
         dpsi_next_dk = tape.gradient(psi_next, k_next)
         chi_next     = 1.0 + tape.gradient(psi_next, k_next_next)
         del tape

@@ -520,24 +520,41 @@ joint training begins.
 | `train_dataset` | `dict` | Flattened format: `s_endo`, `z`, `z_next_main`, `z_next_fork`. |
 | `val_dataset` | `dict` or `None` | Same flattened format.  Used for Euler/Bellman evaluation only. |
 | `config` | `BRMConfig` | See Section 5 for defaults. |
+| `eval_callback` | callable or `None` | Custom validation metrics.  See [training_infrastructure.md](training_infrastructure.md) §1. |
 
 ### Output
 
-Returns a dict with keys `policy`, `value_net` (both updated in-place),
-`history`, and `config`.  The `history` dict contains per-evaluation-step
-lists: `step`, `loss`, `loss_br`, `loss_foc`, `euler_residual`,
-`bellman_residual`.
+See [training_infrastructure.md](training_infrastructure.md) §3 for the
+full output schema (history keys, early-stopping metadata, wall time).
+BRM records `loss`, `loss_br`, `loss_foc` in history.
 
 ### Minimal example
 
 ```python
-config = BRMConfig(n_steps=3000, eval_interval=500)
+from src.v2.trainers.brm import train_brm
+from src.v2.trainers.config import BRMConfig
+
+config = BRMConfig(
+    n_steps=3000,
+    eval_interval=500,
+    br_scale=1.0 / env.reward_scale(),  # normalize BR to O(1)
+    warm_start_epochs=1,                # pre-train critic on analytical V
+)
 
 result = train_brm(env, policy, value_net,
                    train_flat, val_flat, config=config)
 ```
 
-The primary convergence signal is `euler_residual`.  `loss_br` and
-`loss_foc` should both decrease; if `loss_foc` stalls while `loss_br`
-decreases, the policy is not improving (the value function is fitting a
-suboptimal policy).
+**Key config choices:**
+- `br_scale` normalizes the Bellman residual to prevent scale mismatch
+  with the FOC loss.  Set to `1 / env.reward_scale()` (= |V*|) so that
+  the normalized residual is O(1).  Without normalization, the raw BR
+  can dominate the FOC and mask policy improvement.
+- `warm_start_epochs` pre-trains the critic on the analytical terminal
+  value $V^{term}(k) = r(\bar{s}, \bar{a}) / (1-\gamma)$ via MSE
+  regression.  This gives the critic $\partial V / \partial k > 0$ so
+  that the FOC steers the policy in a meaningful direction from step 0.
+  Cold start (0 epochs) risks the critic providing garbage gradients.
+- `loss_br` and `loss_foc` should both decrease; if `loss_foc` stalls
+  while `loss_br` decreases, the value function is fitting a suboptimal
+  policy.

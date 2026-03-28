@@ -1,4 +1,4 @@
-"""Policy helpers shared across benchmark notebooks."""
+"""Policy helpers shared across the supported evaluation notebooks."""
 
 from __future__ import annotations
 

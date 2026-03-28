@@ -150,13 +150,7 @@ def solve_pfi(
         z_curr, z_next, grids["exo_grids_1d"], alpha=gc.transition_alpha)
 
     # 3. Precompute tables
-    tables = _precompute_tables(
-        env,
-        grids,
-        prob_matrix,
-        reward_temperature=config.reward_temperature,
-        reward_gate_mode=config.reward_gate_mode,
-    )
+    tables = _precompute_tables(env, grids, prob_matrix)
 
     n_exo    = tables["n_exo"]
     n_endo   = tables["n_endo"]

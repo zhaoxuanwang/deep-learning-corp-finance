@@ -97,6 +97,14 @@ class TestGridAxis:
             ratios = grid[1:] / grid[:-1]
             np.testing.assert_allclose(ratios, ratios[0], rtol=1e-6)
 
+    def test_geometric_grid_alias_matches_log_grid(self):
+        log_grid = build_1d_grid(GridAxis(1.0, 100.0, spacing="log"), 7)
+        geometric_grid = build_1d_grid(
+            GridAxis(1.0, 100.0, spacing="geometric"),
+            7,
+        )
+        np.testing.assert_allclose(geometric_grid, log_grid, rtol=1e-12, atol=1e-12)
+
     def test_log_grid_values_in_levels(self):
         """Log-spaced grid values should be in levels (positive), not in log."""
         axis = GridAxis(0.5, 2.0, spacing="log")
@@ -290,13 +298,13 @@ class TestSnapToGrid:
 class TestBuildGrids:
 
     def test_basic_env_grid_spec(self, env):
-        """BasicInvestmentEnv provides grid_spec with log k, log z, linear I."""
+        """BasicInvestmentEnv provides grid_spec with geometric k, log z, linear I."""
         spec = env.grid_spec()
         assert spec is not None
         assert len(spec["endo"]) == 1
         assert len(spec["exo"]) == 1
         assert len(spec["action"]) == 1
-        assert spec["endo"][0].spacing == "log"
+        assert spec["endo"][0].spacing == "geometric"
         assert spec["exo"][0].spacing == "log"
         assert spec["action"][0].spacing == "linear"
 
@@ -365,29 +373,19 @@ class TestVFI:
         assert np.sum(diffs < -1e-2) <= 1, (
             f"k'(z) should be mostly increasing. Diffs: {diffs}")
 
-    def test_vfi_uses_hard_gate_mode_for_reward_tables(self, small_grid_config):
-        """VFI should evaluate fixed costs with the true hard indicator."""
-
-        class GateTrackingEnv(BasicInvestmentEnv):
-            def __init__(self):
-                super().__init__(
-                    econ_params=EconomicParams(cost_convex=0.2, cost_fixed=0.02),
-                    shock_params=ShockParams(mu=0.0, rho=0.7, sigma=0.15),
-                )
-                self.gate_modes_seen = []
-
-            def reward(self, s, a, temperature=1e-6, gate_mode="soft"):
-                self.gate_modes_seen.append(gate_mode)
-                return super().reward(
-                    s, a, temperature=temperature, gate_mode=gate_mode)
-
-        env = GateTrackingEnv()
+    def test_vfi_runs_on_fixed_cost_model(self, small_grid_config):
+        """VFI remains valid for the exact hard fixed-cost model."""
+        env = BasicInvestmentEnv(
+            econ_params=EconomicParams(cost_convex=0.2, cost_fixed=0.02),
+            shock_params=ShockParams(mu=0.0, rho=0.7, sigma=0.15),
+        )
         gen = DataGenerator(env, DataGeneratorConfig(n_paths=20, horizon=8))
         flat_dataset = gen.get_flattened_dataset("train")
 
-        solve_vfi(env, flat_dataset, VFIConfig(grid=small_grid_config, tol=1e-4, max_iter=50))
-        assert env.gate_modes_seen
-        assert set(env.gate_modes_seen) == {"hard"}
+        result = solve_vfi(
+            env, flat_dataset, VFIConfig(grid=small_grid_config, tol=1e-4, max_iter=50)
+        )
+        assert result["value"].shape[0] > 0
 
 
 # =============================================================================
@@ -408,63 +406,19 @@ class TestPFI:
         result = solve_pfi(env, flat_dataset, config)
         assert float(tf.reduce_min(result["value"])) >= -1e-3
 
-    def test_pfi_uses_hard_gate_mode_for_reward_tables(self, small_grid_config):
-        """PFI should evaluate fixed costs with the true hard indicator."""
-
-        class GateTrackingEnv(BasicInvestmentEnv):
-            def __init__(self):
-                super().__init__(
-                    econ_params=EconomicParams(cost_convex=0.2, cost_fixed=0.02),
-                    shock_params=ShockParams(mu=0.0, rho=0.7, sigma=0.15),
-                )
-                self.gate_modes_seen = []
-
-            def reward(self, s, a, temperature=1e-6, gate_mode="soft"):
-                self.gate_modes_seen.append(gate_mode)
-                return super().reward(
-                    s, a, temperature=temperature, gate_mode=gate_mode)
-
-        env = GateTrackingEnv()
-        gen = DataGenerator(env, DataGeneratorConfig(n_paths=20, horizon=8))
-        flat_dataset = gen.get_flattened_dataset("train")
-
-        solve_pfi(env, flat_dataset, PFIConfig(grid=small_grid_config, max_iter=20, eval_steps=20))
-        assert env.gate_modes_seen
-        assert set(env.gate_modes_seen) == {"hard"}
-
-    def test_pfi_respects_reward_temperature_and_gate_mode(self, small_grid_config):
-        """PFI should pass configured reward kwargs into env.reward()."""
-
-        class RewardTrackingEnv(BasicInvestmentEnv):
-            def __init__(self):
-                super().__init__(
-                    econ_params=EconomicParams(cost_convex=0.2, cost_fixed=0.02),
-                    shock_params=ShockParams(mu=0.0, rho=0.7, sigma=0.15),
-                )
-                self.reward_calls = []
-
-            def reward(self, s, a, temperature=1e-6, gate_mode="soft"):
-                self.reward_calls.append((float(temperature), gate_mode))
-                return super().reward(
-                    s, a, temperature=temperature, gate_mode=gate_mode)
-
-        env = RewardTrackingEnv()
-        gen = DataGenerator(env, DataGeneratorConfig(n_paths=20, horizon=8))
-        flat_dataset = gen.get_flattened_dataset("train")
-
-        solve_pfi(
-            env,
-            flat_dataset,
-            PFIConfig(
-                grid=small_grid_config,
-                max_iter=20,
-                eval_steps=20,
-                reward_temperature=1e-3,
-                reward_gate_mode="soft",
-            ),
+    def test_pfi_runs_on_fixed_cost_model(self, small_grid_config):
+        """PFI remains valid for the exact hard fixed-cost model."""
+        env = BasicInvestmentEnv(
+            econ_params=EconomicParams(cost_convex=0.2, cost_fixed=0.02),
+            shock_params=ShockParams(mu=0.0, rho=0.7, sigma=0.15),
         )
-        assert env.reward_calls
-        assert set(env.reward_calls) == {(1e-3, "soft")}
+        gen = DataGenerator(env, DataGeneratorConfig(n_paths=20, horizon=8))
+        flat_dataset = gen.get_flattened_dataset("train")
+
+        result = solve_pfi(
+            env, flat_dataset, PFIConfig(grid=small_grid_config, max_iter=20, eval_steps=20)
+        )
+        assert result["value"].shape[0] > 0
 
 
 # =============================================================================
@@ -526,8 +480,7 @@ class TwoEndoMockEnv(MDPEnvironment):
     def endogenous_transition(self, s_endo, action, s_exo):
         return 0.9 * s_endo + action
 
-    def reward(self, s, a, temperature=1e-6, gate_mode="soft"):
-        del temperature, gate_mode
+    def reward(self, s, a):
         return -tf.reduce_sum(s ** 2, axis=-1) - tf.reduce_sum(a ** 2, axis=-1)
 
     def discount(self):

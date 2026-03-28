@@ -49,7 +49,8 @@ class GridAxis:
                  - "linear": np.linspace(low, high, n).
                    Uniform spacing. Use for actions or variables with
                    no strong prior on where density is needed.
-                 - "log":    np.exp(np.linspace(log(low), log(high), n)).
+                 - "log" / "geometric":
+                   np.exp(np.linspace(log(low), log(high), n)).
                    Denser at low values, sparser at high values.
                    Use for capital (curvature highest at low k) and
                    productivity (log-AR(1) natural coordinate).
@@ -67,13 +68,13 @@ class GridAxis:
         if self.low >= self.high:
             raise ValueError(
                 f"GridAxis requires low < high. Got low={self.low}, high={self.high}")
-        valid = {"linear", "log", "zero_power"}
+        valid = {"linear", "log", "geometric", "zero_power"}
         if self.spacing not in valid:
             raise ValueError(
                 f"Unknown spacing '{self.spacing}'. Valid: {sorted(valid)}")
-        if self.spacing == "log" and self.low <= 0:
+        if self.spacing in {"log", "geometric"} and self.low <= 0:
             raise ValueError(
-                f"Log spacing requires low > 0. Got low={self.low}")
+                f"Log/geometric spacing requires low > 0. Got low={self.low}")
         if self.spacing == "zero_power" and not (self.low < 0.0 < self.high):
             raise ValueError(
                 "zero_power spacing requires bounds that straddle zero. "
@@ -105,7 +106,7 @@ def build_1d_grid(axis: GridAxis, n: int) -> np.ndarray:
     if axis.spacing == "linear":
         return np.linspace(axis.low, axis.high, n, dtype=np.float64)
 
-    elif axis.spacing == "log":
+    elif axis.spacing in {"log", "geometric"}:
         log_low  = np.log(axis.low)
         log_high = np.log(axis.high)
         return np.exp(np.linspace(log_low, log_high, n)).astype(np.float64)
@@ -329,6 +330,157 @@ def estimate_exo_transition_matrix(
     # Safety normalization
     probs = probs / np.maximum(probs.sum(axis=1, keepdims=True), 1e-12)
     return probs
+
+
+def tauchen_transition_matrix(
+    shock_params,
+    exo_grids_1d: List[np.ndarray],
+) -> np.ndarray:
+    """Compute P(z'|z) analytically from AR(1) parameters (Tauchen's method).
+
+    For the log-AR(1) process: log(z') = (1-ρ)μ + ρ·log(z) + σ·ε,
+    computes exact transition probabilities on the given z grid using
+    normal CDF midpoint integration.  Fully vectorized (no Python loops).
+
+    Requires 1-D exogenous state.  Deterministic — no simulation noise.
+
+    Args:
+        shock_params: ShockParams with rho, sigma, mu.
+        exo_grids_1d: List with one 1-D array (the z grid in levels).
+
+    Returns:
+        Transition matrix, shape (n_z, n_z), rows sum to 1.
+    """
+    from scipy.stats import norm as _norm
+
+    z_grid = np.asarray(exo_grids_1d[0], dtype=np.float64)
+    log_z = np.log(np.maximum(z_grid, 1e-12))
+    n = len(log_z)
+    rho   = float(shock_params.rho)
+    sigma = float(shock_params.sigma)
+    mu    = float(shock_params.mu)
+
+    # Conditional means: (n,)
+    cond_mean = (1.0 - rho) * mu + rho * log_z
+
+    # Midpoints between adjacent grid points: (n-1,)
+    midpoints = (log_z[:-1] + log_z[1:]) / 2.0
+
+    # CDF at all midpoints for all z_i: (n, n-1)
+    standardized = (midpoints[None, :] - cond_mean[:, None]) / sigma
+    cdf_vals = _norm.cdf(standardized)
+
+    # P[:, 0] = CDF at first midpoint (all mass below)
+    # P[:, j] = CDF at midpoint j - CDF at midpoint j-1 (interior bins)
+    # P[:, n-1] = 1 - CDF at last midpoint (all mass above)
+    P = np.zeros((n, n), dtype=np.float64)
+    P[:, 0] = cdf_vals[:, 0]
+    P[:, 1:-1] = np.diff(cdf_vals, axis=1)
+    P[:, -1] = 1.0 - cdf_vals[:, -1]
+
+    # Safety normalization
+    P = P / np.maximum(P.sum(axis=1, keepdims=True), 1e-12)
+    return P
+
+
+def tauchen_transition_matrix_tf(
+    shock_params,
+    exo_grids_1d: List[np.ndarray],
+    dtype: tf.dtypes.DType = tf.float32,
+) -> tf.Tensor:
+    """TensorFlow Tauchen transition matrix for 1-D log-AR(1) shocks."""
+
+    z_grid = tf.convert_to_tensor(exo_grids_1d[0], dtype=dtype)
+    eps = tf.cast(1e-12, dtype)
+    sqrt_two = tf.cast(np.sqrt(2.0), dtype)
+    rho = tf.cast(shock_params.rho, dtype)
+    sigma = tf.cast(shock_params.sigma, dtype)
+    mu = tf.cast(shock_params.mu, dtype)
+
+    log_z = tf.math.log(tf.maximum(z_grid, eps))
+    cond_mean = (1.0 - rho) * mu + rho * log_z
+    midpoints = 0.5 * (log_z[:-1] + log_z[1:])
+    standardized = (midpoints[None, :] - cond_mean[:, None]) / sigma
+    cdf_vals = 0.5 * (1.0 + tf.math.erf(standardized / sqrt_two))
+
+    p_left = cdf_vals[:, :1]
+    p_mid = cdf_vals[:, 1:] - cdf_vals[:, :-1]
+    p_right = 1.0 - cdf_vals[:, -1:]
+    probs = tf.concat([p_left, p_mid, p_right], axis=1)
+    probs = probs / tf.maximum(tf.reduce_sum(probs, axis=1, keepdims=True), eps)
+    return probs
+
+
+def gh_transition_matrix(
+    shock_params,
+    exo_grids_1d: List[np.ndarray],
+    n_quadrature: int = 15,
+) -> np.ndarray:
+    """Compute P(z'|z) via Gauss-Hermite quadrature on the z grid.
+
+    For each z_i, computes Q quadrature nodes z'_q from the conditional
+    distribution, then distributes each node's weight to the two nearest
+    z grid points via linear interpolation.  The result is a (n_z, n_z)
+    transition matrix that is a drop-in replacement for Tauchen.
+
+    GH with Q nodes is exact for polynomial integrands up to degree 2Q-1,
+    and generally more accurate than Tauchen's midpoint CDF for smooth
+    functions at the same grid size.  Fully vectorized (no Python loops).
+
+    Requires 1-D exogenous state.  Deterministic — no simulation noise.
+
+    Args:
+        shock_params:  ShockParams with rho, sigma, mu.
+        exo_grids_1d:  List with one 1-D array (the z grid in levels).
+        n_quadrature:  Number of GH quadrature nodes Q.
+
+    Returns:
+        Transition matrix, shape (n_z, n_z), rows sum to 1.
+    """
+    from numpy.polynomial.hermite_e import hermegauss
+
+    z_grid = np.asarray(exo_grids_1d[0], dtype=np.float64)
+    log_z = np.log(np.maximum(z_grid, 1e-12))
+    n = len(log_z)
+    rho   = float(shock_params.rho)
+    sigma = float(shock_params.sigma)
+    mu    = float(shock_params.mu)
+    Q     = n_quadrature
+
+    # GH nodes and weights (probabilist's Hermite: weight fn exp(-x²/2)/√(2π))
+    nodes, weights = hermegauss(Q)
+    weights = weights / weights.sum()  # normalize to sum to 1
+
+    # Conditional means: (n,)
+    cond_mean = (1.0 - rho) * mu + rho * log_z
+
+    # All z' values in log space: (n, Q)
+    log_z_primes = cond_mean[:, None] + sigma * nodes[None, :]
+
+    # Bracket each z' in the log_z grid: vectorized searchsorted
+    log_z_flat = log_z_primes.ravel()                   # (n*Q,)
+    idx_hi = np.searchsorted(log_z, log_z_flat, side='right')
+    idx_hi = np.clip(idx_hi, 1, n - 1)
+    idx_lo = idx_hi - 1
+
+    # Interpolation fractions
+    g_lo = log_z[idx_lo]
+    g_hi = log_z[idx_hi]
+    frac = (log_z_flat - g_lo) / np.maximum(g_hi - g_lo, 1e-12)
+    frac = np.clip(frac, 0.0, 1.0)
+
+    # Row indices (which z_i each entry belongs to) and tiled weights
+    i_indices = np.repeat(np.arange(n), Q)              # (n*Q,)
+    w_flat = np.tile(weights, n)                         # (n*Q,)
+
+    # Accumulate into transition matrix
+    P = np.zeros((n, n), dtype=np.float64)
+    np.add.at(P, (i_indices, idx_lo), w_flat * (1.0 - frac))
+    np.add.at(P, (i_indices, idx_hi), w_flat * frac)
+
+    # Safety normalization
+    P = P / np.maximum(P.sum(axis=1, keepdims=True), 1e-12)
+    return P
 
 
 def snap_to_grid(values: tf.Tensor, grid_product: tf.Tensor) -> tf.Tensor:

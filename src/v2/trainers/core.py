@@ -196,34 +196,26 @@ def warm_start_value_net(env, value_net, train_dataset: dict,
             print(f"  warm-start step {i:4d} | MSE={float(loss):.2f}")
 
 
-def resolve_eval_temperature(config, train_temperature: float) -> float:
-    """Choose the temperature used for validation metrics.
-
-    By default evaluation mirrors the current training temperature.
-    Notebooks can override this with config.eval_temperature to benchmark
-    all checkpoints against a fixed target temperature.
-    """
-    if getattr(config, "eval_temperature", None) is not None:
-        return float(config.eval_temperature)
-    return float(train_temperature)
+EvalCallback = Callable[[int, object, object, Optional[object], Optional[dict]], Dict[str, float]]
 
 
-EvalCallback = Callable[[int, object, object, Optional[object], Optional[dict], float], Dict[str, float]]
-
-
-def default_eval_metrics(env, policy, value_net, val_dataset: Optional[dict],
-                         temperature: float) -> Dict[str, float]:
+def default_eval_metrics(
+    env,
+    policy,
+    value_net,
+    val_dataset: Optional[dict],
+) -> Dict[str, float]:
     """Default validation metrics used when no eval callback is provided."""
     if val_dataset is None:
         return {}
 
     metrics = {
-        "euler_residual_val": evaluate_euler_residual(
-            env, policy, val_dataset, temperature=temperature),
+        "euler_residual_val": evaluate_euler_residual(env, policy, val_dataset),
     }
     if value_net is not None:
         metrics["bellman_residual"] = evaluate_bellman_residual(
-            env, policy, value_net, val_dataset, temperature=temperature)
+            env, policy, value_net, val_dataset
+        )
     return metrics
 
 
@@ -232,20 +224,12 @@ def run_eval_callback(step: int,
                       policy,
                       value_net,
                       val_dataset: Optional[dict],
-                      train_temperature: float,
-                      eval_callback: Optional[EvalCallback] = None,
-                      eval_temperature: Optional[float] = None) -> Dict[str, float]:
+                      eval_callback: Optional[EvalCallback] = None) -> Dict[str, float]:
     """Run notebook-supplied eval callback or fall back to built-in metrics."""
-    temperature = (
-        float(eval_temperature)
-        if eval_temperature is not None else float(train_temperature)
-    )
     if eval_callback is None:
-        return default_eval_metrics(
-            env, policy, value_net, val_dataset, temperature=temperature)
+        return default_eval_metrics(env, policy, value_net, val_dataset)
 
-    metrics = eval_callback(
-        step, env, policy, value_net, val_dataset, float(train_temperature))
+    metrics = eval_callback(step, env, policy, value_net, val_dataset)
     if metrics is None:
         return {}
     if not isinstance(metrics, Mapping):
@@ -258,13 +242,11 @@ def run_eval_callback(step: int,
 def append_history_row(history: dict,
                        step: int,
                        elapsed_sec: float,
-                       train_temperature: float,
                        base_scalars: Optional[Mapping[str, float]] = None,
                        eval_metrics: Optional[Mapping[str, float]] = None) -> None:
     """Append one logged row, creating metric lists lazily when needed."""
     history.setdefault("step", []).append(int(step))
     history.setdefault("elapsed_sec", []).append(float(elapsed_sec))
-    history.setdefault("train_temperature", []).append(float(train_temperature))
 
     for source in (base_scalars or {}, eval_metrics or {}):
         for key, value in source.items():
@@ -500,8 +482,7 @@ class StopTracker:
 #      z_next_main: (N, exo_dim), z_next_fork: (N, exo_dim)}
 # ---------------------------------------------------------------------------
 
-def evaluate_euler_residual(env, policy, val_dataset: dict,
-                            temperature: float = 1e-6) -> float:
+def evaluate_euler_residual(env, policy, val_dataset: dict) -> float:
     """Mean absolute Euler residual on the validation dataset.
 
     Computes the one-step Euler condition using pre-computed z transitions.
@@ -512,7 +493,6 @@ def evaluate_euler_residual(env, policy, val_dataset: dict,
         policy:      Policy network (callable: s -> a).
         val_dataset: Flattened dataset dict with keys:
                      s_endo, z, z_next_main.
-        temperature: Smooth-gate temperature.
 
     Returns:
         float: mean absolute residual, or nan if ER not supported.
@@ -529,15 +509,13 @@ def evaluate_euler_residual(env, policy, val_dataset: dict,
         s_next = env.merge_state(k_next, z_next)
         a_next = policy(s_next, training=False)
 
-        residual = env.euler_residual(s, a, s_next, a_next,
-                                      temperature=temperature)
+        residual = env.euler_residual(s, a, s_next, a_next)
         return float(tf.reduce_mean(tf.abs(residual)))
     except NotImplementedError:
         return float("nan")
 
 
-def evaluate_bellman_residual(env, policy, value_net, val_dataset: dict,
-                                temperature: float = 1e-6) -> float:
+def evaluate_bellman_residual(env, policy, value_net, val_dataset: dict) -> float:
     """Mean absolute Bellman residual V(s) - r(s,a) - γ·V(s') on val data.
 
     Args:
@@ -546,7 +524,6 @@ def evaluate_bellman_residual(env, policy, value_net, val_dataset: dict,
         value_net:   State-value network V(s).
         val_dataset: Flattened dataset dict with keys:
                      s_endo, z, z_next_main.
-        temperature: Smooth-gate temperature.
 
     Returns:
         float: mean absolute residual.
@@ -558,7 +535,7 @@ def evaluate_bellman_residual(env, policy, value_net, val_dataset: dict,
     s = env.merge_state(s_endo, z)
     a = policy(s, training=False)
 
-    r = env.reward(s, a, temperature=temperature)
+    r = env.reward(s, a)
     r = tf.squeeze(r) if r.shape.rank > 1 else r
 
     k_next = env.endogenous_transition(s_endo, a, z)

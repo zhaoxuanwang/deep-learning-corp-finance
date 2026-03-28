@@ -1,3 +1,7 @@
+
+# Abstract
+The ongoing revolution in deep learning has provided new tools for solving high-dimensional dynamic equilibrium models that were previously considered intractable in economic and finance. Despite their promising theoretical properties, 
+
 # Introduction
 In this paper, I explore methods from deep learning and reinforcement learning (RL) which can be used to solve high-dimensional dynamic economic models that were previously considered as intractable. Specifically, I focus on the main toolkit of deep learning methods recently adopted by economists and systematically examine their effectiveness and properties in actual implementations. Drawing insights from the recent RL literature, I introduce significant improvements on the accuracy and performance of the main methods introduced by @maliar21 and @fern26. I build an open-source package in Python and Tensorflow that can easily be used for implementation of any user-specified dynamic models that shares similar generalized structure. I illustrate my proposed method and its software usage using the canonical corporate finance model.
 

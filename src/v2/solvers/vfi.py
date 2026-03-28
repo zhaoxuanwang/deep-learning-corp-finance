@@ -41,8 +41,6 @@ def _precompute_tables(
     env,
     grids: Dict,
     prob_matrix: np.ndarray,
-    reward_temperature: float = 1e-6,
-    reward_gate_mode: str = "hard",
 ) -> Dict[str, tf.Tensor]:
     """Precompute reward matrix and transition map on the discrete grid.
 
@@ -85,12 +83,7 @@ def _precompute_tables(
     reward_parts = []
     for start in range(0, N_total, CHUNK):
         end = min(start + CHUNK, N_total)
-        r_chunk = env.reward(
-            s_all[start:end],
-            action_all[start:end],
-            temperature=reward_temperature,
-            gate_mode=reward_gate_mode,
-        )
+        r_chunk = env.reward(s_all[start:end], action_all[start:end])
         # Flatten to (chunk,)
         r_chunk = tf.reshape(r_chunk, [-1])
         reward_parts.append(r_chunk)
@@ -101,14 +94,29 @@ def _precompute_tables(
     trans_parts = []
     endo_product_tf = tf.constant(endo_pts, dtype=tf.float32)
 
-    # For 1D endo, prepare linear interpolation between bracketing grid
-    # points.  This eliminates snap-to-grid bias in the continuation value
-    # (the discrete "winner's curse" from maximising over noisy V lookups).
-    use_interp = (endo_dim == 1)
-    if use_interp:
-        endo_1d_sorted = endo_pts[:, 0].copy()   # numpy, sorted
+    # Linear interpolation between bracketing grid points eliminates
+    # snap-to-grid bias in the continuation value.
+    #
+    # 1D endo: standard linear interp (trans_lo, trans_frac).
+    # Multi-D endo: per-variable bracketing + N-linear interp
+    #   (trans_lo_d, trans_frac_d for each variable d, plus endo_var_sizes).
+    #   For 2D this is bilinear; for 3D trilinear; etc.
+    endo_grids_1d = grids.get("endo_grids_1d")
+    use_interp_1d = (endo_dim == 1)
+    use_interp_nd = (endo_dim >= 2 and endo_grids_1d is not None
+                     and len(endo_grids_1d) == endo_dim)
+
+    if use_interp_1d:
+        endo_1d_sorted = endo_pts[:, 0].copy()
         trans_lo_parts = []
         trans_frac_parts = []
+
+    if use_interp_nd:
+        # Per-variable sorted grids and parts lists
+        _nd_grids = [np.asarray(g, dtype=np.float64) for g in endo_grids_1d]
+        _nd_sizes = [len(g) for g in _nd_grids]
+        _nd_lo_parts = [[] for _ in range(endo_dim)]
+        _nd_frac_parts = [[] for _ in range(endo_dim)]
 
     for start in range(0, N_total, CHUNK):
         end = min(start + CHUNK, N_total)
@@ -119,7 +127,7 @@ def _precompute_tables(
             tf.cast(s_endo_next, tf.float32), endo_product_tf)
         trans_parts.append(idx_chunk)
 
-        if use_interp:
+        if use_interp_1d:
             k_next_np = s_endo_next.numpy().reshape(-1)
             idx_hi = np.searchsorted(endo_1d_sorted, k_next_np, side='right')
             idx_hi = np.clip(idx_hi, 1, n_endo - 1)
@@ -130,6 +138,22 @@ def _precompute_tables(
             frac = np.clip(frac, 0.0, 1.0)
             trans_lo_parts.append(tf.constant(idx_lo, dtype=tf.int32))
             trans_frac_parts.append(tf.constant(frac, dtype=tf.float32))
+
+        if use_interp_nd:
+            s_next_np = s_endo_next.numpy().astype(np.float64)
+            for d in range(endo_dim):
+                vals = s_next_np[:, d]
+                grid_d = _nd_grids[d]
+                n_d = _nd_sizes[d]
+                hi = np.searchsorted(grid_d, vals, side='right')
+                hi = np.clip(hi, 1, n_d - 1)
+                lo = hi - 1
+                v_lo = grid_d[lo]
+                v_hi = grid_d[hi]
+                fr = (vals - v_lo) / np.maximum(v_hi - v_lo, 1e-12)
+                fr = np.clip(fr, 0.0, 1.0)
+                _nd_lo_parts[d].append(tf.constant(lo, dtype=tf.int32))
+                _nd_frac_parts[d].append(tf.constant(fr, dtype=tf.float32))
 
     trans_flat = tf.concat(trans_parts, axis=0)  # (N_total,)
     trans_idx = tf.reshape(trans_flat, [n_exo, n_endo, n_action])
@@ -144,11 +168,20 @@ def _precompute_tables(
         "n_action":    n_action,
     }
 
-    if use_interp:
+    if use_interp_1d:
         tables["trans_lo"] = tf.reshape(
             tf.concat(trans_lo_parts, axis=0), [n_exo, n_endo, n_action])
         tables["trans_frac"] = tf.reshape(
             tf.concat(trans_frac_parts, axis=0), [n_exo, n_endo, n_action])
+
+    if use_interp_nd:
+        shape = [n_exo, n_endo, n_action]
+        for d in range(endo_dim):
+            tables[f"trans_lo_{d}"] = tf.reshape(
+                tf.concat(_nd_lo_parts[d], axis=0), shape)
+            tables[f"trans_frac_{d}"] = tf.reshape(
+                tf.concat(_nd_frac_parts[d], axis=0), shape)
+        tables["endo_var_sizes"] = _nd_sizes
 
     return tables
 
@@ -297,13 +330,7 @@ def solve_vfi(
         z_curr, z_next, grids["exo_grids_1d"], alpha=gc.transition_alpha)
 
     # 3. Precompute tables
-    tables = _precompute_tables(
-        env,
-        grids,
-        prob_matrix,
-        reward_temperature=config.reward_temperature,
-        reward_gate_mode=config.reward_gate_mode,
-    )
+    tables = _precompute_tables(env, grids, prob_matrix)
 
     n_exo  = tables["n_exo"]
     n_endo = tables["n_endo"]

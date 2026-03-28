@@ -107,6 +107,7 @@ def train_shac(env, policy, value_net, train_dataset: dict,
         dict with keys: policy, value_net, history, config.
     """
     config      = config or SHACConfig()
+    env.validate_nn_training_support("train_shac")
     seed_runtime(
         config.master_seed, "train_shac",
         strict_reproducibility=config.strict_reproducibility,
@@ -114,12 +115,6 @@ def train_shac(env, policy, value_net, train_dataset: dict,
     gamma       = env.discount()
     horizon     = config.horizon
     window_len  = config.short_horizon
-
-    # Annealing: env decides; tf.Variable so @tf.function reads it live.
-    schedule = env.annealing_schedule()
-    temp_var = tf.Variable(
-        schedule.value if schedule else config.temperature,
-        dtype=tf.float32, trainable=False)
 
     # ------------------------------------------------------------------
     # Reward normalization
@@ -221,7 +216,7 @@ def train_shac(env, policy, value_net, train_dataset: dict,
                 s_t = env.merge_state(k_current, z_t)
                 a_t = policy(s_t, training=False)
 
-                r_t = env.reward(s_t, a_t, temperature=temp_var)
+                r_t = env.reward(s_t, a_t)
                 r_t = tf.reshape(r_t, [-1]) * reward_scale_tf
 
                 collected_states.append(tf.stop_gradient(s_t))
@@ -261,7 +256,7 @@ def train_shac(env, policy, value_net, train_dataset: dict,
         """
         # Target policy action and reward
         a_target = target_policy(s_batch, training=False)
-        r_target = env.reward(s_batch, a_target, temperature=temp_var)
+        r_target = env.reward(s_batch, a_target)
         r_target = tf.reshape(r_target, [-1]) * reward_scale_tf
 
         # Target transition: s' under target policy
@@ -353,10 +348,6 @@ def train_shac(env, policy, value_net, train_dataset: dict,
             polyak_update(policy, target_policy,
                           tau=config.polyak_rate)
 
-            if schedule:
-                schedule.update()
-                temp_var.assign(schedule.value)
-
             # Logging
             elapsed_sec = time.perf_counter() - train_start
             cap_reached = (
@@ -364,19 +355,13 @@ def train_shac(env, policy, value_net, train_dataset: dict,
                 and elapsed_sec >= config.max_wall_time_sec
             )
             if step % config.eval_interval == 0 or step == config.n_steps - 1 or cap_reached:
-                train_temperature = float(temp_var)
                 eval_metrics = run_eval_callback(
                     step,
                     env,
                     policy,
                     value_net,
                     val_dataset,
-                    train_temperature,
                     eval_callback=eval_callback,
-                    eval_temperature=(
-                        config.eval_temperature
-                        if eval_callback is None else None
-                    ),
                 )
                 elapsed_sec = time.perf_counter() - train_start
                 stop_on_threshold = stop_tracker.record_eval(
@@ -390,7 +375,6 @@ def train_shac(env, policy, value_net, train_dataset: dict,
                     history,
                     step,
                     elapsed_sec,
-                    train_temperature,
                     base_scalars={
                         "loss_actor": float(loss_actor),
                         "loss_critic": float(loss_c),
@@ -412,8 +396,7 @@ def train_shac(env, policy, value_net, train_dataset: dict,
                     f"SHAC step {step:5d} | "
                     f"loss_actor={float(loss_actor):.4f} | "
                     f"loss_critic={float(loss_c):.6f}"
-                    f"{monitor_text} | temp={train_temperature:.6g} | "
-                    f"elapsed={elapsed_sec:.1f}s{status}"
+                    f"{monitor_text} | elapsed={elapsed_sec:.1f}s{status}"
                 )
                 capture_checkpoint(step, config, policy=policy, value_net=value_net)
                 if stop_on_threshold or cap_reached:

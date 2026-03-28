@@ -1,15 +1,14 @@
-"""Experimental joint-update BRM trainer.
+"""Supported BRM control used by the ablation notebook.
 
 Faithful control implementation of the original joint-regression BRM idea:
 the Bellman residual and autodiff FOC losses are summed into one objective,
 and a single optimizer step updates both the policy and value network
 simultaneously.
 
-This trainer is intentionally kept outside ``src/v2/trainers`` because it is
-used for methodology-ablation notebooks rather than production benchmarking.
-The implementation reuses the modern v2 infrastructure (deterministic data
-pipeline, eval callbacks, checkpoint capture) so comparisons against the
-refined BRM are fair.
+This trainer stays outside ``src/v2/trainers`` because it is a comparison
+method for notebook 02 rather than part of the core production trainer set.
+The implementation reuses the modern v2 infrastructure so comparisons against
+the refined BRM are fair.
 """
 
 from __future__ import annotations
@@ -60,13 +59,13 @@ def train_brm_joint(
     """
 
     config = config or BRMConfig()
+    env.validate_nn_training_support("train_brm_joint")
     seed_runtime(
         config.master_seed,
         "train_brm_joint",
         strict_reproducibility=config.strict_reproducibility,
     )
     gamma = env.discount()
-    schedule = env.annealing_schedule()
 
     validate_dataset_keys(
         train_dataset, _DATASET_KEYS, "train_brm_joint", "train_dataset"
@@ -137,7 +136,6 @@ def train_brm_joint(
 
     for step, batch in enumerate(train_iter.take(config.n_steps)):
         last_step = step
-        temperature = schedule.value if schedule else config.temperature
 
         s_endo = batch["s_endo"]
         z = batch["z"]
@@ -149,7 +147,7 @@ def train_brm_joint(
             a = policy(s, training=True)
             v_s = tf.squeeze(value_net(s, training=True))
 
-            r = env.reward(s, a, temperature=temperature)
+            r = env.reward(s, a)
             r = tf.squeeze(r) if r.shape.rank > 1 else r
 
             k_next = env.endogenous_transition(s_endo, a, z)
@@ -179,10 +177,10 @@ def train_brm_joint(
             dV_fork = t2.gradient(vf, s_next_fork)
 
             f1 = _autodiff_foc(
-                env, s, s_endo, a, z, z_next_main, dV_main, gamma, temperature
+                env, s, s_endo, a, z, z_next_main, dV_main, gamma
             )
             f2 = _autodiff_foc(
-                env, s, s_endo, a, z, z_next_fork, dV_fork, gamma, temperature
+                env, s, s_endo, a, z, z_next_fork, dV_fork, gamma
             )
 
             if config.loss_type == "crossprod":
@@ -194,9 +192,6 @@ def train_brm_joint(
 
         grads = tape.gradient(loss, joint_variables)
         joint_optimizer.apply_gradients(zip(grads, joint_variables))
-
-        if schedule:
-            schedule.update()
 
         elapsed_sec = time.perf_counter() - train_start
         cap_reached = (
@@ -210,11 +205,7 @@ def train_brm_joint(
                 policy,
                 value_net,
                 val_dataset,
-                float(temperature),
                 eval_callback=eval_callback,
-                eval_temperature=(
-                    config.eval_temperature if eval_callback is None else None
-                ),
             )
             elapsed_sec = time.perf_counter() - train_start
             stop_now = stop_tracker.record_eval(step, elapsed_sec, eval_metrics)
@@ -227,7 +218,6 @@ def train_brm_joint(
                 history,
                 step,
                 elapsed_sec,
-                float(temperature),
                 base_scalars={
                     "loss": float(loss),
                     "loss_br": float(loss_br),
@@ -250,8 +240,7 @@ def train_brm_joint(
                 f"BRM-Joint step {step:5d} | loss={float(loss):.6f} | "
                 f"loss_br={float(loss_br):.6f} | "
                 f"loss_foc={float(loss_foc):.6f}"
-                f"{monitor_text} | temp={float(temperature):.6g} | "
-                f"elapsed={elapsed_sec:.1f}s{status}"
+                f"{monitor_text} | elapsed={elapsed_sec:.1f}s{status}"
             )
             capture_checkpoint(step, config, policy=policy, value_net=value_net)
             if stop_now or cap_reached:

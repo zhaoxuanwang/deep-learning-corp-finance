@@ -4,11 +4,17 @@ All training smoke tests use very small configs (few steps, small batch)
 to verify correctness without long runtimes.
 """
 
+import importlib
+
 import tensorflow as tf
 import numpy as np
 import pytest
 
-from src.v2.environments.basic_investment import BasicInvestmentEnv
+from src.v2.environments.basic_investment import (
+    BasicInvestmentEnv,
+    EconomicParams as BasicEconomicParams,
+)
+from src.v2.environments.risky_debt import RiskyDebtEnv
 from src.v2.networks.policy import PolicyNetwork
 from src.v2.networks.state_value import StateValueNetwork
 from src.v2.data.generator import DataGenerator, DataGeneratorConfig
@@ -27,7 +33,8 @@ from src.v2.trainers.lr import train_lr
 from src.v2.trainers.er import train_er
 from src.v2.trainers.brm import train_brm
 from src.v2.trainers.shac import train_shac
-from src.v2.experimental.brm_joint import train_brm_joint
+from src.v2.ablations.brm_joint import train_brm_joint
+from src.v2.ablations.er_original import train_er_original
 
 
 # =============================================================================
@@ -87,12 +94,129 @@ def _small_optimizer():
     return OptimizerConfig(learning_rate=1e-3, clipnorm=100.0)
 
 
+def _make_policy(env):
+    net = PolicyNetwork(
+        state_dim=env.state_dim(),
+        action_dim=env.action_dim(),
+        **env.action_spec(),
+        n_layers=2,
+        n_neurons=32,
+    )
+    net(tf.zeros((1, env.state_dim())))
+    return net
+
+
+def _make_value(env):
+    net = StateValueNetwork(
+        state_dim=env.state_dim(),
+        n_layers=2,
+        n_neurons=32,
+    )
+    net(tf.zeros((1, env.state_dim())))
+    return net
+
+
+def _assert_trainer_rejects_env(trainer_name: str, env, match: str) -> None:
+    policy = _make_policy(env)
+    value_net = _make_value(env)
+
+    if trainer_name == "train_lr":
+        with pytest.raises(ValueError, match=match):
+            train_lr(
+                env,
+                policy,
+                {},
+                config=LRConfig(
+                    n_steps=1,
+                    batch_size=1,
+                    horizon=1,
+                    policy_optimizer=_small_optimizer(),
+                ),
+            )
+        return
+
+    if trainer_name == "train_er":
+        with pytest.raises(ValueError, match=match):
+            train_er(
+                env,
+                policy,
+                {},
+                config=ERConfig(n_steps=1, batch_size=1, policy_optimizer=_small_optimizer()),
+            )
+        return
+
+    if trainer_name == "train_er_original":
+        with pytest.raises(ValueError, match=match):
+            train_er_original(
+                env,
+                policy,
+                {},
+                config=ERConfig(n_steps=1, batch_size=1, policy_optimizer=_small_optimizer()),
+            )
+        return
+
+    if trainer_name == "train_brm":
+        with pytest.raises(ValueError, match=match):
+            train_brm(
+                env,
+                policy,
+                value_net,
+                {},
+                config=BRMConfig(n_steps=1, batch_size=1, policy_optimizer=_small_optimizer()),
+            )
+        return
+
+    if trainer_name == "train_brm_joint":
+        with pytest.raises(ValueError, match=match):
+            train_brm_joint(
+                env,
+                policy,
+                value_net,
+                {},
+                config=BRMConfig(
+                    n_steps=1,
+                    batch_size=1,
+                    warm_start_steps=0,
+                    policy_optimizer=_small_optimizer(),
+                    critic_optimizer=_small_optimizer(),
+                ),
+            )
+        return
+
+    if trainer_name == "train_shac":
+        with pytest.raises(ValueError, match=match):
+            train_shac(
+                env,
+                policy,
+                value_net,
+                {},
+                config=SHACConfig(
+                    n_steps=1,
+                    batch_size=1,
+                    horizon=1,
+                    short_horizon=1,
+                    n_critic=1,
+                    policy_optimizer=_small_optimizer(),
+                    critic_optimizer=_small_optimizer(),
+                ),
+            )
+        return
+
+    raise AssertionError(f"Unknown trainer_name {trainer_name!r}")
+
+
 # =============================================================================
 # Target network operations
 # =============================================================================
 
 class TestTargetOps:
     """Tests for polyak_update and hard_update."""
+
+    def test_trainers_config_import_smoke(self):
+        """Package init should not break ``src.v2.trainers.config`` imports."""
+        module = importlib.import_module("src.v2.trainers.config")
+        assert hasattr(module, "LRConfig")
+        assert hasattr(module, "SHACConfig")
 
     def test_hard_update_copies_weights(self, policy, env):
         """hard_update makes target weights equal to source."""
@@ -207,6 +331,50 @@ class TestEvaluationMetrics:
         """evaluate_bellman_residual returns a finite number."""
         br = evaluate_bellman_residual(env, policy, value_net, val_dataset)
         assert np.isfinite(br)
+
+
+class TestTrainerCompatibilityGuards:
+    """Active NN trainers should reject unsupported environment families."""
+
+    @pytest.mark.parametrize(
+        "trainer_name",
+        [
+            "train_lr",
+            "train_er",
+            "train_er_original",
+            "train_brm",
+            "train_brm_joint",
+            "train_shac",
+        ],
+    )
+    def test_trainers_reject_basic_fixed_cost_model(self, trainer_name):
+        env = BasicInvestmentEnv(
+            econ_params=BasicEconomicParams(cost_convex=0.2, cost_fixed=0.02)
+        )
+        _assert_trainer_rejects_env(
+            trainer_name,
+            env,
+            match="solve_vfi\\(\\) or solve_pfi\\(\\)",
+        )
+
+    @pytest.mark.parametrize(
+        "trainer_name",
+        [
+            "train_lr",
+            "train_er",
+            "train_er_original",
+            "train_brm",
+            "train_brm_joint",
+            "train_shac",
+        ],
+    )
+    def test_trainers_reject_risky_debt_env(self, trainer_name):
+        env = RiskyDebtEnv()
+        _assert_trainer_rejects_env(
+            trainer_name,
+            env,
+            match="solve_nested_vfi\\(\\)",
+        )
 
 
 class TestStopTracker:
@@ -354,27 +522,7 @@ class TestTrainLR:
         assert result["threshold_step"] == 0
         assert result["stop_step"] == 1
         assert len(hist["elapsed_sec"]) == len(hist["step"])
-        assert len(hist["train_temperature"]) == len(hist["step"])
         assert hist["elapsed_sec"][0] <= hist["elapsed_sec"][-1]
-
-    def test_train_lr_eval_temperature_override(self, env, policy, traj_dataset,
-                                                val_dataset, monkeypatch):
-        """LR validation uses eval_temperature when provided."""
-        seen = []
-
-        def fake_eval(_env, _policy, _val_dataset, temperature=0.0):
-            seen.append(float(temperature))
-            return 2.0
-
-        monkeypatch.setattr("src.v2.trainers.core.evaluate_euler_residual", fake_eval)
-        config = LRConfig(
-            n_steps=1, batch_size=16, horizon=4,
-            eval_interval=1,
-            eval_temperature=1e-6,
-            policy_optimizer=_small_optimizer(),
-        )
-        train_lr(env, policy, traj_dataset, val_dataset=val_dataset, config=config)
-        assert seen == [pytest.approx(1e-6)]
 
     def test_train_lr_callback_metric_supports_plateau_stopping(self, env, policy,
                                                                 traj_dataset):
@@ -386,9 +534,7 @@ class TestTrainLR:
             3: 4.05,
         }
 
-        def eval_callback(step, _env, _policy, _value_net, _val_dataset,
-                          train_temperature):
-            assert train_temperature > 0.0
+        def eval_callback(step, _env, _policy, _value_net, _val_dataset):
             return {
                 "benchmark_policy_mae": series[step],
                 "lifetime_reward_val": 10.0 - 0.1 * step,
@@ -414,7 +560,6 @@ class TestTrainLR:
         assert result["stop_step"] == 3
         assert hist["benchmark_policy_mae"] == pytest.approx([5.0, 4.0, 4.03, 4.05])
         assert hist["lifetime_reward_val"] == pytest.approx([10.0, 9.9, 9.8, 9.7])
-        assert len(hist["train_temperature"]) == 4
 
 
 # =============================================================================
@@ -476,7 +621,49 @@ class TestTrainER:
         assert result["stop_reason"] == "converged"
         assert result["stop_step"] == 1
         assert len(result["history"]["elapsed_sec"]) == 2
-        assert len(result["history"]["train_temperature"]) == 2
+
+
+class TestTrainEROriginal:
+    """Smoke tests for the supported ER control used in notebook 02."""
+
+    def test_train_er_original_runs(self, env, policy, flat_dataset):
+        config = ERConfig(
+            n_steps=4,
+            batch_size=16,
+            eval_interval=2,
+            policy_optimizer=_small_optimizer(),
+        )
+        result = train_er_original(env, policy, flat_dataset, config=config)
+        assert "policy" in result
+        assert len(result["history"]["step"]) > 0
+        assert all(np.isfinite(x) for x in result["history"]["loss"])
+
+    def test_train_er_original_supports_eval_callback(self, env, policy, flat_dataset):
+        def eval_callback(step, _env, _policy, _value_net, _val_dataset):
+            return {
+                "benchmark_policy_mae": 5.0 - step,
+                "lifetime_reward_val": 10.0 + step,
+            }
+
+        checkpoint_history = []
+        config = ERConfig(
+            n_steps=3,
+            batch_size=16,
+            eval_interval=1,
+            checkpoint_history=checkpoint_history,
+            policy_optimizer=_small_optimizer(),
+        )
+        result = train_er_original(
+            env,
+            policy,
+            flat_dataset,
+            config=config,
+            eval_callback=eval_callback,
+        )
+        hist = result["history"]
+        assert hist["benchmark_policy_mae"] == pytest.approx([5.0, 4.0, 3.0])
+        assert len(checkpoint_history) == 3
+        assert "policy" in checkpoint_history[0]["models"]
 
 
 # =============================================================================
@@ -571,11 +758,10 @@ class TestTrainBRM:
         assert result["stop_reason"] == "converged"
         assert result["stop_step"] == 1
         assert len(result["history"]["elapsed_sec"]) == 2
-        assert len(result["history"]["train_temperature"]) == 2
 
 
 class TestTrainBRMJoint:
-    """Smoke tests for the experimental joint-update BRM control."""
+    """Smoke tests for the supported BRM control used in notebook 02."""
 
     def test_train_brm_joint_runs(self, env, policy, value_net, flat_dataset):
         config = BRMConfig(
@@ -597,12 +783,10 @@ class TestTrainBRMJoint:
     ):
         checkpoint_history = []
 
-        def eval_callback(step, _env, _policy, _value_net, _val_dataset,
-                          train_temperature):
-            assert train_temperature > 0.0
+        def eval_callback(step, _env, _policy, _value_net, _val_dataset):
             return {
                 "benchmark_policy_mae": 10.0 - step,
-                "lifetime_reward_val": train_temperature,
+                "lifetime_reward_val": 100.0 + step,
             }
 
         config = BRMConfig(
@@ -625,6 +809,7 @@ class TestTrainBRMJoint:
         )
         hist = result["history"]
         assert hist["benchmark_policy_mae"] == pytest.approx([10.0, 9.0, 8.0])
+        assert hist["lifetime_reward_val"] == pytest.approx([100.0, 101.0, 102.0])
         assert len(checkpoint_history) == 3
         assert "policy" in checkpoint_history[0]["models"]
         assert "value_net" in checkpoint_history[0]["models"]
@@ -686,7 +871,6 @@ class TestTrainSHAC:
         assert all(np.isfinite(l) for l in hist["loss_critic"])
         assert all(np.isfinite(r) for r in hist["euler_residual_val"])
         assert all(np.isfinite(r) for r in hist["bellman_residual"])
-        assert len(hist["train_temperature"]) == len(hist["step"])
 
     # ---- Input validation ----
 
@@ -747,9 +931,7 @@ class TestTrainSHAC:
             3: 4.05,
         }
 
-        def eval_callback(step, _env, _policy, _value_net, _val_dataset,
-                          train_temperature):
-            assert train_temperature > 0.0
+        def eval_callback(step, _env, _policy, _value_net, _val_dataset):
             return {
                 "benchmark_policy_mae": series[step],
                 "lifetime_reward_val": 10.0 - 0.1 * step,
