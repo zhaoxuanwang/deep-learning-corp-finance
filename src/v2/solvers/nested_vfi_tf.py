@@ -12,7 +12,7 @@ import tensorflow as tf
 
 from src.v2.solvers.config import NestedVFIConfig, NestedVFITFRuntimeConfig
 from src.v2.solvers.grid import tauchen_transition_matrix_tf
-from src.v2.solvers.nested_vfi_np import _build_nested_vfi_grids
+from src.v2.solvers.nested_vfi_np import _build_nested_vfi_grids, _AUTARKY_RATE
 
 
 def _tf_dtype_from_name(name: str) -> tf.dtypes.DType:
@@ -320,8 +320,21 @@ def solve_nested_vfi_tf(
     config: NestedVFIConfig | None = None,
     eval_callback=None,
     runtime_config: NestedVFITFRuntimeConfig | None = None,
+    value_init: np.ndarray | None = None,
+    r_tilde_init: np.ndarray | None = None,
 ) -> Dict:
-    """Solve the risky-debt benchmark via a TF-native blocked nested VFI."""
+    """Solve the risky-debt benchmark via a TF-native blocked nested VFI.
+
+    Args:
+        value_init:   Optional initial value function, shape (n_z, n_state).
+                      When None (default), starts from zeros (cold start).
+                      Pass the converged value from a previous solve at
+                      nearby parameters to reduce iterations.
+        r_tilde_init: Optional initial risky-rate schedule, shape
+                      (n_z, n_k, n_b).  When None (default), uses pessimistic
+                      autarky initialization.  Pass the converged pricing
+                      from a previous solve for warm-starting.
+    """
 
     del train_dataset
     config = config or NestedVFIConfig()
@@ -390,12 +403,28 @@ def solve_nested_vfi_tf(
         )
         recovery_flat = tf.reshape(tf.repeat(recovery, repeats=n_b, axis=2), [n_z, -1])
 
-        value = tf.zeros([n_z, n_state], dtype=dtype)
+        if value_init is not None:
+            value = tf.cast(
+                tf.reshape(value_init, [n_z, n_state]), dtype
+            )
+        else:
+            value = tf.zeros([n_z, n_state], dtype=dtype)
         policy_idx = tf.zeros([n_z, n_state], dtype=tf.int32)
-        r_tilde_grid = tf.fill(
-            [n_z, n_k, n_b],
-            tf.cast(env.econ.interest_rate, dtype),
-        )
+
+        if r_tilde_init is not None:
+            r_tilde_grid = tf.cast(
+                tf.reshape(r_tilde_init, [n_z, n_k, n_b]), dtype
+            )
+        else:
+            # Pessimistic (autarky) initialization, matching the NumPy
+            # version: lenders refuse to lend at reasonable rates for
+            # positive debt, seeding a non-empty default region.
+            b_grid_np = np.asarray(grids["endo_grids_1d"][1], dtype=np.float64)
+            r_init_np = np.full(
+                (n_z, n_k, n_b), env.econ.interest_rate, dtype=np.float64
+            )
+            r_init_np[:, :, b_grid_np > 1e-12] = _AUTARKY_RATE
+            r_tilde_grid = tf.cast(r_init_np, dtype)
 
         inner_solver = _get_inner_bellman_solver_tf(
             n_choice=n_choice,

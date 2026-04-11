@@ -39,14 +39,17 @@ def _evaluate_policy(
     v_init: tf.Tensor,
     tables: Dict[str, tf.Tensor],
     eval_steps: int,
+    interp_mode: str = "auto",
 ) -> tf.Tensor:
     """Policy evaluation: iterate V = R_h + gamma * P * V[trans_h].
 
     Args:
-        policy_idx: (n_exo, n_endo) int32 — action index at each state.
-        v_init:     (n_exo, n_endo) initial value estimate.
-        tables:     Precomputed tables from _precompute_tables.
-        eval_steps: Number of evaluation iterations.
+        policy_idx:  (n_exo, n_endo) int32 — action index at each state.
+        v_init:      (n_exo, n_endo) initial value estimate.
+        tables:      Precomputed tables from _precompute_tables.
+        eval_steps:  Number of evaluation iterations.
+        interp_mode: "auto" | "linear" | "none".  Controls how the
+                     continuation value is computed (same as _bellman_step).
 
     Returns:
         v_eval: (n_exo, n_endo) evaluated value function.
@@ -74,9 +77,15 @@ def _evaluate_policy(
     trans_policy = tf.reshape(tf.squeeze(trans_policy, -1), [n_exo, n_endo])
     # trans_policy[z, k] = endo_next index under the fixed policy
 
-    # Linear interpolation data for 1D endo (matches _bellman_step)
-    use_interp = "trans_lo" in tables
-    if use_interp:
+    # --- Determine interpolation strategy ---
+    use_snap = (interp_mode == "none")
+    has_1d = "trans_lo" in tables
+    has_nd = "trans_lo_0" in tables
+
+    use_interp_1d = (not use_snap) and has_1d
+    use_interp_nd = (not use_snap) and (not has_1d) and has_nd
+
+    if use_interp_1d:
         lo_flat = tf.reshape(tables["trans_lo"], [n_exo * n_endo, n_action])
         trans_lo_policy = tf.gather(lo_flat, pi_exp, batch_dims=1)
         trans_lo_policy = tf.reshape(tf.squeeze(trans_lo_policy, -1), [n_exo, n_endo])
@@ -87,6 +96,31 @@ def _evaluate_policy(
 
         trans_hi_policy = tf.minimum(trans_lo_policy + 1, n_endo - 1)
 
+    if use_interp_nd:
+        endo_var_sizes = tables["endo_var_sizes"]  # [n_0, n_1, ...]
+        endo_dim_count = len(endo_var_sizes)
+        # Row-major strides
+        nd_strides = [0] * endo_dim_count
+        nd_strides[-1] = 1
+        for d in range(endo_dim_count - 2, -1, -1):
+            nd_strides[d] = nd_strides[d + 1] * endo_var_sizes[d + 1]
+        # Extract per-policy lo/frac for each endo variable
+        lo_policy_d = []
+        frac_policy_d = []
+        hi_policy_d = []
+        for d in range(endo_dim_count):
+            lo_flat_d = tf.reshape(tables[f"trans_lo_{d}"], [n_exo * n_endo, n_action])
+            lo_pol = tf.gather(lo_flat_d, pi_exp, batch_dims=1)
+            lo_pol = tf.reshape(tf.squeeze(lo_pol, -1), [n_exo, n_endo])
+            lo_policy_d.append(lo_pol)
+
+            frac_flat_d = tf.reshape(tables[f"trans_frac_{d}"], [n_exo * n_endo, n_action])
+            frac_pol = tf.gather(frac_flat_d, pi_exp, batch_dims=1)
+            frac_pol = tf.reshape(tf.squeeze(frac_pol, -1), [n_exo, n_endo])
+            frac_policy_d.append(frac_pol)
+
+            hi_policy_d.append(tf.minimum(lo_pol + 1, endo_var_sizes[d] - 1))
+
     # Iterate V = R_h + gamma * E[V(z', k_h')]
     v = v_init
     for _ in range(eval_steps):
@@ -94,10 +128,26 @@ def _evaluate_policy(
         # Loop over z' to avoid materializing (n_exo, n_exo*n_endo) tensor.
         ev = tf.zeros([n_exo, n_endo], dtype=v.dtype)
         for zp in range(n_exo):
-            if use_interp:
+            if use_interp_1d:
                 v_lo = tf.gather(v[zp], trans_lo_policy)   # (n_exo, n_endo)
                 v_hi = tf.gather(v[zp], trans_hi_policy)
                 v_zp = (1.0 - frac_policy) * v_lo + frac_policy * v_hi
+            elif use_interp_nd:
+                v_zp = tf.zeros([n_exo, n_endo], dtype=v.dtype)
+                for corner in range(1 << endo_dim_count):
+                    weight = tf.ones([n_exo, n_endo], dtype=v.dtype)
+                    flat_idx = tf.zeros([n_exo, n_endo], dtype=tf.int32)
+                    for d in range(endo_dim_count):
+                        if corner & (1 << d):
+                            idx_d = hi_policy_d[d]
+                            w_d = frac_policy_d[d]
+                        else:
+                            idx_d = lo_policy_d[d]
+                            w_d = 1.0 - frac_policy_d[d]
+                        weight = weight * w_d
+                        flat_idx = flat_idx + idx_d * nd_strides[d]
+                    v_corner = tf.gather(v[zp], flat_idx)
+                    v_zp = v_zp + weight * v_corner
             else:
                 v_zp = tf.gather(v[zp], trans_policy)      # (n_exo, n_endo)
             w = tf.reshape(prob[:, zp], [n_exo, 1])
@@ -113,6 +163,7 @@ def solve_pfi(
     train_dataset: Dict[str, tf.Tensor],
     config: PFIConfig = None,
     eval_callback=None,
+    value_init: Optional[tf.Tensor] = None,
 ) -> Dict:
     """Generic Policy Function Iteration solver.
 
@@ -124,6 +175,10 @@ def solve_pfi(
         eval_callback: Optional callable(iteration, partial_result) -> dict[str, float].
                        Called after each policy improvement iteration.
                        partial_result contains 'value', 'policy_action', 'policy_endo', 'grids'.
+        value_init:    Optional initial value function for warm-starting,
+                       shape (n_exo, n_endo).  When None (default), starts
+                       from zeros (cold start).  A warm V also produces a
+                       warm initial policy via the first Bellman step.
 
     Returns:
         Dict with keys:
@@ -185,8 +240,12 @@ def solve_pfi(
             v <= threshold for v in vals[-threshold_patience:])
 
     # 4. PFI iteration
-    v_curr = tf.zeros([n_exo, n_endo], dtype=tf.float32)
-    _, policy_idx = _bellman_step(v_curr, tables)
+    interp_mode = config.interpolation
+    if value_init is not None:
+        v_curr = tf.cast(tf.reshape(value_init, [n_exo, n_endo]), tf.float32)
+    else:
+        v_curr = tf.zeros([n_exo, n_endo], dtype=tf.float32)
+    _, policy_idx = _bellman_step(v_curr, tables, interp_mode)
 
     eval_history = {}
     stop_reason  = None
@@ -195,10 +254,11 @@ def solve_pfi(
 
     for iteration in range(config.max_iter):
         # Policy evaluation
-        v_eval = _evaluate_policy(policy_idx, v_curr, tables, config.eval_steps)
+        v_eval = _evaluate_policy(
+            policy_idx, v_curr, tables, config.eval_steps, interp_mode)
 
         # Policy improvement
-        v_greedy, new_policy_idx = _bellman_step(v_eval, tables)
+        v_greedy, new_policy_idx = _bellman_step(v_eval, tables, interp_mode)
 
         # Eval checkpoint (before convergence check so we log the last state)
         if eval_callback is not None:

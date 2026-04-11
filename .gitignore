@@ -6,6 +6,8 @@ notebooks/
 experiments/
 production/
 notes/
+.cache/
+configs/pipelines/
 
 # --- Python Standard Exclusions ---
 __pycache__/

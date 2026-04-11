@@ -48,6 +48,9 @@ class GridConfig:
                 f"transition_alpha must be >= 0. Got {self.transition_alpha}")
 
 
+_VALID_INTERPOLATION_MODES = {"auto", "linear", "none"}
+
+
 @dataclass
 class VFIConfig:
     """Configuration for Value Function Iteration.
@@ -57,6 +60,13 @@ class VFIConfig:
         tol:                Sup-norm convergence tolerance.
         max_iter:           Maximum Bellman iterations.
         eval_interval:      Evaluate via eval_callback every N Bellman iterations.
+        interpolation:      Continuation-value interpolation mode:
+                            - "auto" (default): use linear interpolation when
+                              per-variable 1-D grids are available, fall back to
+                              snap-to-grid otherwise.
+                            - "linear": require linear interpolation (1-D) or
+                              N-linear interpolation (multi-D).
+                            - "none": always snap to nearest grid point.
         monitor:            Metric name to watch for early stopping (optional).
         threshold:          Stop when monitor metric satisfies the criterion.
         threshold_patience: Consecutive eval checkpoints that must satisfy rule.
@@ -65,6 +75,7 @@ class VFIConfig:
     tol:                float      = 1e-6
     max_iter:           int        = 2000
     eval_interval:      int        = 50
+    interpolation:      str        = "auto"
     monitor:            Optional[str]   = None
     threshold:          Optional[float] = None
     threshold_patience: int = 1
@@ -78,6 +89,11 @@ class VFIConfig:
             raise ValueError(f"eval_interval must be >= 1. Got {self.eval_interval}")
         if self.threshold_patience < 1:
             raise ValueError(f"threshold_patience must be >= 1. Got {self.threshold_patience}")
+        if self.interpolation not in _VALID_INTERPOLATION_MODES:
+            raise ValueError(
+                f"interpolation must be one of {sorted(_VALID_INTERPOLATION_MODES)}. "
+                f"Got {self.interpolation!r}"
+            )
 @dataclass
 class PFIConfig:
     """Configuration for Policy Function Iteration (Howard's method).
@@ -87,6 +103,8 @@ class PFIConfig:
         max_iter:           Maximum policy improvement iterations.
         eval_steps:         Number of Bellman evaluations per policy
                             evaluation step.
+        interpolation:      Continuation-value interpolation mode (same
+                            semantics as VFIConfig.interpolation).
         monitor:            Metric name to watch for early stopping (optional).
         threshold:          Stop when monitor metric satisfies the criterion.
         threshold_patience: Consecutive eval checkpoints that must satisfy rule.
@@ -94,6 +112,7 @@ class PFIConfig:
     grid:               GridConfig = field(default_factory=GridConfig)
     max_iter:           int        = 200
     eval_steps:         int        = 400
+    interpolation:      str        = "auto"
     monitor:            Optional[str]   = None
     threshold:          Optional[float] = None
     threshold_patience: int = 1
@@ -105,6 +124,11 @@ class PFIConfig:
             raise ValueError(f"eval_steps must be >= 1. Got {self.eval_steps}")
         if self.threshold_patience < 1:
             raise ValueError(f"threshold_patience must be >= 1. Got {self.threshold_patience}")
+        if self.interpolation not in _VALID_INTERPOLATION_MODES:
+            raise ValueError(
+                f"interpolation must be one of {sorted(_VALID_INTERPOLATION_MODES)}. "
+                f"Got {self.interpolation!r}"
+            )
 @dataclass
 class NestedVFIGridConfig:
     """Grid sizes for the canonical risky-debt nested VFI.
@@ -181,7 +205,7 @@ class NestedVFIConfig:
     max_iter_inner:     int = 2000
     tol_inner:          float = 1e-6
     max_iter_outer:     int = 50
-    tol_outer_value:    float = 1e-4
+    tol_outer_value:    float = 1e-6
 
     def __post_init__(self):
         if self.max_iter_inner < 1:
@@ -195,6 +219,94 @@ class NestedVFIConfig:
         if self.tol_outer_value <= 0:
             raise ValueError(
                 f"tol_outer_value must be > 0. Got {self.tol_outer_value}")
+
+
+@dataclass
+class InterpNestedVFIConfig(NestedVFIConfig):
+    """Nested VFI with z-interpolation speedup.
+
+    Solves the Bellman on a coarse z grid (n_z_coarse nodes selected from
+    the fine Tauchen grid) and interpolates the value function to the full
+    fine grid for continuation values and pricing updates.  The fine grid
+    size is ``grid.exo_sizes[0]``.
+    """
+
+    n_z_coarse: int = 10
+
+    def __post_init__(self):
+        super().__post_init__()
+        if self.n_z_coarse < 2:
+            raise ValueError(
+                f"n_z_coarse must be >= 2. Got {self.n_z_coarse}"
+            )
+        n_z_fine = self.grid.exo_sizes[0]
+        if self.n_z_coarse >= n_z_fine:
+            raise ValueError(
+                f"n_z_coarse ({self.n_z_coarse}) must be < "
+                f"exo_sizes[0] ({n_z_fine})."
+            )
+
+
+@dataclass
+class RiskyDebtSolverConfig:
+    """Risky-debt nested VFI solver with z-interpolation and adaptive b' bounds.
+
+    Grid parameters:
+        n_k:         Capital grid points (shared by state k and action k').
+        n_b:         Debt grid points (shared by state b and action b').
+        n_z:         Productivity nodes for Tauchen quadrature (fine grid).
+        n_z_solve:   Productivity nodes for the Bellman solve (coarse grid).
+                     Must be < n_z.  The value function is solved at n_z_solve
+                     nodes and linearly interpolated to n_z for continuation
+                     values and bond pricing.
+
+    Spacing:
+        k_spacing:   "geometric" (default, denser at low k) or "linear".
+        b_spacing:   "linear" (default).
+        z_spacing:   "log" (default, natural for log-AR(1)).
+
+    Adaptive b' bounds:
+        adaptive:    If True (default), run a fast internal solve on a small
+                     grid to discover the economically active b' region, then
+                     re-solve with tight bounds.
+        buffer_frac: Fractional buffer around the discovered active region.
+    """
+
+    # Grid
+    n_k: int = 50
+    n_b: int = 50
+    n_z: int = 30
+    n_z_solve: int = 10
+    k_spacing: str = "geometric"
+    b_spacing: str = "linear"
+    z_spacing: str = "log"
+
+    # Adaptive b' bounds
+    adaptive: bool = True
+    buffer_frac: float = 0.01
+
+    _VALID_SPACINGS = {"linear", "log", "geometric"}
+
+    def __post_init__(self):
+        for name, val in [("n_k", self.n_k), ("n_b", self.n_b), ("n_z", self.n_z)]:
+            if val < 2:
+                raise ValueError(f"{name} must be >= 2. Got {val}")
+        if self.n_z_solve < 2:
+            raise ValueError(f"n_z_solve must be >= 2. Got {self.n_z_solve}")
+        if self.n_z_solve >= self.n_z:
+            raise ValueError(
+                f"n_z_solve ({self.n_z_solve}) must be < n_z ({self.n_z})."
+            )
+        for name, val in [
+            ("k_spacing", self.k_spacing),
+            ("b_spacing", self.b_spacing),
+            ("z_spacing", self.z_spacing),
+        ]:
+            if val not in self._VALID_SPACINGS:
+                raise ValueError(
+                    f"{name} must be one of {sorted(self._VALID_SPACINGS)}. "
+                    f"Got {val!r}"
+                )
 
 
 @dataclass

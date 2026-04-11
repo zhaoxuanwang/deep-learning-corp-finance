@@ -6,6 +6,7 @@ keras>=3.0.0
 # Numerical Computing & Data
 numpy>=1.26.0,<2.0.0
 pandas>=2.0.0  # Used in notebooks and ExperimentConfig.summary()
+scipy>=1.11.0
 
 # Visualization
 matplotlib>=3.8.0
