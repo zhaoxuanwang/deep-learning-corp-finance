@@ -130,9 +130,14 @@ class SMMRunConfig:
                            production (e.g., 50× more panels than moments).
         master_seed:       Length-2 integer tuple used to derive all
                            sub-seeds via the seeding utilities.
-        error_type:        ``'percent'`` (default) normalises each moment
-                           error by the target moment value; ``'level'``
-                           uses raw differences.
+        error_type:        ``'level'`` (default) uses raw differences
+                           ``m_sim - m_target``; ``'percent'`` normalises
+                           by ``|m_target|`` (with a small floor for
+                           near-zero targets).  Level is recommended
+                           when moments differ in magnitude because
+                           percent amplifies moments whose target is
+                           small, inflating Omega_hat's condition
+                           number.
         percent_denom_floor:
                            Minimum absolute denominator for percent errors,
                            preventing division by near-zero targets.
@@ -159,7 +164,7 @@ class SMMRunConfig:
     burn_in: int = 64
     n_sim_panels: int = 32
     master_seed: tuple[int, int] = (20, 26)
-    error_type: ErrorType = "percent"
+    error_type: ErrorType = "level"
     percent_denom_floor: float = 1e-6
     global_method: GlobalMethod = "dual_annealing"
     local_method: LocalMethod = "Powell"

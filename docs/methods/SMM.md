@@ -75,7 +75,7 @@ $$e(\beta) = \bar{m}(\beta) - M(x) \qquad \text{(level)}$$
 
 $$\text{or} \qquad e_r(\beta) = \frac{\bar{m}_r(\beta) - M_r(x)}{M_r(x)} \qquad \text{(percent)}$$
 
-Percent deviation is preferred when moments differ in scale. Level deviation is simpler when moments are comparable in magnitude. When $M_r \approx 0$, the denominator is stabilized to $\text{sign}(M_r) \times \max(|M_r|, 10^{-6})$.
+Level deviation is the **default** (`error_type="level"`) and is recommended whenever moments span a wide range of magnitudes: percent normalization would amplify moments whose target value is small (e.g., $\Pr(\text{default})\sim 10^{-4}$) by $1/M_r^2$, inflating the Omega_hat condition number by orders of magnitude and breaking the efficient estimator. Percent deviation can still be requested via `error_type="percent"` for settings where moments are naturally comparable in magnitude. When percent is selected and $M_r \approx 0$, the denominator is stabilized to $\text{sign}(M_r) \times \max(|M_r|, 10^{-6})$.
 
 5. **Return** the objective value:
 
@@ -154,6 +154,87 @@ $$J = \frac{S}{S + 1} \; Q(\hat{\beta}) \;\xrightarrow{d}\; \chi^2(R - K)$$
 The factor $S/(S+1)$ corrects for the target being one random draw (not a population quantity); as $S \to \infty$ and $\hat \beta \to \beta^*$, it converges to 1 and $J \to Q(\beta^*)=0$.
 
 For significance level $\alpha$, reject $H_0$ if $J > \chi^2_{1-\alpha}(R-K)$. A rejection means no $\beta$ can match all $R$ moments simultaneously and indicates model misspecification. Importantly, correct solution means we should *fail to reject* the null (i.e., our model is mis-specified), but it cannot prove that our model is correctly specified.
+
+---
+
+### Pre-Estimation Diagnostics
+
+Before running the full optimization, I compute three diagnostics at the known true parameters $\beta_0$ to verify that the estimation problem is well-posed. These checks are independent of the optimizer and isolate pipeline correctness from identification strength.
+
+#### Diagnostic 1: Oracle Test
+
+**Definition.** Evaluate the objective at the true parameters:
+
+$$Q(\beta_0) = e(\beta_0)^\top W \, e(\beta_0), \qquad e(\beta_0) = \bar{m}(\beta_0) - M(\beta_0)$$
+
+where $\bar{m}(\beta_0)$ is computed from $S$ simulated panels using a *different* random seed than the target $M(\beta_0)$, so the two are statistically independent. Report both $Q$ and $\|e\| = \sqrt{Q}$.
+
+**Intention.** This tests whether the solver-simulation-moment pipeline produces correct moments at the known truth. It is a **necessary condition** for SMM to work: if $Q(\beta_0)$ is large, then the pipeline has a bug (wrong sign, off-by-one in panel indexing, inconsistent moment definition, etc.) and no optimizer can succeed. It is **not sufficient**: $Q(\beta_0) \approx 0$ confirms pipeline correctness but says nothing about whether $\beta_0$ is a unique minimizer or whether the optimizer can find it.
+
+**Interpretation.** Pass if $Q < 0.01$ (equivalently $\|e\| < 0.1$). A small but nonzero $Q$ reflects simulation noise from using independent seeds; this vanishes as $S \to \infty$. A large $Q$ indicates a bug. Common failure modes: moment function uses wrong variable, simulation horizon too short for burn-in, solver did not converge.
+
+
+#### Diagnostic 2: Jacobian Rank and Sensitivity
+
+**Definition.** Compute the $R \times K$ Jacobian of the moment function at $\beta_0$ via central finite differences:
+
+$$D_{rk} = \frac{\partial \bar{m}_r(\beta)}{\partial \beta_k}\bigg|_{\beta_0} \approx \frac{\bar{m}_r(\beta_0 + h_k \mathbf{e}_k) - \bar{m}_r(\beta_0 - h_k \mathbf{e}_k)}{2 h_k}$$
+
+where $h_k = 0.01 \times (\beta_k^{\max} - \beta_k^{\min})$ scales the step to 1% of the feasible range per parameter. This requires $2K$ model solves. From $D$, compute:
+
+**Singular values.** The SVD $D = U \Sigma V^\top$ yields singular values $\sigma_1 \geq \sigma_2 \geq \cdots \geq \sigma_K \geq 0$. Each $\sigma_j$ measures the moment sensitivity along the $j$-th principal parameter direction (a linear combination of the original parameters defined by the columns of $V$). Directions with large $\sigma_j$ are well-identified; directions with $\sigma_j \approx 0$ are unidentifiable.
+
+**Rank.** $\text{rank}(D) = \#\{j : \sigma_j > 10^{-8}\}$. Full rank ($= K$) is required for local identification.
+
+**Column norms.** For each parameter $k$, the column norm $\|D_{\cdot k}\| = \sqrt{\sum_r D_{rk}^2}$ measures the total moment sensitivity to that individual parameter. Classify as:
+
+| $\|D_{\cdot k}\|$ | Status | Meaning |
+|---|---|---|
+| $< 10^{-6}$ | DEAD | No moment responds to this parameter |
+| $< 0.05$ | WEAK | Moments respond but very faintly |
+| $\geq 0.05$ | OK | Adequate sensitivity |
+
+**Full Jacobian table.** The matrix $D$ itself (rows = moments, columns = parameters) shows exactly which moments identify which parameters. Entry $D_{rk}$ is the marginal effect of parameter $k$ on moment $r$. A column of near-zeros indicates an unidentified parameter. Two columns with proportional entries indicate confounded parameters — the moments cannot distinguish one from the other.
+
+**Intention.** The rank condition ($\text{rank}(D) = K$) is the standard **necessary condition for local identification** (Rothenberg, 1971): it ensures the mapping $\beta \mapsto m(\beta)$ is locally injective at $\beta_0$, so the system $m(\beta) = m_{\text{target}}$ has a locally unique solution. The singular values quantify how strongly each direction is identified. The column norms and full Jacobian table provide interpretable per-parameter and per-moment diagnostics.
+
+The rank condition is **not sufficient** for global identification (multiple well-separated minima may exist) or for good finite-sample performance (a direction with $\sigma_j = 0.01$ is technically identified but requires very precise optimization and large $S$ to pin down).
+
+**Interpretation.**
+
+- $\text{rank}(D) < K$: at least one parameter direction is locally unidentifiable. Either add moments that load on the missing direction, or calibrate the unidentified parameter externally.
+- $\text{rank}(D) = K$ but $\sigma_K \ll \sigma_1$: all parameters are locally identified, but the condition number $\kappa(D) = \sigma_1/\sigma_K$ measures the sensitivity ratio between the best- and worst-identified directions. Large $\kappa$ (e.g., $> 10^3$) means the optimizer must navigate a narrow valley — feasible but requiring more function evaluations.
+- WEAK or DEAD parameters: fix them externally or add targeted moments. Estimating a DEAD parameter wastes optimizer budget and inflates standard errors for all other parameters (the flat direction creates ridges in the objective surface that the optimizer slides along).
+- Two columns with similar patterns: the corresponding parameters are confounded. The optimizer can trade off one against the other without changing $Q$ much. Consider whether additional moments with orthogonal sensitivity can break the confounding.
+
+
+#### Diagnostic 3: $\hat{\Omega}$ Condition Number
+
+**Definition.** At the first-step estimate $\hat{\beta}_1$ (or at $\beta_0$ during pre-estimation diagnostics), retrieve the $S$ per-panel error vectors $\{E_s\}_{s=1}^S$ (as defined in Part 3) and compute:
+
+$$\hat{\Omega} = \frac{1}{S}\sum_{s=1}^S E_s E_s^\top \qquad (R \times R)$$
+
+Report $\kappa(\hat{\Omega}) = \sigma_{\max}(\hat{\Omega}) / \sigma_{\min}(\hat{\Omega})$.
+
+**Intention.** This checks whether $W = \hat{\Omega}^{-1}$ is numerically stable. A well-conditioned $\hat{\Omega}$ is **required for the efficient estimator** (Stage 2 with optimal $W$), the $J$-test, and the efficient standard errors from Part 4. It is **not an identification condition**: a poorly conditioned $\hat{\Omega}$ does not mean the parameters are unidentified. The first-step estimator ($W = I$) remains consistent regardless of $\hat{\Omega}$ — it will converge to $\beta_0$ as optimizer budget and sample size grow, but with larger variance than the efficient estimator.
+
+**Interpretation.**
+
+- $\kappa < 10^6$: $\hat{\Omega}^{-1}$ is numerically stable. Proceed with Stage 2 using $W = \hat{\Omega}^{-1}$. The $J$-test and efficient SEs are available.
+- $\kappa > 10^6$: $\hat{\Omega}^{-1}$ is unreliable. Fall back to $W = I$ for Stage 2. The $J$-test and efficient SEs are not available. The first-step estimator is still consistent but not efficient.
+- Common cause: $S$ is too small relative to $R$. The sample covariance $\hat{\Omega}$ is estimated from $S$ observations of an $R$-dimensional vector; when $S/R$ is small, sampling noise inflates the condition number. Rule of thumb: $S \gg R$ (e.g., $S \geq 50R$). Moments with very different scales (e.g., default frequency $\sim 10^{-4}$ vs leverage $\sim 1$) also increase $\kappa$ even in the population.
+
+
+#### Summary: What Each Diagnostic Can and Cannot Conclude
+
+| Diagnostic | Checks | Condition type | Failure consequence |
+|---|---|---|---|
+| Oracle $Q(\beta_0) \approx 0$ | Pipeline correctness | Necessary for SMM | Bug in solver/simulation/moments |
+| $\text{rank}(D) = K$ | Local identification | Necessary for unique $\hat{\beta}$ | Unidentified parameter direction |
+| SVs of $D$ | Identification strength | Quantitative (not binary) | Weak directions → slow convergence, large SEs |
+| $\kappa(\hat{\Omega}) < 10^6$ | Efficient estimator feasibility | Required for $J$-test and efficient SEs only | Fall back to $W = I$; lose $J$-test |
+
+The diagnostics are ordered by severity: an oracle failure blocks everything; a rank-deficient Jacobian means estimation is futile for those parameters; a large $\kappa(\hat{\Omega})$ only prevents the efficient second step but does not invalidate the first-step estimator.
 
 
 ---
@@ -262,48 +343,65 @@ I select 5 moments to match 4 target parameters:
 
 #### Equity issuance moments
 
-To identify the equity issuance cost $\Omega(e)=(\eta_0 + \eta_1 |e|)\mathcal{I}\{e<0\}$, I use moments that capture both the **level** and **dynamics** of issuance behavior. Static unconditional moments (e.g., frequency of issuance, frequency of negative debt) provide weak identification when issuance is rare, because they are near-zero regardless of $\eta_0, \eta_1$. Dynamic cross-moments capture how issuance interacts with other firm decisions over time, providing richer variation.
+To identify the equity issuance cost $\Omega(e)=(\eta_0 + \eta_1 |e|)\mathcal{I}\{e<0\}$, I follow @hennessy2007costly and use four cross-sectional moments that separate the fixed cost ($\eta_0$, which gates issuance frequency) from the proportional cost ($\eta_1$, which shapes the pecking order). The H&W set also drops the variance-of-issuance moment that they use for the quadratic cost $\lambda_2$, since this model has no quadratic term.
 
 | # | Moment | Definition | Identifies | Reasons |
 |---|---|---|---|---|
-| 1 | Avg equity issuance / assets | $\mathbb{E}\bigl[\max(0, -e_{it}) / k_{it}\bigr]$ | $\eta_0, \eta_1$ | Overall issuance intensity |
-| 2 | Conditional issuance size | $\mathbb{E}\bigl[\max(0, -e_{it}) / k_{it}\bigr]$ when $e_{it} < 0$ | $\eta_1$ | Separates proportional cost (affects amount) from fixed cost (affects frequency) |
-| 3 | Autocorr of equity issuance | $\text{Corr}\!\left(\frac{\max(0,-e_{it})}{k_{it}},\; \frac{\max(0,-e_{i,t-1})}{k_{i,t-1}}\right)$ | $\eta_0$ | High fixed cost produces lumpy, persistent issuance episodes |
-| 4 | Cross-corr: leverage → issuance | $\text{Corr}\!\left(\text{lev}_{it},\; \frac{\max(0,-e_{i,t+1})}{k_{i,t+1}}\right)$ | $\eta_0, \eta_1, c_{\text{def}}$ | High leverage predicts future equity need; the strength of this channel depends on both financing frictions and default costs |
+| 1 | Avg equity issuance / assets | $\mathbb{E}\bigl[\max(0, -e_{it}) / k_{it}\bigr]$ | $\eta_0$ | Overall issuance intensity; large $\eta_0$ → infrequent but large flotations → small mean |
+| 2 | Frequency of equity issuance | $\Pr(e_{it} < 0)$ | $\eta_0$ | Direct identifier: large fixed cost gates how often the firm issues at all |
+| 3 | Corr(equity issuance, investment) | $\text{Corr}\!\left(\frac{\max(0,-e_{it})}{k_{it}},\; \frac{I_{it}}{k_{it}}\right)$ | $\eta_0, \eta_1$ | Position of equity in the pecking order: strong correlation ⇒ low equity cost; weak correlation ⇒ firm prefers internal funds first. We use the correlation (scale-stabilised) rather than H&W's raw covariance because $\text{Cov}(\text{Iss}/k, I/k)$ has population variance $\sim 10^{-8}$ — both variables are near-zero for most firm-years — which would make Omega_hat singular regardless of sample size. Correlation is bounded in $[-1,1]$ and conditioning is comparable to other moments. |
+
+**Moments computed but excluded from the active set** (kept in `_ALL_MOMENT_NAMES` for diagnostic comparison, disabled at the API level via `disabled_moments=[...]`):
+
+- *Conditional issuance size* $\mathbb{E}[\max(0,-e)/k \mid e<0]$ — Jacobian audit shows zero loading on $\eta_1$ in this model; mechanically redundant with moments 1 and 2 since $\text{Cond Iss} = \text{Avg Iss}/\Pr(e<0)$.
+- *Autocorr of equity issuance* — Jacobian shows $\eta_0$ loading is dominated by $\alpha$ and $\psi_1$; small target value ($\sim -0.01$) inflates Omega_hat condition number.
+- *Cross-corr leverage → issuance* — Jacobian shows $\eta_1$ loading exists but is dominated by $\alpha$ and $\psi_1$; replaced by the cleaner Cov(Iss, I) pecking-order moment from H&W.
+
+**Unused moment candidate** (defined in `_UNUSED_MOMENT_CANDIDATES`, not computed):
+
+- *Frequency of negative debt* $\Pr(b' < 0)$ — H&W 2007 propose this to identify the precautionary-saving motive, but the production solver uses `adaptive=True` which shrinks the b-grid to the default-risk region ($b' > 0$ only). The moment is therefore structurally zero by construction; including it would create a singular row in Omega_hat.
 
 #### Debt and leverage moments
 
-The average leverage identifies $c_{\text{def}}$ because higher default costs make borrowing more expensive, reducing equilibrium leverage. The cross-sectional dispersion of leverage provides additional identification: $c_{\text{def}}$ determines the leverage ceiling where default becomes binding, and firms cluster below this ceiling.
+Faithful to @hennessy2007costly: book net debt-to-assets identifies the level of $c_{\text{def}}$ (high default cost ⇒ lower equilibrium leverage), and the covariance between leverage and investment identifies the position of debt in the financing pecking order ($c_{\text{def}}$ controls how much firms substitute debt for internal funds when financing investment).
 
 | # | Moment | Definition | Identifies | Reasons |
 |---|---|---|---|---|
-| 5 | Avg net debt / assets | $\mathbb{E}\!\left[\frac{b'_{it}/(1+\tilde{r}_{it})}{V_{it} + b'_{it}/(1+\tilde{r}_{it})}\right]$ | $c_{\text{def}}$ | Equilibrium leverage level |
-| 6 | Std of leverage | $\text{Std}\!\left(\frac{b'_{it}/(1+\tilde{r}_{it})}{V_{it} + b'_{it}/(1+\tilde{r}_{it})}\right)$ | $c_{\text{def}}$ | Cross-sectional leverage dispersion driven by default-cost-induced ceiling |
+| 5 | Book leverage | $\mathbb{E}\bigl[b'_{it}/k_{it}\bigr]$ | $c_{\text{def}}$ | Equilibrium net debt-to-assets ratio |
+| 6 | Cov(leverage, investment) | $\text{Cov}\bigl(b'_{it}/k_{it},\; I_{it}/k_{it}\bigr)$ | $c_{\text{def}}$ | Pecking-order channel: high $c_{\text{def}}$ weakens debt-investment co-movement |
 
-#### Adjustment cost moments
+**Unused moment candidates** (defined in `_UNUSED_MOMENT_CANDIDATES`, kept as code-level documentation only — not computed at runtime):
 
-Higher convex costs make full adjustment in one period too expensive, so the firm does partial adjustment (slowly moving to target capital level), creating positive autocorrelation in $I/k$ that scales monotonically with $\psi_1$.
+- *avg_net_debt_assets* — was $\mathbb{E}[b'/(1+\tilde{r})/(V + b'/(1+\tilde{r}))]$ (market-value leverage). Replaced by book leverage above to match H&W's accounting definition.
+- *std_leverage* — replaced by Cov(leverage, investment) above for H&W's pecking-order moment.
+
+#### Investment and adjustment-cost moments
+
+Mean investment / assets is H&W 2007's primary identifier for $\alpha$ (production curvature scales the equilibrium investment rate). The serial correlation of $I/k$ identifies $\psi_1$: higher convex costs force partial adjustment, creating positive autocorrelation that scales monotonically with $\psi_1$.
 
 | # | Moment | Definition | Identifies | Reasons
 |---|---|---|---|---|
-| 7 | Serial corr of investment | $\text{Corr}\!\left(\frac{I_{it}}{k_{it}},\; \frac{I_{i,t-1}}{k_{i,t-1}}\right)$ | $\psi_1$ | Partial adjustment |
+| 7 | Var of investment / assets | $\text{Var}\bigl[I_{it} / k_{it}\bigr]$ |$\alpha, \psi_1$ | Marginal product of capital |
+| 8 | Serial corr of investment | $\text{Corr}\!\left(\frac{I_{it}}{k_{it}},\; \frac{I_{i,t-1}}{k_{i,t-1}}\right)$ | $\psi_1$ | Partial adjustment |
 
 
 #### Real technology moments
 
-The variance of investment rate captures the marginal product of capital — firms respond less to shocks when $\alpha$ is small. The two AR(1) parameters are identified from a panel IV regression on the observable income/asset ratio $y_{it} = z_{it} k_{it}^{\alpha-1}$, following the same IV first-difference estimator used in the basic investment model (see above).
+The variance of investment rate captures how much investment responds to shocks — firms respond less when $\alpha$ is small. The two AR(1) parameters are identified from a panel IV regression on the observable income/asset ratio $y_{it} = z_{it} k_{it}^{\alpha-1}$, following the same IV first-difference estimator used in the basic investment model (see above).
 
 | # | Moment | Definition | Identifies | Reasons
 |---|---|---|---|---|
-| 8 | Var of investment / assets | $\text{Var}\bigl[I_{it} / k_{it}\bigr]$ |$\alpha, \psi_1$ | Marginal product of capital
-| 9 | AR(1) persistence | $\hat{\beta}_1$ from panel IV regression of $\Delta \log y_t$ on $\Delta \log y_{t-1}$ | $\rho$ | Direct
-| 10 | AR(1) shock std dev | $\hat{\sigma}_u$ from the same IV regression | $\sigma_\varepsilon$ | Direct
+| 9 | Mean investment / assets | $\mathbb{E}\bigl[I_{it}/k_{it}\bigr]$ | $\alpha$ | Equilibrium investment rate scales with $\alpha$ |
+| 10 | AR(1) persistence | $\hat{\beta}_1$ from panel IV regression of $\Delta \log y_t$ on $\Delta \log y_{t-1}$ | $\rho$ | Direct |
+| 11 | AR(1) shock std dev | $\hat{\sigma}_u$ from the same IV regression | $\sigma_\varepsilon$ | Direct |
 
 #### Summary
 
-- **Parameter count:** 10 moment conditions identify 7 free parameters $(\alpha, \psi_1, \eta_0, \eta_1, c_{\text{def}}, \rho, \sigma_\varepsilon)$.
-- **Overidentifying**: $R - K = 3$ overidentifying restrictions allow for the $J$-test.
-- **Cost**: Each candidate $\beta$ requires a full nested VFI solve to obtain the optimal policy $\pi(\cdot;\beta)$.
+- **Active moment set:** 11 moments — 3 issuance (H&W) + 2 leverage + 2 investment/adjustment + 3 real technology + 1 default frequency — to identify up to 7 parameters $(\alpha, \psi_1, \eta_0, \eta_1, c_{\text{def}}, \rho, \sigma_\varepsilon)$.
+- **Diagnostic-only moments:** 4 additional moments are computed (`conditional_issuance_size`, `autocorr_equity_issuance`, `crosscorr_leverage_issuance`, `default_frequency` when $c_{\text{def}}$ is calibrated) and reported alongside the active set, but excluded from the SMM objective. These appear in the panel-moments output for comparison but never enter $Q(\beta)$.
+- **API toggle:** Pass `disabled_moments=[...]` to `RiskyDebtEnv.make_smm_spec()` to exclude any moment from the active set without removing it from the registry. Validation ensures the remaining active set still satisfies $R \geq K$.
+- **Overidentifying:** With all 7 parameters estimated and 11 active moments, $R - K = 4$ overidentifying restrictions allow for the $J$-test. When parameters are calibrated externally (e.g., $c_{\text{def}}$), moments tagged solely to those parameters are auto-dropped, preserving the overidentifying margin.
+- **Cost:** Each candidate $\beta$ requires a full nested VFI solve to obtain the optimal policy $\pi(\cdot;\beta)$. Computing all 14 moments per panel adds negligible overhead relative to the solver.
 
 For the SMM validation via Monte Carlo, I choose the following set of params for the fixed "truth" and verify whether my SMM estimation can obtain $\hat \beta \approx \beta_0$.
 

@@ -36,10 +36,16 @@ from src.v2.estimation.smm import (
     _panel_serial_correlation,
 )
 from src.v2.environments.base import MDPEnvironment
-from src.v2.solvers import NestedVFIConfig, solve_nested_vfi, solve_risky_debt
+from src.v2.solvers import (
+    NestedVFIConfig,
+    RiskyDebtSolverConfig,
+    solve_nested_vfi,
+    solve_risky_debt,
+)
 
 # Type alias for solver callables: fn(env, config=...) -> dict
 SolverFn = Any
+SolverConfig = NestedVFIConfig | RiskyDebtSolverConfig
 
 
 @dataclass(frozen=True)
@@ -520,13 +526,16 @@ class RiskyDebtEnv(MDPEnvironment):
             "conditional_issuance_size",
             "autocorr_equity_issuance",
             "crosscorr_leverage_issuance",
-            "avg_net_debt_assets",
-            "std_leverage",
+            "book_leverage",
+            "cov_leverage_investment",
+            "mean_investment_assets",
             "serial_corr_investment",
             "var_investment_assets",
             "income_ar1_beta",
             "income_ar1_resid_std",
             "default_frequency",
+            "frequency_equity_issuance",
+            "corr_issuance_investment",
         )
 
     def smm_default_bounds(self) -> tuple[tuple[float, float], ...]:
@@ -573,18 +582,23 @@ class RiskyDebtEnv(MDPEnvironment):
 
     def make_smm_spec(
         self,
-        solver_config: NestedVFIConfig | None = None,
+        solver_config: SolverConfig | None = None,
         initial_guess: Sequence[float] | None = None,
         bounds: Sequence[Sequence[float]] | None = None,
         estimated_params: Sequence[str] | None = None,
         solver_fn: SolverFn | None = None,
+        disabled_moments: Sequence[str] | None = None,
     ) -> SMMSpec:
         """Build the generic SMM specification owned by this environment.
 
         Args:
-            solver_config: Nested VFI settings used inside the optimizer
-                           loop.  Each evaluate_beta call re-solves the
-                           model — this is the dominant cost per iteration.
+            solver_config: Risky-debt solver settings used inside the optimizer
+                           loop.  Passing ``NestedVFIConfig`` selects
+                           ``solve_nested_vfi``; passing
+                           ``RiskyDebtSolverConfig`` (or leaving this as
+                           ``None``) selects ``solve_risky_debt``. Each
+                           evaluate_beta call re-solves the model — this is
+                           the dominant cost per iteration.
             initial_guess: Starting point for the optimizer.  Defaults to
                            the midpoint of each parameter's bounds.
             bounds:        Search region for each parameter.  Defaults to
@@ -598,7 +612,17 @@ class RiskyDebtEnv(MDPEnvironment):
                            estimated parameter are included.  Defaults to
                            all 7 parameters (full estimation).
             solver_fn:     Callable ``fn(env, config=...) -> dict`` used to
-                           solve the model.  Defaults to ``solve_nested_vfi``.
+                           solve the model.  Defaults are inferred from
+                           ``solver_config``.
+            disabled_moments:
+                           Moment names to exclude from the SMM objective
+                           even when they would otherwise be auto-selected.
+                           These moments remain defined in the registry and
+                           are still computed by ``compute_smm_panel_moments``
+                           (so they appear in diagnostic outputs), but the
+                           optimizer never sees them.  Use to test alternative
+                           moment sets without removing code.  Must contain
+                           valid moment names from ``smm_moment_names()``.
         """
         # --- Resolve estimated params and select moments ----------------
         if estimated_params is not None:
@@ -613,10 +637,34 @@ class RiskyDebtEnv(MDPEnvironment):
             est_params = _ALL_PARAM_NAMES
 
         selected_moments, moment_indices = _select_moments(est_params)
+
+        # --- Apply user-supplied disabled_moments filter ----------------
+        if disabled_moments:
+            disabled_set = set(disabled_moments)
+            unknown_m = disabled_set - set(_ALL_MOMENT_NAMES)
+            if unknown_m:
+                raise ValueError(
+                    f"Unknown moment name(s) in disabled_moments: "
+                    f"{sorted(unknown_m)}. "
+                    f"Valid names: {_ALL_MOMENT_NAMES}"
+                )
+            kept = [
+                (m, i) for m, i in zip(selected_moments, moment_indices)
+                if m not in disabled_set
+            ]
+            if kept:
+                selected_moments, moment_indices = (
+                    tuple(m for m, _ in kept),
+                    tuple(i for _, i in kept),
+                )
+            else:
+                selected_moments, moment_indices = (), ()
+
         if len(selected_moments) < len(est_params):
             raise ValueError(
                 f"Underidentified: {len(est_params)} estimated parameters "
-                f"but only {len(selected_moments)} moments auto-selected. "
+                f"but only {len(selected_moments)} moments active "
+                f"(after applying disabled_moments). "
                 f"Need at least as many moments as parameters."
             )
 
@@ -640,8 +688,7 @@ class RiskyDebtEnv(MDPEnvironment):
         else:
             guess = np.asarray(initial_guess, dtype=np.float64)
 
-        solver_config = solver_config or NestedVFIConfig()
-        _solver_fn = solver_fn or solve_risky_debt
+        solver_config, _solver_fn = _resolve_smm_solver(solver_config, solver_fn)
         midx = list(moment_indices)  # for numpy fancy indexing
 
         # --- Closures ---------------------------------------------------
@@ -701,13 +748,13 @@ class RiskyDebtEnv(MDPEnvironment):
         beta: Sequence[float],
         run_config: SMMRunConfig,
         seed: tuple[int, int],
-        solver_config: NestedVFIConfig | None = None,
+        solver_config: SolverConfig | None = None,
         solved_result: dict[str, Any] | None = None,
         solver_fn: SolverFn | None = None,
     ) -> "RiskyDebtSMMPanelData":
         """Solve the candidate model and return raw simulated panel data."""
 
-        _solver_fn = solver_fn or solve_risky_debt
+        solver_config, _solver_fn = _resolve_smm_solver(solver_config, solver_fn)
         candidate_env = _risky_debt_env_from_beta(self, beta)
         solved = solved_result
         if solved is None:
@@ -759,7 +806,7 @@ class RiskyDebtEnv(MDPEnvironment):
         beta: Sequence[float],
         run_config: SMMRunConfig,
         seed: tuple[int, int],
-        solver_config: NestedVFIConfig | None = None,
+        solver_config: SolverConfig | None = None,
         solved_result: dict[str, Any] | None = None,
         solver_fn: SolverFn | None = None,
     ) -> SMMPanelMoments:
@@ -773,7 +820,7 @@ class RiskyDebtEnv(MDPEnvironment):
             solved_result: Optional pre-computed solver output.  When
                            provided, skips the model solve entirely.
             solver_fn:     Callable ``fn(env, config=...) -> dict``.
-                           Defaults to ``solve_nested_vfi``.
+                           Defaults are inferred from ``solver_config``.
         """
         panel_data = self.simulate_smm_panel_data(
             beta=beta,
@@ -800,7 +847,7 @@ class RiskyDebtEnv(MDPEnvironment):
         beta: Sequence[float],
         run_config: SMMRunConfig,
         seed: tuple[int, int],
-        solver_config: NestedVFIConfig | None = None,
+        solver_config: SolverConfig | None = None,
         solver_fn: SolverFn | None = None,
     ) -> SMMTargetMoments:
         """Simulate a fake-real target-moment vector from the model.
@@ -895,13 +942,41 @@ _ALL_MOMENT_NAMES: tuple[str, ...] = (
     "conditional_issuance_size",
     "autocorr_equity_issuance",
     "crosscorr_leverage_issuance",
-    "avg_net_debt_assets",
-    "std_leverage",
+    "book_leverage",
+    "cov_leverage_investment",
+    "mean_investment_assets",
     "serial_corr_investment",
     "var_investment_assets",
     "income_ar1_beta",
     "income_ar1_resid_std",
     "default_frequency",
+    "frequency_equity_issuance",
+    "corr_issuance_investment",
+)
+
+# Unused moment candidates — defined here for documentation but NOT computed
+# by ``_compute_smm_panel_moments`` and NOT exposed via the SMM spec.
+#
+#   "avg_net_debt_assets"     was  E[debt_market / (V + debt_market)]
+#                             (market-value leverage; mislabeled vs H&W's
+#                             book "net debt to assets" which is E[b'/k]).
+#                             Replaced by ``book_leverage`` = E[b'/k].
+#   "std_leverage"            was  Std(market-value leverage).  Replaced by
+#                             ``cov_leverage_investment`` = Cov(b'/k, I/k),
+#                             H&W's pecking-order moment for c_def.
+#   "frequency_negative_debt" was  Pr(b' < 0).  Always zero under
+#                             ``solve_risky_debt(adaptive=True)`` because
+#                             the adaptive solver shrinks the b-grid to
+#                             the default-risk region (b' > 0 only), and
+#                             simulation clamps b_next to that tight grid.
+#                             A dead moment would create a zero row in
+#                             Omega_hat, making it singular.  Removed
+#                             entirely since adaptive is the production
+#                             default.
+_UNUSED_MOMENT_CANDIDATES: tuple[str, ...] = (
+    "avg_net_debt_assets",
+    "std_leverage",
+    "frequency_negative_debt",
 )
 
 # For each moment, which structural parameters it primarily helps identify.
@@ -913,13 +988,16 @@ _MOMENT_PARAM_TAGS: dict[str, tuple[str, ...]] = {
     "conditional_issuance_size":   ("eta0", "eta1"),
     "autocorr_equity_issuance":    ("eta0", "eta1"),
     "crosscorr_leverage_issuance": ("c_def", "eta0", "eta1"),
-    "avg_net_debt_assets":         ("alpha", "c_def"),
-    "std_leverage":                ("c_def", "sigma_epsilon"),
+    "book_leverage":               ("c_def",),
+    "cov_leverage_investment":     ("c_def",),
+    "mean_investment_assets":      ("alpha",),
     "serial_corr_investment":      ("rho", "psi1"),
     "var_investment_assets":       ("psi1", "sigma_epsilon"),
     "income_ar1_beta":             ("rho",),
     "income_ar1_resid_std":        ("sigma_epsilon",),
     "default_frequency":           ("c_def",),
+    "frequency_equity_issuance":   ("eta0",),
+    "corr_issuance_investment":    ("eta0", "eta1"),
 }
 
 
@@ -939,6 +1017,30 @@ def _select_moments(
             selected.append(m)
             indices.append(i)
     return tuple(selected), tuple(indices)
+
+
+def _resolve_smm_solver(
+    solver_config: SolverConfig | None,
+    solver_fn: SolverFn | None,
+) -> tuple[SolverConfig, SolverFn]:
+    """Resolve the risky-debt SMM solver/config pair.
+
+    ``NestedVFIConfig`` is kept for legacy tests and raw-grid diagnostics.
+    ``RiskyDebtSolverConfig`` is the production notebook path.
+    """
+
+    if solver_fn is None:
+        if solver_config is None:
+            return RiskyDebtSolverConfig(), solve_risky_debt
+        if isinstance(solver_config, NestedVFIConfig):
+            return solver_config, solve_nested_vfi
+        return solver_config, solve_risky_debt
+
+    if solver_config is None:
+        if solver_fn is solve_nested_vfi:
+            return NestedVFIConfig(), solver_fn
+        return RiskyDebtSolverConfig(), solver_fn
+    return solver_config, solver_fn
 
 
 def _env_param_values(env: RiskyDebtEnv) -> dict[str, float]:
@@ -1159,23 +1261,29 @@ def _compute_smm_panel_moments(
     env: RiskyDebtEnv,
     panel_data: RiskyDebtSMMPanelData,
 ) -> tuple[np.ndarray, dict[str, Any]]:
-    """Compute the 11 risky-debt SMM moments for each simulated panel.
+    """Compute the 14 risky-debt SMM moments for each simulated panel.
 
     Moment ordering (must match ``smm_moment_names``):
       0  avg_equity_issuance_assets    E[max(0,-e)/k]
       1  conditional_issuance_size     E[max(0,-e)/k | e<0]
       2  autocorr_equity_issuance      Corr(iss_t, iss_{t-1})
       3  crosscorr_leverage_issuance   Corr(lev_t, iss_{t+1})
-      4  avg_net_debt_assets           E[leverage]
-      5  std_leverage                  Std(leverage)
-      6  serial_corr_investment        Corr(I/k_t, I/k_{t-1})
-      7  var_investment_assets         Var(I/k)
-      8  income_ar1_beta               IV first-diff AR(1) beta
-      9  income_ar1_resid_std          IV first-diff AR(1) resid std
-     10  default_frequency             Pr(V = 0)
+      4  book_leverage                 E[b'/k]               [H&W 2007]
+      5  cov_leverage_investment       Cov(b'/k, I/k)        [H&W 2007]
+      6  mean_investment_assets        E[I/k]                [H&W 2007]
+      7  serial_corr_investment        Corr(I/k_t, I/k_{t-1})
+      8  var_investment_assets         Var(I/k)
+      9  income_ar1_beta               IV first-diff AR(1) beta
+     10  income_ar1_resid_std          IV first-diff AR(1) resid std
+     11  default_frequency             Pr(V = 0)
+     12  frequency_equity_issuance     Pr(e < 0)              [H&W 2007]
+     13  corr_issuance_investment      Corr(max(0,-e)/k, I/k) [H&W 2007, scale-stabilised]
+
+    See ``_UNUSED_MOMENT_CANDIDATES`` for moments retained as documentation
+    but not computed.
     """
     n_panels = panel_data.k.shape[0]
-    panel_moments = np.zeros((n_panels, 11), dtype=np.float64)
+    panel_moments = np.zeros((n_panels, 14), dtype=np.float64)
     payout_mean = np.zeros(n_panels, dtype=np.float64)
     payout_var = np.zeros(n_panels, dtype=np.float64)
 
@@ -1186,7 +1294,9 @@ def _compute_smm_panel_moments(
     payout_ratio = np.maximum(0.0, panel_data.cash_flow) / safe_k
     debt_market = panel_data.b_next * panel_data.debt_discount
     asset_value = np.maximum(panel_data.value + debt_market, 1e-8)
-    leverage = debt_market / asset_value
+    leverage = debt_market / asset_value           # market-value leverage; used by
+                                                   # crosscorr_leverage_issuance
+    book_leverage_arr = panel_data.b_next / safe_k  # H&W "net debt to assets" = b'/k
     log_income_ratio = np.log(
         np.maximum(panel_data.z * np.power(safe_k, env.econ.production_elasticity - 1.0), 1e-12)
     )
@@ -1221,16 +1331,24 @@ def _compute_smm_panel_moments(
         else:
             crosscorr_lev_iss = 0.0
 
-        # [4] Avg leverage
-        avg_lev = float(np.mean(leverage_panel))
+        # [4] H&W "net debt to assets" — book leverage E[b'/k].  The natural
+        # identifier for c_def: high default cost shrinks equilibrium debt.
+        book_lev_panel = book_leverage_arr[idx]
+        book_lev = float(np.mean(book_lev_panel))
 
-        # [5] Std leverage (cross-sectional + time)
-        std_lev = float(np.std(leverage_panel))
+        # [5] H&W pecking-order moment Cov(b'/k, I/k).  Captures how firms
+        # use debt to fund investment; large positive cov ⇒ low default
+        # cost (debt is cheap), weak cov ⇒ high default cost.
+        cov_lev_inv = _panel_covariance(book_lev_panel, invest_panel)
 
-        # [6] Serial correlation of investment
+        # [6] Mean investment / assets — H&W 2007 primary identifier for
+        # alpha (production curvature scales the equilibrium investment rate).
+        mean_inv = float(np.mean(invest_panel))
+
+        # [7] Serial correlation of investment
         serial_corr_inv = _panel_serial_correlation(invest_panel)
 
-        # [7] Var of investment / assets
+        # [8] Var of investment / assets
         var_inv = float(np.var(invest_panel))
 
         # [8-9] AR(1) on log income/asset ratio (same as basic model)
@@ -1240,19 +1358,41 @@ def _compute_smm_panel_moments(
         value_panel = panel_data.value[idx]  # (n_firms, horizon)
         default_freq = float(np.mean(value_panel <= 0.0))
 
+        # [11] Frequency of equity issuance: Pr(e < 0).  H&W 2007's direct
+        # identifier for the fixed equity-issuance cost (eta0): a large fixed
+        # cost makes flotations infrequent.
+        freq_eq_iss = float(np.mean(panel_data.cash_flow[idx] < 0.0))
+
+        # [12] Correlation of equity issuance and investment.  H&W 2007's
+        # pecking-order moment; we use the correlation (not covariance) to
+        # avoid pathological Omega_hat conditioning — Cov(Iss, I) has
+        # intrinsic population variance O(1e-8) because both Iss and I are
+        # near-zero for most firm-years, which would make Omega singular
+        # regardless of sample size.  Corr is bounded in [-1, 1].
+        iss_c = issue_panel - np.mean(issue_panel)
+        inv_c = invest_panel - np.mean(invest_panel)
+        denom_iss_inv = np.sqrt(np.mean(iss_c ** 2) * np.mean(inv_c ** 2))
+        corr_iss_inv = (
+            float(np.mean(iss_c * inv_c) / denom_iss_inv)
+            if denom_iss_inv > 1e-12 else 0.0
+        )
+
         panel_moments[idx, :] = np.array(
             [
                 avg_iss,
                 cond_iss,
                 autocorr_iss,
                 crosscorr_lev_iss,
-                avg_lev,
-                std_lev,
+                book_lev,
+                cov_lev_inv,
+                mean_inv,
                 serial_corr_inv,
                 var_inv,
                 ar_beta,
                 ar_sigma,
                 default_freq,
+                freq_eq_iss,
+                corr_iss_inv,
             ],
             dtype=np.float64,
         )

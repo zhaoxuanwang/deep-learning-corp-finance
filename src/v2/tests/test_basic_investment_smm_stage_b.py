@@ -275,5 +275,8 @@ def test_stage_b_solve_smm_smoke_returns_finite_results(stage_b_env, solver_conf
 
     assert result.beta_hat.shape == (4,)
     assert np.all(np.isfinite(result.beta_hat))
-    assert np.isfinite(result.j_statistic)
+    if result.j_test_valid:
+        assert np.isfinite(result.j_statistic)
+    else:
+        assert np.isnan(result.j_statistic)
     assert result.stage2.panel_moments.shape[1] == 5

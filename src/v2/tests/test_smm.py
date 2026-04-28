@@ -26,7 +26,11 @@ from src.v2.environments.risky_debt import (
     _simulate_smm_panel_data,
     _uniforms_to_standard_normal,
 )
-from src.v2.estimation.smm import _panel_iv_first_diff_ar1, _panel_serial_correlation
+from src.v2.estimation.smm import (
+    _panel_covariance,
+    _panel_iv_first_diff_ar1,
+    _panel_serial_correlation,
+)
 from src.v2.solvers import NestedVFIConfig, NestedVFIGridConfig, solve_nested_vfi
 from src.v2.utils.seeding import fold_in_seed, make_seed_int
 
@@ -246,6 +250,33 @@ def test_risky_debt_make_smm_spec_exposes_env_authority(small_risky_debt_setup):
     assert spec.moment_names == env.smm_moment_names()
     assert spec.bounds == env.smm_default_bounds()
     np.testing.assert_allclose(spec.initial_guess, custom_guess, atol=1e-12)
+
+
+def test_risky_debt_make_smm_spec_validates_disabled_moments(small_risky_debt_setup):
+    env, solver_config, _ = small_risky_debt_setup
+
+    spec = env.make_smm_spec(
+        solver_config=solver_config,
+        estimated_params=("eta0",),
+        disabled_moments=("conditional_issuance_size", "autocorr_equity_issuance"),
+    )
+
+    assert "conditional_issuance_size" not in spec.moment_names
+    assert "autocorr_equity_issuance" not in spec.moment_names
+    assert "frequency_equity_issuance" in spec.moment_names
+
+    with pytest.raises(ValueError, match="Unknown moment name"):
+        env.make_smm_spec(
+            solver_config=solver_config,
+            disabled_moments=("not_a_moment",),
+        )
+
+    with pytest.raises(ValueError, match="Underidentified"):
+        env.make_smm_spec(
+            solver_config=solver_config,
+            estimated_params=("alpha",),
+            disabled_moments=("mean_investment_assets",),
+        )
 
 
 def test_risky_debt_panel_simulation_respects_seed_and_burn_in(small_risky_debt_setup):
@@ -493,18 +524,41 @@ def test_risky_debt_moments_use_cash_flow_and_ratio_construction(small_risky_deb
     denom_cc = np.sqrt(np.mean(lev_c ** 2) * np.mean(iss_c ** 2))
     crosscorr = float(np.mean(lev_c * iss_c) / denom_cc) if denom_cc > 1e-12 else 0.0
 
+    # Default frequency: fraction of firm-periods with V <= 0
+    default_freq = float(np.mean(panel_data.value[0] <= 0.0))
+
+    # H&W 2007 leverage moments (book leverage = b'/k; pecking order = Cov)
+    book_lev_panel = panel_data.b_next[0] / safe_k
+    book_lev = float(np.mean(book_lev_panel))
+    cov_lev_inv = _panel_covariance(book_lev_panel, investment_ratio)
+
+    # H&W 2007 issuance moments (correlation, not covariance — avoids
+    # pathological Omega conditioning from the tiny Cov population variance)
+    freq_eq_iss = float(np.mean(panel_data.cash_flow[0] < 0.0))
+    iss_c = issuance_ratio - np.mean(issuance_ratio)
+    inv_c = investment_ratio - np.mean(investment_ratio)
+    denom_iss_inv = np.sqrt(np.mean(iss_c ** 2) * np.mean(inv_c ** 2))
+    corr_iss_inv = (
+        float(np.mean(iss_c * inv_c) / denom_iss_inv)
+        if denom_iss_inv > 1e-12 else 0.0
+    )
+
     manual_moments = np.array(
         [
             np.mean(issuance_ratio),
             cond_iss,
             autocorr_iss,
             crosscorr,
-            np.mean(leverage),
-            np.std(leverage),
+            book_lev,
+            cov_lev_inv,
+            np.mean(investment_ratio),
             _panel_serial_correlation(investment_ratio),
             np.var(investment_ratio),
             manual_beta,
             manual_sigma,
+            default_freq,
+            freq_eq_iss,
+            corr_iss_inv,
         ],
         dtype=np.float64,
     )
@@ -574,7 +628,7 @@ def test_risky_debt_smm_smoke_validation_runs(small_risky_debt_setup):
         n_firms=2,
         horizon=3,
         burn_in=1,
-        n_sim_panels=11,
+        n_sim_panels=15,
         global_method="Powell",
         optimizer_maxiter=1,
     )

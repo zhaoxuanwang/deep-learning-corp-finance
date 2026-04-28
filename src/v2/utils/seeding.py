@@ -9,8 +9,17 @@ derive deterministic sub-seeds for distinct tasks such as:
 - BRM critic warm-start shuffling
 - notebook/runtime seeding
 
-Strict reproducibility beyond these routine controls (for example deterministic
-TensorFlow kernels on a fixed device) remains optional.
+Standard mode (default) covers all of the above plus seeding Python's `random`,
+NumPy, and Keras RNGs via `seed_runtime`. It is sufficient to make data, NN
+initialization, and mini-batch order bit-identical across runs on the same
+machine.
+
+Strict mode (`strict_reproducibility=True` in `seed_runtime`) additionally
+calls `tf.config.experimental.enable_op_determinism()`, which forces
+deterministic TensorFlow kernels (parallel reductions, GPU/Metal ops, certain
+`tf.matmul` paths). This is needed for bit-identical training trajectories
+(not just data) and incurs a non-trivial throughput cost; it is intended for
+paper-grade reruns and debugging rather than routine training.
 """
 
 from __future__ import annotations

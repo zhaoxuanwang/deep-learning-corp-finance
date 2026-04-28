@@ -51,5 +51,6 @@ checkpoints/
 *.nav
 *.snm
 *.vrb
+*.typ
 *_files/
 .quarto/
