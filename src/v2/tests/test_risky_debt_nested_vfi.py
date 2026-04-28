@@ -164,6 +164,51 @@ def test_solver_stops_on_inner_nonconvergence(env):
     assert not result["converged_inner"]
 
 
+def test_autarky_init_avoids_spurious_instant_convergence():
+    """With autarky initialization, the solver should iterate through
+    multiple outer loops even on a narrow grid — not converge instantly
+    to a risk-free fixed point as the old r_free initialization did.
+
+    For these parameters the true equilibrium has no default (the grid
+    is too narrow), but the solver must *discover* this through genuine
+    pricing iteration, not skip it via a self-fulfilling initialization.
+    """
+    env = RiskyDebtEnv(
+        econ_params=EconomicParams(
+            interest_rate=0.04,
+            depreciation_rate=0.15,
+            production_elasticity=0.70,
+            cost_convex=0.05,
+            tax=0.30,
+            default_haircut=0.45,
+            cost_inject_fixed=0.50,
+            cost_inject_linear=0.10,
+        ),
+        shock_params=ShockParams(mu=0.0, rho=0.70, sigma=0.15),
+        k_min_mult=0.10,
+        k_max_mult=1.20,
+        b_max_mult=1.50,
+        b_min_mult=0.40,
+    )
+    config = NestedVFIConfig(
+        grid=NestedVFIGridConfig(exo_sizes=[25], endo_sizes=[20, 20]),
+        max_iter_inner=500,
+        max_iter_outer=200,
+    )
+
+    result = solve_nested_vfi(env, config=config)
+
+    assert result["stop_reason"] == "converged_outer_value"
+    assert result["n_outer"] > 1, "Should iterate, not converge instantly"
+    assert not result["risk_free_fixed_point"], (
+        "Autarky init should avoid the spurious instant-convergence fixed point"
+    )
+    # The final equilibrium may or may not have default — that depends
+    # on the economics and grid, not the initialization.  What matters
+    # is that the solver explored the default region before concluding.
+    assert result["risk_free_equilibrium"] is True or np.any(result["default_mask"])
+
+
 def test_nested_vfi_reward_tensor_has_expected_shape(env):
     grids = _build_nested_vfi_grids(
         env,

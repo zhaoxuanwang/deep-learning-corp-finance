@@ -150,14 +150,112 @@ negligible impact.
 
 For problems with `endo_dim > 1` or `action_dim > 1`, per-variable 1-D
 grids are combined into Cartesian product grids.  The value function is
-indexed by a flat product-grid index.  The endogenous next-state $k'$
-from `env.endogenous_transition()` is snapped to the nearest
-product-grid point via Euclidean distance.
+indexed by a flat product-grid index (row-major / C-order).  The
+endogenous next-state from `env.endogenous_transition()` generally
+falls between grid points and is handled according to the
+`interpolation` mode (see Section 3a).
 
 This supports moderate dimensionality (e.g., the risky debt model with
 2 endogenous variables $k, b$ and 2 action variables $I, b'$), but grid
 sizes grow exponentially: $m$ points per variable and $d$ variables
 yields $m^d$ product-grid points.
+
+## 3a. Continuation-Value Interpolation
+
+When the endogenous transition $k' = f(k, a, z)$ lands between grid
+points, there are two strategies for evaluating the continuation value
+$V(z', k')$.  The solver exposes this choice via the `interpolation`
+config parameter.
+
+### Snap-to-grid (`interpolation="none"`)
+
+The baseline approach.  $k'$ is rounded to the nearest product-grid
+point $k_{\text{near}}$ and the continuation is simply:
+
+$$V_{\text{snap}}(z', k') = V(z', k_{\text{near}})$$
+
+This is exact on the grid but introduces discretization error
+proportional to the grid spacing $\Delta k$.  The Bellman max can
+exploit this: when two actions map to the same nearest grid point, the
+one whose true $k'$ is higher is indistinguishable from the lower one,
+creating a systematic upward bias.
+
+### Linear / N-linear interpolation (`interpolation="auto"` or `"linear"`)
+
+Computes the continuation value by interpolating $V$ between the
+bracketing grid points.  This eliminates the snap-to-grid bias and
+allows coarser grids to achieve accuracy comparable to much finer
+snap-to-grid solves.
+
+**1-D endogenous state.**  For a single endogenous variable (e.g.,
+capital $k$), the next-state $k'$ falls between two adjacent grid
+points $k_{\ell}$ and $k_{\ell+1}$.  Define the interpolation fraction:
+
+$$f = \frac{k' - k_\ell}{k_{\ell+1} - k_\ell}, \quad f \in [0, 1]$$
+
+The interpolated continuation value is:
+
+$$V_{\text{interp}}(z', k') = (1 - f) \cdot V(z', k_\ell) \;+\; f \cdot V(z', k_{\ell+1})$$
+
+This is standard linear interpolation.  It is used whenever
+`endo_dim = 1` and `interpolation` is `"auto"` or `"linear"`.
+
+**Multi-D endogenous state (N-linear interpolation).**  For $D \geq 2$
+endogenous variables $(x_0, x_1, \ldots, x_{D-1})$, the next state
+falls inside a $D$-dimensional hypercube cell.  Each variable $d$ is
+independently bracketed:
+
+$$x'_d \in [x_{d,\ell_d},\; x_{d,\ell_d + 1}], \quad
+  f_d = \frac{x'_d - x_{d,\ell_d}}{x_{d,\ell_d + 1} - x_{d,\ell_d}} \in [0, 1]$$
+
+The interpolated value is the weighted sum over all $2^D$ corner
+vertices of the hypercube:
+
+$$V_{\text{interp}}(z', x') = \sum_{c \,\in\, \{0,1\}^D}
+  \left(\prod_{d=0}^{D-1} w_d(c_d)\right) \cdot
+  V\!\left(z',\; \text{flat}(i_0(c_0), \ldots, i_{D-1}(c_{D-1}))\right)$$
+
+where for each dimension $d$ and corner bit $c_d$:
+
+$$w_d(c_d) = \begin{cases} 1 - f_d & \text{if } c_d = 0 \\ f_d & \text{if } c_d = 1 \end{cases}, \qquad
+  i_d(c_d) = \begin{cases} \ell_d & \text{if } c_d = 0 \\ \ell_d + 1 & \text{if } c_d = 1 \end{cases}$$
+
+The flat product-grid index is computed via row-major strides:
+
+$$\text{flat}(i_0, \ldots, i_{D-1}) = \sum_{d=0}^{D-1} i_d \cdot s_d,
+  \quad s_d = \prod_{j=d+1}^{D-1} n_j$$
+
+For $D = 2$ (bilinear), this sums over 4 corners.  For $D = 3$
+(trilinear), 8 corners.  The cost per Bellman step grows as $2^D$
+relative to snap-to-grid, but for $D \leq 3$ this is negligible
+compared to the action-maximization loop.
+
+### Mode selection
+
+| `interpolation` | Behavior |
+|-----------------|----------|
+| `"auto"` (default) | Use interpolation when per-variable 1-D grids are available; fall back to snap-to-grid otherwise. |
+| `"linear"` | Same as `"auto"`. Provided for explicitness. |
+| `"none"` | Always snap to nearest grid point (brute-force baseline). |
+
+Both VFI and PFI support the same three modes via `VFIConfig.interpolation`
+and `PFIConfig.interpolation`.  The mode applies to:
+- VFI: each Bellman maximization step.
+- PFI: both the policy evaluation inner loop and the policy improvement step.
+
+### Precomputation
+
+The interpolation data is computed once during table precomputation
+(before the iteration loop begins) and stored alongside the reward and
+transition tables:
+
+- **1-D:** `trans_lo` (lower bracket index) and `trans_frac`
+  (interpolation fraction), each shape `(n_exo, n_endo, n_action)`.
+- **Multi-D:** `trans_lo_d` and `trans_frac_d` for each variable $d$,
+  same shape; plus `endo_var_sizes = [n_0, n_1, \ldots]`.
+
+When `interpolation="none"`, this precomputed data is present but
+ignored — only the snap-to-grid `trans_idx` is used.
 
 ## 4. Data Pipeline Integration
 
@@ -199,6 +297,7 @@ should override explicitly.
 |-----------|---------|-------|
 | `tol` | $10^{-6}$ | Sup-norm convergence tolerance. |
 | `max_iter` | 2000 | Sufficient for $\gamma \leq 0.97$ with small grids. |
+| `interpolation` | `"auto"` | `"auto"`, `"linear"`, or `"none"`. See Section 3a. |
 
 ### PFI configuration (`PFIConfig`)
 
@@ -206,6 +305,7 @@ should override explicitly.
 |-----------|---------|-------|
 | `max_iter` | 200 | Maximum policy improvement steps. |
 | `eval_steps` | 400 | Bellman evaluations per policy evaluation. |
+| `interpolation` | `"auto"` | `"auto"`, `"linear"`, or `"none"`. See Section 3a. |
 
 ## 6. Usage Reference
 
@@ -268,16 +368,21 @@ improvement steps (typically 5–20 steps).
   approximately $d \leq 4$ (e.g., $z, k, b, b'$) with moderate grid
   sizes.
 
-- **Discretization error.**  The nearest-neighbor snapping of $k'$ to
-  the grid introduces approximation error proportional to the grid
-  spacing.  Log grids mitigate this by concentrating points where the
-  value function has the most curvature, but the error is always
-  nonzero.
+- **Discretization error.**  With `interpolation="none"`, the
+  nearest-neighbor snapping of $k'$ to the grid introduces
+  approximation error proportional to the grid spacing $\Delta k$.
+  With `interpolation="auto"` (default), linear / N-linear
+  interpolation of the continuation value eliminates this bias,
+  allowing coarser grids to achieve accuracy comparable to much finer
+  snap-to-grid solves (see Section 3a).  Log grids further concentrate
+  points where the value function has the most curvature.
 
-- **No function approximation.**  The policy is a lookup table on the
-  grid, not a smooth function.  Interpolating between grid points for
-  evaluation at off-grid states requires post-processing (not currently
-  implemented).
+- **No off-grid function approximation.**  The policy is a lookup table
+  on the grid, not a smooth function.  Querying the value or policy at
+  arbitrary off-grid states requires external post-processing (e.g.,
+  scipy interpolation on the output arrays).  The interpolation mode
+  only affects the *solver's internal* continuation value — it does not
+  produce a callable interpolant for downstream use.
 
 - **Transition estimation quality.**  The Markov matrix $P(z' \mid z)$
   is estimated from binned observations.  With very few exogenous grid

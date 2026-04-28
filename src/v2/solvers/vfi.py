@@ -189,12 +189,17 @@ def _precompute_tables(
 def _bellman_step(
     v_curr: tf.Tensor,
     tables: Dict[str, tf.Tensor],
+    interp_mode: str = "auto",
 ) -> tuple:
     """One Bellman operator application.
 
     Args:
-        v_curr: Value function, shape (n_exo, n_endo).
-        tables: Precomputed tables from _precompute_tables.
+        v_curr:      Value function, shape (n_exo, n_endo).
+        tables:      Precomputed tables from _precompute_tables.
+        interp_mode: "auto" | "linear" | "none".  Controls how the
+                     continuation value V(z', endo_next) is computed:
+                     - "auto"/"linear": use interpolation when available.
+                     - "none": snap to nearest grid point (brute-force).
 
     Returns:
         (v_next, policy_idx):
@@ -209,28 +214,66 @@ def _bellman_step(
     reward   = tables["reward"]        # (n_exo, n_endo, n_action)
     trans    = tables["trans_idx"]     # (n_exo, n_endo, n_action)
 
+    # --- Determine interpolation strategy ---
+    #
     # Expected continuation: E[V(z', k')] for each (z, k, a)
     # EV[z, k, a] = sum_{z'} P(z, z') * V(z', trans[z, k, a])
     #
-    # When trans_lo / trans_frac are available (1D endo), linearly interpolate
-    # V between the two bracketing endo grid points instead of snapping to the
-    # nearest one.  This removes the systematic upward bias caused by the
-    # Bellman max selecting actions whose snapped k' overshoots.
+    # Three paths:
+    #   1D interp:  V_interp = (1-f)*V[z',lo] + f*V[z',hi]
+    #   N-D interp: V_interp = sum over 2^D hypercube corners, weighted
+    #               by products of per-variable fractions (see docs).
+    #   Snap:       V_snap = V[z', nearest]
     #
-    # Loop over z' to avoid materializing the full (n_exo, n_exo, n_endo, n_action)
-    # tensor, which would OOM for large grids. Memory per iteration: O(n_endo*n_action).
-    use_interp = "trans_lo" in tables
-    if use_interp:
+    # Loop over z' to avoid materializing (n_exo, n_exo, n_endo, n_action).
+    use_snap = (interp_mode == "none")
+    has_1d = "trans_lo" in tables
+    has_nd = "trans_lo_0" in tables
+
+    use_interp_1d = (not use_snap) and has_1d
+    use_interp_nd = (not use_snap) and (not has_1d) and has_nd
+
+    if use_interp_1d:
         trans_lo   = tables["trans_lo"]     # (n_exo, n_endo, n_action) int32
         trans_frac = tables["trans_frac"]   # (n_exo, n_endo, n_action) float32
         trans_hi   = tf.minimum(trans_lo + 1, n_endo - 1)
 
+    if use_interp_nd:
+        endo_var_sizes = tables["endo_var_sizes"]  # [n_0, n_1, ...]
+        endo_dim_count = len(endo_var_sizes)
+        # Row-major strides: stride[d] = prod(n_{d+1}, ..., n_{D-1})
+        nd_strides = [0] * endo_dim_count
+        nd_strides[-1] = 1
+        for d in range(endo_dim_count - 2, -1, -1):
+            nd_strides[d] = nd_strides[d + 1] * endo_var_sizes[d + 1]
+        lo_d = [tables[f"trans_lo_{d}"] for d in range(endo_dim_count)]
+        frac_d = [tables[f"trans_frac_{d}"] for d in range(endo_dim_count)]
+        hi_d = [tf.minimum(lo_d[d] + 1, endo_var_sizes[d] - 1)
+                for d in range(endo_dim_count)]
+
     ev = tf.zeros([n_exo, n_endo, n_action], dtype=v_curr.dtype)
     for zp in range(n_exo):
-        if use_interp:
+        if use_interp_1d:
             v_lo = tf.gather(v_curr[zp], trans_lo)   # (n_exo, n_endo, n_action)
             v_hi = tf.gather(v_curr[zp], trans_hi)
             v_zp = (1.0 - trans_frac) * v_lo + trans_frac * v_hi
+        elif use_interp_nd:
+            # N-linear interpolation over 2^D hypercube corners.
+            v_zp = tf.zeros([n_exo, n_endo, n_action], dtype=v_curr.dtype)
+            for corner in range(1 << endo_dim_count):
+                weight = tf.ones([n_exo, n_endo, n_action], dtype=v_curr.dtype)
+                flat_idx = tf.zeros([n_exo, n_endo, n_action], dtype=tf.int32)
+                for d in range(endo_dim_count):
+                    if corner & (1 << d):
+                        idx_d = hi_d[d]
+                        w_d = frac_d[d]
+                    else:
+                        idx_d = lo_d[d]
+                        w_d = 1.0 - frac_d[d]
+                    weight = weight * w_d
+                    flat_idx = flat_idx + idx_d * nd_strides[d]
+                v_corner = tf.gather(v_curr[zp], flat_idx)
+                v_zp = v_zp + weight * v_corner
         else:
             v_zp = tf.gather(v_curr[zp], trans)       # (n_exo, n_endo, n_action)
         # Weight by P(z, z') — broadcast (n_exo, 1, 1) * (n_exo, n_endo, n_action)
@@ -291,6 +334,7 @@ def solve_vfi(
     train_dataset: Dict[str, tf.Tensor],
     config: VFIConfig = None,
     eval_callback=None,
+    value_init: Optional[tf.Tensor] = None,
 ) -> Dict:
     """Generic Value Function Iteration solver.
 
@@ -302,6 +346,12 @@ def solve_vfi(
         eval_callback: Optional callable(iteration, partial_result) -> dict[str, float].
                        Called every config.eval_interval iterations.
                        partial_result contains 'value', 'policy_action', 'policy_endo', 'grids'.
+        value_init:    Optional initial value function for warm-starting,
+                       shape (n_exo, n_endo).  When None (default), starts
+                       from zeros (cold start).  Pass the converged value
+                       from a previous solve at nearby parameters to reduce
+                       iterations.  Typical use: SMM estimation where
+                       consecutive candidate beta values are close.
 
     Returns:
         Dict with keys:
@@ -336,16 +386,20 @@ def solve_vfi(
     n_endo = tables["n_endo"]
 
     # 4. Bellman iteration
-    v_curr = tf.zeros([n_exo, n_endo], dtype=tf.float32)
+    if value_init is not None:
+        v_curr = tf.cast(tf.reshape(value_init, [n_exo, n_endo]), tf.float32)
+    else:
+        v_curr = tf.zeros([n_exo, n_endo], dtype=tf.float32)
     policy_idx = tf.zeros([n_exo, n_endo], dtype=tf.int32)
     diff_history = []
     eval_history = {}
     stop_reason  = None
 
+    interp_mode = config.interpolation
     start_time = time.perf_counter()
     converged = False
     for iteration in range(config.max_iter):
-        v_next, policy_idx = _bellman_step(v_curr, tables)
+        v_next, policy_idx = _bellman_step(v_curr, tables, interp_mode)
         diff = float(tf.reduce_max(tf.abs(v_next - v_curr)).numpy())
         diff_history.append(diff)
         v_curr = v_next

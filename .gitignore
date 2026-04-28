@@ -6,6 +6,8 @@ notebooks/
 experiments/
 production/
 notes/
+.cache/
+configs/pipelines/
 
 # --- Python Standard Exclusions ---
 __pycache__/
@@ -49,5 +51,6 @@ checkpoints/
 *.nav
 *.snm
 *.vrb
+*.typ
 *_files/
 .quarto/

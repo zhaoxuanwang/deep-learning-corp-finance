@@ -16,6 +16,7 @@ iteration without damping.
 from __future__ import annotations
 
 import time
+import warnings
 from typing import Dict
 
 import numpy as np
@@ -26,6 +27,13 @@ from src.v2.solvers.grid import (
     build_product_grid,
     tauchen_transition_matrix,
 )
+
+# Pessimistic initial risky rate for positive-debt cells.  Economically
+# equivalent to near-autarky (debt proceeds ≈ 9% of face value) but avoids
+# infinities in the initial reward tensor.  The outer loop relaxes pricing
+# as it discovers which states are solvent.
+_AUTARKY_RATE = 10.0
+
 
 def _production_np(k, z, alpha):
     return z * np.power(k, alpha)
@@ -291,6 +299,46 @@ def _zero_profit_residual_np(
     return residual, funded_mask
 
 
+def _is_risk_free_equilibrium(
+    env,
+    result: Dict[str, object],
+) -> bool:
+    """Detect an all-solvent equilibrium with risk-free pricing.
+
+    Returns True when the solver converged with no default states and
+    all funded rates equal to the risk-free rate.  The caller must use
+    ``n_outer`` to distinguish a genuine no-default equilibrium (many
+    outer iterations, default set shrank to empty) from a spurious
+    instant-convergence fixed point (≤ 1 outer iteration).
+    """
+
+    if result.get("stop_reason") != "converged_outer_value":
+        return False
+
+    default_mask = np.asarray(result["default_mask"], dtype=bool)
+    if bool(np.any(default_mask)):
+        return False
+
+    r_tilde_grid = np.asarray(result["r_tilde_grid"], dtype=np.float64)
+    funded_mask = np.asarray(result["funded_mask"], dtype=bool)
+    if not bool(np.any(funded_mask)):
+        return False
+
+    funded_rates = r_tilde_grid[funded_mask]
+    if funded_rates.size == 0:
+        return False
+
+    return bool(
+        np.all(np.isfinite(funded_rates))
+        and np.allclose(
+            funded_rates,
+            env.econ.interest_rate,
+            atol=1e-10,
+            rtol=0.0,
+        )
+    )
+
+
 def _solve_inner_bellman_np(
     env,
     prob_matrix: np.ndarray,
@@ -332,8 +380,21 @@ def solve_nested_vfi(
     train_dataset: Dict[str, object] | None = None,
     config: NestedVFIConfig | None = None,
     eval_callback=None,
+    value_init: np.ndarray | None = None,
+    r_tilde_init: np.ndarray | None = None,
 ) -> Dict:
-    """Solve the canonical risky-debt benchmark via the NumPy reference path."""
+    """Solve the canonical risky-debt benchmark via the NumPy reference path.
+
+    Args:
+        value_init:   Optional initial value function, shape (n_z, n_state).
+                      When None (default), starts from zeros (cold start).
+                      Pass the converged value from a previous solve at
+                      nearby parameters to reduce iterations.
+        r_tilde_init: Optional initial risky-rate schedule, shape
+                      (n_z, n_k, n_b).  When None (default), uses pessimistic
+                      autarky initialization.  Pass the converged pricing
+                      from a previous solve for warm-starting.
+    """
 
     del train_dataset
     config = config or NestedVFIConfig()
@@ -346,13 +407,31 @@ def solve_nested_vfi(
     n_z = len(z_grid)
     n_state = endo_product.shape[0]
 
-    value = np.zeros((n_z, n_state), dtype=np.float64)
+    if value_init is not None:
+        value = np.asarray(value_init, dtype=np.float64).reshape(n_z, n_state)
+    else:
+        value = np.zeros((n_z, n_state), dtype=np.float64)
     policy_idx = np.zeros((n_z, n_state), dtype=np.int64)
-    r_tilde_grid = np.full(
-        (n_z, len(grids["endo_grids_1d"][0]), len(grids["endo_grids_1d"][1])),
-        env.econ.interest_rate,
-        dtype=np.float64,
-    )
+
+    b_grid = grids["endo_grids_1d"][1]
+    n_k = len(grids["endo_grids_1d"][0])
+    n_b = len(b_grid)
+
+    if r_tilde_init is not None:
+        r_tilde_grid = np.asarray(r_tilde_init, dtype=np.float64).reshape(
+            n_z, n_k, n_b
+        )
+    else:
+        # Pessimistic (autarky) initialization: lenders refuse to lend at
+        # reasonable rates.  This seeds a non-empty default region in the
+        # first inner Bellman, allowing the outer loop to iterate toward
+        # the correct equilibrium with credit spreads.
+        r_tilde_grid = np.full(
+            (n_z, n_k, n_b),
+            env.econ.interest_rate,
+            dtype=np.float64,
+        )
+        r_tilde_grid[:, :, b_grid > 1e-12] = _AUTARKY_RATE
 
     start_time = time.perf_counter()
     inner_diff_history = []
@@ -507,10 +586,37 @@ def solve_nested_vfi(
         solvent_probability,
     )
 
+    risk_free_equilibrium = _is_risk_free_equilibrium(
+        env,
+        {
+            "stop_reason": stop_reason,
+            "default_mask": default_mask,
+            "r_tilde_grid": r_tilde_grid,
+            "funded_mask": funded_mask,
+        },
+    )
+
+    # Distinguish spurious instant convergence from a genuine no-default
+    # equilibrium reached after real pricing iteration.
+    risk_free_fixed_point = risk_free_equilibrium and n_outer <= 1
+    risk_free_fixed_point_warning = None
+    if risk_free_fixed_point:
+        risk_free_fixed_point_warning = (
+            "Nested VFI converged to a risk-free fixed point in ≤1 outer "
+            "iteration: the pricing schedule never changed from its initial "
+            "value, so the default region was never explored. This likely "
+            "indicates that the state-space grid does not cover high-leverage "
+            "states where default would occur. Suggested actions: increase "
+            "b_max_mult, decrease k_min_mult, or verify that no-default is "
+            "the intended economic outcome."
+        )
+        warnings.warn(risk_free_fixed_point_warning, RuntimeWarning, stacklevel=2)
+
     env.install_r_tilde_grid(grids, r_tilde_grid.astype(np.float32))
 
     return {
         "value": value,
+        "policy_idx": policy_idx,
         "policy_action": policy_action,
         "policy_endo": policy_endo,
         "grids": grids,
@@ -528,6 +634,9 @@ def solve_nested_vfi(
         "pricing_diff_history": pricing_diff_history,
         "history": eval_history,
         "stop_reason": stop_reason,
+        "risk_free_equilibrium": risk_free_equilibrium,
+        "risk_free_fixed_point": risk_free_fixed_point,
+        "risk_free_fixed_point_warning": risk_free_fixed_point_warning,
         "backend": "numpy",
         "dtype": "float64",
         "device": "CPU:0",

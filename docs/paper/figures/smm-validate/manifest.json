@@ -1,0 +1,44 @@
+{
+  "setup": {
+    "profile": "MC_VALIDATION",
+    "description": "Full Monte Carlo validation with larger panels."
+  },
+  "environment": {
+    "economic_params": {
+      "interest_rate": 0.04,
+      "depreciation_rate": 0.15,
+      "production_elasticity": 0.6,
+      "cost_convex": 0.0,
+      "cost_fixed": 0.0,
+      "tax": 0.3,
+      "cost_default": 0.4,
+      "cost_inject_fixed": 0.0,
+      "cost_inject_linear": 0.0,
+      "frac_liquid": 0.5
+    },
+    "shock_params": {
+      "rho": 0.7,
+      "sigma": 0.15,
+      "mu": 0.0
+    }
+  },
+  "smm_run": {
+    "n_firms": 500,
+    "horizon": 25,
+    "burn_in": 75,
+    "n_sim_panels": 50,
+    "master_seed": [
+      20,
+      26
+    ],
+    "error_type": "percent",
+    "percent_denom_floor": 1e-06,
+    "global_method": "differential_evolution",
+    "local_method": "Powell",
+    "optimizer_maxiter": 50,
+    "optimizer_popsize": 15
+  },
+  "monte_carlo": {
+    "n_replications": 10
+  }
+}
