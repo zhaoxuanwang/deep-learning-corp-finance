@@ -8,6 +8,8 @@ import tensorflow as tf
 
 from src.v2.evaluation import (
     build_action_grid_policy,
+    evaluate_lifetime_reward,
+    evaluate_policy_mae,
     load_method_bundle,
     load_plot_inputs,
     load_solver_bundle,
@@ -19,6 +21,29 @@ from src.v2.evaluation import (
     save_plot_inputs,
     save_solver_bundle,
 )
+
+
+class _LinearMetricEnv:
+    def discount(self):
+        return 0.9
+
+    def merge_state(self, k, z):
+        return tf.concat([k, z], axis=1)
+
+    def reward(self, state, action):
+        return state[:, :1] + 2.0 * state[:, 1:] - action
+
+    def endogenous_transition(self, k, action, z):
+        return 0.8 * k + action + 0.1 * z
+
+    def analytical_policy(self, state):
+        return 0.5 * state[:, 1:]
+
+
+class _LinearMetricPolicy:
+    def __call__(self, state, training=False):
+        del training
+        return 0.25 * state[:, :1] + 0.5 * state[:, 1:]
 
 
 class TestEvaluationRunArtifacts:
@@ -209,3 +234,61 @@ class TestEvaluationPolicies:
         )
         np.testing.assert_allclose(policy.get_weights()[0], [[3.0], [4.0]])
         np.testing.assert_allclose(value_net.get_weights()[0], [[7.0], [8.0]])
+
+
+class TestEvaluationMetrics:
+    def test_evaluate_lifetime_reward_matches_manual_rollout(self):
+        env = _LinearMetricEnv()
+        policy = _LinearMetricPolicy()
+        traj_dataset = {
+            "s_endo_0": tf.constant([[1.0], [2.0]], dtype=tf.float32),
+            "z_path": tf.constant(
+                [
+                    [[0.1], [0.2], [0.3], [0.4]],
+                    [[0.5], [0.6], [0.7], [0.8]],
+                ],
+                dtype=tf.float32,
+            ),
+        }
+
+        value = evaluate_lifetime_reward(
+            env,
+            policy,
+            traj_dataset,
+            horizon=2,
+            n_samples=1,
+        )
+
+        k = traj_dataset["s_endo_0"][:1]
+        z_path = traj_dataset["z_path"][:1]
+        manual = tf.zeros(tf.shape(k)[0], dtype=tf.float32)
+        discount_t = 1.0
+        for t in range(2):
+            z_t = z_path[:, t, :]
+            state = env.merge_state(k, z_t)
+            action = policy(state)
+            manual = manual + discount_t * tf.reshape(env.reward(state, action), [-1])
+            k = env.endogenous_transition(k, action, z_t)
+            discount_t *= env.discount()
+
+        assert value == float(tf.reduce_mean(manual))
+
+    def test_evaluate_policy_mae_matches_manual_next_capital_error(self):
+        env = _LinearMetricEnv()
+        policy = _LinearMetricPolicy()
+        flat_dataset = {
+            "s_endo": tf.constant([[1.0], [2.0]], dtype=tf.float32),
+            "z": tf.constant([[0.2], [0.4]], dtype=tf.float32),
+        }
+
+        mae = evaluate_policy_mae(env, policy, flat_dataset)
+
+        state = env.merge_state(flat_dataset["s_endo"], flat_dataset["z"])
+        k_next_pred = env.endogenous_transition(
+            flat_dataset["s_endo"], policy(state), flat_dataset["z"]
+        )
+        k_next_true = env.endogenous_transition(
+            flat_dataset["s_endo"], env.analytical_policy(state), flat_dataset["z"]
+        )
+        expected = float(tf.reduce_mean(tf.abs(k_next_pred - k_next_true)))
+        assert mae == expected

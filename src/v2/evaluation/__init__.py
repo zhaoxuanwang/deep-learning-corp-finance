@@ -15,6 +15,10 @@ from src.v2.evaluation.artifacts import (
     save_solver_bundle,
     save_summary_rows,
 )
+from src.v2.evaluation.metrics import (
+    evaluate_lifetime_reward,
+    evaluate_policy_mae,
+)
 from src.v2.evaluation.policies import (
     InterpolatedGridPolicy,
     build_action_grid_policy,
@@ -26,6 +30,8 @@ from src.v2.evaluation.policies import (
 __all__ = [
     "InterpolatedGridPolicy",
     "build_action_grid_policy",
+    "evaluate_lifetime_reward",
+    "evaluate_policy_mae",
     "load_evaluation_run",
     "load_manifest",
     "load_method_bundle",
