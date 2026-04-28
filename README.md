@@ -32,6 +32,16 @@ Every figure and table in the report is produced by one of the notebooks in `doc
 
 Each notebook writes its outputs to `outputs/notebooks/<notebook-name>/`. Every run is fully reproducible from a single master seed. See `src/v2/data/rng.py` for details.
 
+## Design
+
+The codebase keeps three concerns strictly separate:
+
+1. **Environment is the single authority.** All model primitives (state space, action space, reward, transition, parameters) live in one environment class under `src/v2/environments/`. Nothing else owns them.
+2. **Data simulation is separate from the solver.** A `DataGenerator` builds the dataset once from the environment. Solvers consume the dataset and never call the simulator during training.
+3. **Solvers are generic.** Every solver (VFI, PFI, LRM, ERM, BRM, SHAC) reads the environment through a common interface and works on any model that conforms to it.
+
+Adding a new model means writing one new environment file. The solvers, data pipeline, and utilities do not change.
+
 ## Methods
 
 Solvers for dynamic models are in `src/v2/solvers/` and `src/v2/trainers/`:

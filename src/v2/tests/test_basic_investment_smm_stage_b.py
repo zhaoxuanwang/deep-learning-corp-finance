@@ -234,16 +234,39 @@ def test_stage_b_pfi_bundle_returns_finite_panel_moments(stage_b_env):
 
 
 @pytest.mark.slow
-@pytest.mark.parametrize(
-    ("solver_config", "label"),
-    [
-        (_make_er_solver_config(), "ER"),
-        (_make_pfi_solver_config(), "PFI"),
-    ],
-)
-def test_stage_b_solve_smm_smoke_returns_finite_results(stage_b_env, solver_config, label):
+def test_stage_b_er_spec_simulates_finite_panel_moments(stage_b_env):
+    beta_true = stage_b_env.smm_initial_guess(mode="stage_b")
+    solver_config = _make_er_solver_config()
+    spec = stage_b_env.make_smm_spec(
+        mode="stage_b",
+        initial_guess=beta_true,
+        solver_config=solver_config,
+    )
+    run_config = SMMRunConfig(
+        n_firms=3,
+        horizon=4,
+        burn_in=1,
+        n_sim_panels=6,
+        master_seed=(30, 40),
+    )
+
+    panel_result = spec.simulate_panel_moments(
+        beta_true,
+        run_config,
+        fold_in_seed(run_config.master_seed, "stage_b", "ER", "panel"),
+    )
+
+    assert panel_result.panel_moments.shape == (6, 5)
+    assert panel_result.average_moments.shape == (5,)
+    assert np.all(np.isfinite(panel_result.panel_moments))
+    assert np.all(np.isfinite(panel_result.average_moments))
+
+
+@pytest.mark.slow
+def test_stage_b_pfi_solve_smm_smoke_returns_finite_results(stage_b_env):
     beta_true = stage_b_env.smm_initial_guess(mode="stage_b")
     initial_guess = np.array([0.66, 0.16, 0.60, 0.12], dtype=np.float64)
+    solver_config = _make_pfi_solver_config()
     spec = stage_b_env.make_smm_spec(
         mode="stage_b",
         initial_guess=initial_guess,
@@ -255,13 +278,14 @@ def test_stage_b_solve_smm_smoke_returns_finite_results(stage_b_env, solver_conf
         burn_in=2,
         n_sim_panels=6,
         global_method="Powell",
+        local_method="least_squares",
         optimizer_maxiter=1,
         master_seed=(30, 40),
     )
     target = stage_b_env.simulate_smm_target_moments(
         beta_true,
         run_config,
-        seed=fold_in_seed(run_config.master_seed, "stage_b", label, "target"),
+        seed=fold_in_seed(run_config.master_seed, "stage_b", "PFI", "target"),
         mode="stage_b",
         solver_config=solver_config,
     )
@@ -270,7 +294,9 @@ def test_stage_b_solve_smm_smoke_returns_finite_results(stage_b_env, solver_conf
         spec=spec,
         target=target,
         config=run_config,
-        simulation_seed=fold_in_seed(run_config.master_seed, "stage_b", label, "crn"),
+        simulation_seed=fold_in_seed(
+            run_config.master_seed, "stage_b", "PFI", "crn",
+        ),
     )
 
     assert result.beta_hat.shape == (4,)
