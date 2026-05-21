@@ -3,6 +3,11 @@ tensorflow>=2.16.0,<2.18.0
 keras>=3.0.0
 # NOTE: For Apple Silicon, install tensorflow-macos and tensorflow-metal instead
 
+# Probabilistic programming (Bayesian estimation in src/v2/estimation/bayesian.py)
+# TFP 0.24 is the version paired with TF 2.16. Requires tf-keras pinned to match TF.
+tensorflow-probability==0.24.0
+tf-keras==2.16.0
+
 # Numerical Computing & Data
 numpy>=1.26.0,<2.0.0
 pandas>=2.0.0

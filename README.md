@@ -24,7 +24,7 @@ Every figure and table in the report is produced by one of the notebooks in `doc
 | Notebook | Reproduces | Approx. runtime |
 | --- | --- | --- |
 | [docs/01_basic_investment_benchmark.ipynb](docs/01_basic_investment_benchmark.ipynb) | Part I, basic investment model. Trains VFI, PFI, LRM, ERM, and SHAC. Reproduces Figures 1 to 5. | 30 min on CPU |
-| [docs/02_basic_investment_ablation.ipynb](docs/02_basic_investment_ablation.ipynb) | Architecture ablations for input normalization, output head, and hidden activation. | 20 min |
+| [docs/02_basic_investment_ablation.ipynb](docs/02_basic_investment_ablation.ipynb) | Reproduce the original methods in Maliar21 and benchmark their performance. | 20 min |
 | [docs/03_risky_debt_vfi_interp.ipynb](docs/03_risky_debt_vfi_interp.ipynb) | Part I, risky debt model. Runs the nested VFI solve. Reproduces Figures 6 to 8. | 5 min |
 | [docs/04_gmm_validation.ipynb](docs/04_gmm_validation.ipynb) | Part II, GMM Monte Carlo validation on the basic model. Reproduces Tables 5 to 7. | 10 min |
 | [docs/05_smm_validation.ipynb](docs/05_smm_validation.ipynb) | Part II, SMM Monte Carlo validation on the frictionless basic model. Reproduces Tables 8 to 10. | 30 min |

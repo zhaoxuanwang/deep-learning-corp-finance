@@ -2,14 +2,28 @@
 
 Methods
 -------
-smm  — Simulated Method of Moments (generic two-step estimator)
-gmm  — Generalized Method of Moments (closed-form moment conditions)
+smm       — Simulated Method of Moments (generic two-step estimator)
+gmm       — Generalized Method of Moments (closed-form moment conditions)
+bayesian  — Bayesian estimation via TFP (Kalman or particle filter + NUTS
+            or RW-MH); per-env factories live in sibling modules such as
+            ``bayesian_basic_investment``.
 
 Shared panel-statistics helpers (_panel_covariance, _panel_serial_correlation,
 _panel_iv_first_diff_ar1) live in smm.py and are imported by environment
 moment calculators.
 """
 
+from src.v2.estimation.bayesian import (
+    BayesianCoverageConfig,
+    BayesianCoverageResult,
+    BayesianMCMCResult,
+    BayesianRunConfig,
+    BayesianSpec,
+    FilterKind,
+    SamplerKind,
+    run_coverage_check,
+    run_mcmc,
+)
 from src.v2.estimation.gmm import (
     GMMMonteCarloConfig,
     GMMMonteCarloResult,
@@ -35,6 +49,15 @@ from src.v2.estimation.smm import (
     validate_smm,
 )
 __all__ = [
+    "BayesianCoverageConfig",
+    "BayesianCoverageResult",
+    "BayesianMCMCResult",
+    "BayesianRunConfig",
+    "BayesianSpec",
+    "FilterKind",
+    "SamplerKind",
+    "run_coverage_check",
+    "run_mcmc",
     "GMMMonteCarloConfig",
     "GMMMonteCarloResult",
     "GMMMonteCarloSummary",
