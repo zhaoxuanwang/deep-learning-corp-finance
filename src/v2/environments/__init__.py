@@ -5,6 +5,9 @@ from src.v2.environments.basic_investment import (
     BasicInvestmentSMMSolverBundle,
     BasicInvestmentSMMSolverConfig,
 )
+from src.v2.environments.parameterized_basic_investment import (
+    ParameterizedBasicInvestmentEnv,
+)
 from src.v2.environments.risky_debt import RiskyDebtEnv, RiskyDebtSMMPanelData
 
 __all__ = [
@@ -13,6 +16,7 @@ __all__ = [
     "BasicInvestmentSMMPanelData",
     "BasicInvestmentSMMSolverConfig",
     "BasicInvestmentSMMSolverBundle",
+    "ParameterizedBasicInvestmentEnv",
     "RiskyDebtEnv",
     "RiskyDebtSMMPanelData",
 ]

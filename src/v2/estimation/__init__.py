@@ -24,6 +24,11 @@ from src.v2.estimation.bayesian import (
     run_coverage_check,
     run_mcmc,
 )
+from src.v2.estimation.beta_sampler import (
+    BETA_DIM,
+    BETA_DIM_NAMES,
+    BetaSampler,
+)
 from src.v2.estimation.gmm import (
     GMMMonteCarloConfig,
     GMMMonteCarloResult,
@@ -58,6 +63,9 @@ __all__ = [
     "SamplerKind",
     "run_coverage_check",
     "run_mcmc",
+    "BETA_DIM",
+    "BETA_DIM_NAMES",
+    "BetaSampler",
     "GMMMonteCarloConfig",
     "GMMMonteCarloResult",
     "GMMMonteCarloSummary",

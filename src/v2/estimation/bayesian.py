@@ -273,25 +273,111 @@ class BayesianCoverageResult:
 
 
 # ---------------------------------------------------------------------------
-# Target log-prob construction
+# JointDistribution wrapping (NUTS path)
+# ---------------------------------------------------------------------------
+#
+# windowed_adaptive_nuts requires a tfd.JointDistribution rather than a bare
+# target_log_prob_fn. Spec factories produce (prior, log_likelihood_fn) — we
+# pack them into a JointDistributionCoroutine here. The likelihood is wrapped
+# in a pseudo-distribution (_LogProbStandin) whose ``log_prob`` returns the
+# pre-computed scalar from log_likelihood_fn; the "value" passed to it is
+# pinned to zero and ignored.
+
+class _LogProbStandin(tfd.Distribution):
+    """Pseudo-distribution whose ``log_prob`` returns a pre-computed scalar.
+
+    Lets us embed an arbitrary ``log_likelihood_fn(beta, data) -> scalar``
+    inside a ``tfd.JointDistributionCoroutine``. The "value" passed to
+    ``_log_prob`` is ignored; the contribution is fully determined by the
+    ``log_prob_value`` tensor captured at construction. Used only by the
+    NUTS path (windowed_adaptive_nuts requires a JointDistribution).
+    """
+
+    def __init__(self, log_prob_value: tf.Tensor, name: str = "LogProbStandin"):
+        """Note: ``name`` default must NOT match what callers pass explicitly.
+        ``JointDistributionCoroutine`` treats the yielded distribution as
+        "unnamed" (and auto-assigns ``varN``) when ``name`` equals the
+        ``__init__`` default; only explicit overrides survive. Hence the
+        nondescript default — callers always pass an explicit ``name``.
+        """
+        self._log_prob_value = log_prob_value
+        super().__init__(
+            dtype=log_prob_value.dtype,
+            reparameterization_type=tfd.NOT_REPARAMETERIZED,
+            validate_args=False,
+            allow_nan_stats=True,
+            # ``name`` must also appear in ``parameters`` so JointDistribution-
+            # Coroutine picks it up; passing it to super().__init__ alone is
+            # not enough.
+            parameters=dict(log_prob_value=log_prob_value, name=name),
+            name=name,
+        )
+
+    def _log_prob(self, value):
+        return self._log_prob_value
+
+    def _sample_n(self, n, seed=None):
+        return tf.zeros([n], dtype=self.dtype)
+
+    def _event_shape(self):
+        return tf.TensorShape([])
+
+    def _event_shape_tensor(self):
+        return tf.constant([], dtype=tf.int32)
+
+    def _batch_shape(self):
+        return self._log_prob_value.shape
+
+    def _batch_shape_tensor(self):
+        return tf.shape(self._log_prob_value)
+
+
+def _build_joint_distribution(spec: BayesianSpec,
+                              observed_data: Mapping[str, tf.Tensor]):
+    """Pack (prior, likelihood) into a pinned ``tfd.JointDistribution``.
+
+    The result is the form ``windowed_adaptive_nuts`` requires. Bijection to
+    unconstrained ℝᵈ is derived automatically by TFP from each prior's
+    support via ``pinned.experimental_default_event_space_bijector()``, so
+    ``spec.bijector`` is unused on the NUTS path (the RW-MH path still
+    consumes it).
+    """
+    param_names = spec.parameter_names
+    prior_model = spec.prior_distribution.model
+    log_lik_fn  = spec.log_likelihood_fn
+
+    @tfd.JointDistributionCoroutineAutoBatched
+    def model():
+        param_dict: dict[str, tf.Tensor] = {}
+        for name in param_names:
+            # .copy(name=name) propagates the dict key as the distribution
+            # name so JointDistributionCoroutine yields it under that name.
+            param_dict[name] = yield prior_model[name].copy(name=name)
+        log_lik = log_lik_fn(param_dict, observed_data)
+        yield _LogProbStandin(log_lik, name="likelihood")
+
+    # The standin's value is irrelevant; pinning with zeros removes it
+    # from the sampled latent set without affecting log_prob.
+    return model.experimental_pin(likelihood=tf.zeros([]))
+
+
+# ---------------------------------------------------------------------------
+# Target log-prob construction (RW-MH path)
 # ---------------------------------------------------------------------------
 
 def _build_target_log_prob(spec: BayesianSpec,
                            observed_data: Mapping[str, tf.Tensor]):
     """Return a callable ``target_log_prob(*unconstrained_args) -> scalar``.
 
-    Pieces together:
-      - log prior on constrained scale (from spec.prior_distribution),
-      - log |det J| of the constrained→unconstrained map (from spec.bijector),
-      - log likelihood at the constrained parameters (from spec.log_likelihood_fn).
+    Pieces together log prior + log|det J| + log likelihood. Used only by
+    the RW-MH path; the NUTS path goes through ``_build_joint_distribution``
+    + ``windowed_adaptive_nuts``, which handle bijection internally.
     """
 
     param_names = spec.parameter_names
     prior = spec.prior_distribution
     bijector = spec.bijector
 
-    # Sanity: the bijector and prior must use the same key set.
-    # JointMap stores its dict on .bijectors (in 0.24).
     bijector_keys = set(bijector.bijectors.keys()) if isinstance(bijector.bijectors, dict) else set()
     if bijector_keys and bijector_keys != set(param_names):
         raise ValueError(
@@ -311,8 +397,6 @@ def _build_target_log_prob(spec: BayesianSpec,
         log_det = bijector.forward_log_det_jacobian(u, event_ndims={k: 0 for k in param_names})
         log_prior = prior.log_prob(constrained)
         log_lik   = spec.log_likelihood_fn(constrained, observed_data)
-        # log_det may be returned as a dict or summed scalar depending on
-        # JointMap's behaviour. Reduce defensively.
         if isinstance(log_det, Mapping):
             log_det = tf.add_n([tf.cast(v, log_prior.dtype) for v in log_det.values()])
         return log_prior + log_det + log_lik
@@ -322,10 +406,12 @@ def _build_target_log_prob(spec: BayesianSpec,
 
 def _draw_initial_state(spec: BayesianSpec, n_chains: int,
                         seed: tuple[int, int]) -> list[tf.Tensor]:
-    """Sample initial unconstrained states for all chains from the prior."""
+    """Sample initial unconstrained states for all chains from the prior (RW-MH only).
 
+    The NUTS path goes through ``windowed_adaptive_nuts``, which samples
+    its own initial state from the joint distribution internally.
+    """
     samples = spec.prior_distribution.sample(n_chains, seed=tf.constant(seed, tf.int32))
-    # `samples` is a dict {name: tensor of shape [n_chains]}.
     unconstrained = spec.bijector.inverse({k: samples[k] for k in spec.parameter_names})
     return [unconstrained[k] for k in spec.parameter_names]
 
@@ -333,67 +419,72 @@ def _draw_initial_state(spec: BayesianSpec, n_chains: int,
 # ---------------------------------------------------------------------------
 # Sampler dispatch
 # ---------------------------------------------------------------------------
+#
+# Both samplers share the contract:
+#   (spec, observed_data, run_config, seed)
+#       -> (posterior_dict, acceptance_float, sampler_metadata_dict)
+# where ``posterior_dict[name]`` is a (n_samples, n_chains) ndarray on the
+# constrained scale (already mapped back through any bijector).
 
-def _run_nuts(target_log_prob,
-              initial_state: list[tf.Tensor],
+def _run_nuts(spec: BayesianSpec,
+              observed_data: Mapping[str, tf.Tensor],
               run_config: BayesianRunConfig,
               seed: tuple[int, int]):
-    """NUTS via DualAveragingStepSizeAdaptation.
+    """NUTS via ``windowed_adaptive_nuts`` (Stan-style windowed warmup).
 
-    We use the explicit DualAveraging + NoUTurnSampler stack instead of
-    ``windowed_adaptive_nuts`` because (a) it accepts a custom
-    ``target_log_prob_fn`` directly (windowed_adaptive_nuts insists on a
-    JointDistribution, which would force us to fold the prior, bijector,
-    and likelihood into a single coroutine and complicates the shape
-    semantics around the chain batch dim), and (b) the windowed routine's
-    mass-matrix adaptation is only mildly better than dual-averaging step-
-    size adaptation for the 4-D Phase-1 target — not worth the API friction.
+    Bundles step-size dual averaging and diagonal mass-matrix adaptation
+    across expanding warmup windows — the documented choice in
+    Bayesian.md §2.6. The previous in-house composition (NoUTurnSampler +
+    DualAveragingStepSizeAdaptation alone) omitted mass-matrix adaptation
+    and was the root cause of multi-hour stalls on heterogeneous-scale
+    targets such as the 5-D NN-surrogate posterior in NB09.
+
+    Returns:
+        posterior:  {param_name: ndarray (n_samples, n_chains)} on constrained scale.
+        acceptance: mean accept_ratio over post-warmup draws.
+        metadata:   leapfrog and divergence diagnostics.
     """
-
-    kernel = tfp.mcmc.NoUTurnSampler(
-        target_log_prob_fn=target_log_prob,
-        step_size=[tf.constant(0.1, dtype=s.dtype) * tf.ones_like(s)
-                   for s in initial_state],
-    )
-    kernel = tfp.mcmc.DualAveragingStepSizeAdaptation(
-        inner_kernel=kernel,
-        num_adaptation_steps=int(run_config.n_warmup * 0.8),
-        target_accept_prob=tf.constant(run_config.target_accept_prob, dtype=initial_state[0].dtype),
-        step_size_setter_fn=lambda pkr, new_step: pkr._replace(step_size=new_step),
-        step_size_getter_fn=lambda pkr: pkr.step_size,
-        log_accept_prob_getter_fn=lambda pkr: pkr.log_accept_ratio,
-    )
+    joint_dist = _build_joint_distribution(spec, observed_data)
+    target_accept = float(run_config.target_accept_prob)
 
     @tf.function(jit_compile=False)
     def _sample():
-        samples, kernel_results = tfp.mcmc.sample_chain(
-            num_results=run_config.n_samples,
-            num_burnin_steps=run_config.n_warmup,
-            current_state=initial_state,
-            kernel=kernel,
-            trace_fn=lambda _, pkr: pkr.inner_results.log_accept_ratio,
+        return tfp.experimental.mcmc.windowed_adaptive_nuts(
+            n_draws=run_config.n_samples,
+            joint_dist=joint_dist,
+            n_chains=run_config.n_chains,
+            num_adaptation_steps=run_config.n_warmup,
             seed=tf.constant(seed, tf.int32),
+            dual_averaging_kwargs={"target_accept_prob": target_accept},
         )
-        return samples, kernel_results
 
-    samples, log_accept_ratio = _sample()
-    accept_rate = float(tf.reduce_mean(tf.exp(tf.minimum(0.0, log_accept_ratio))))
-    return samples, accept_rate
+    states, trace = _sample()
+    posterior = {k: getattr(states, k).numpy() for k in spec.parameter_names}
+    acceptance = float(tf.reduce_mean(trace["accept_ratio"]))
+    metadata = {
+        "mean_leapfrog_steps": float(tf.reduce_mean(tf.cast(trace["n_steps"], tf.float32))),
+        "max_leapfrog_steps":  int(tf.reduce_max(trace["n_steps"]).numpy()),
+        "divergence_count":    int(tf.reduce_sum(tf.cast(trace["diverging"], tf.int32)).numpy()),
+    }
+    return posterior, acceptance, metadata
 
 
-def _run_rw_mh(target_log_prob,
-               initial_state: list[tf.Tensor],
+def _run_rw_mh(spec: BayesianSpec,
+               observed_data: Mapping[str, tf.Tensor],
                run_config: BayesianRunConfig,
                seed: tuple[int, int]):
-    """Random-walk Metropolis-Hastings with simple step-size adaptation.
+    """Random-walk Metropolis-Hastings — for the (particle, RW-MH) PMMH path.
 
-    Used when (a) the user requests a gradient-free baseline, or
-    (b) the likelihood is a particle-filter estimate (PMMH).  In both
-    cases the kernel below is correct as long as the likelihood estimate
-    is unbiased (Andrieu, Doucet, Holenstein 2010, Bayesian.md §1.3).
+    Gradient-free; works with non-differentiable likelihoods such as
+    particle-filter estimates (Andrieu, Doucet, Holenstein 2010,
+    Bayesian.md §1.3). Same return contract as ``_run_nuts``.
     """
+    target = _build_target_log_prob(spec, observed_data)
+    init_seed   = fold_in_seed(seed, "init")
+    sample_seed = fold_in_seed(seed, "sample")
+    initial_state = _draw_initial_state(spec, run_config.n_chains, init_seed)
 
-    kernel = tfp.mcmc.RandomWalkMetropolis(target_log_prob_fn=target_log_prob)
+    kernel = tfp.mcmc.RandomWalkMetropolis(target_log_prob_fn=target)
     kernel = tfp.mcmc.SimpleStepSizeAdaptation(
         inner_kernel=kernel,
         num_adaptation_steps=int(run_config.n_warmup * 0.8),
@@ -404,19 +495,23 @@ def _run_rw_mh(target_log_prob,
 
     @tf.function(jit_compile=False)
     def _sample():
-        samples, kernel_results = tfp.mcmc.sample_chain(
+        samples, log_accept = tfp.mcmc.sample_chain(
             num_results=run_config.n_samples,
             num_burnin_steps=run_config.n_warmup,
             current_state=initial_state,
             kernel=kernel,
             trace_fn=lambda _, pkr: pkr.inner_results.log_accept_ratio,
-            seed=tf.constant(seed, tf.int32),
+            seed=tf.constant(sample_seed, tf.int32),
         )
-        return samples, kernel_results
+        return samples, log_accept
 
-    samples, log_accept_ratio = _sample()
-    accept_rate = float(tf.reduce_mean(tf.exp(tf.minimum(0.0, log_accept_ratio))))
-    return samples, accept_rate
+    raw_samples, log_accept = _sample()
+    acceptance = float(tf.reduce_mean(tf.exp(tf.minimum(0.0, log_accept))))
+
+    unconstrained_dict = {k: raw_samples[i] for i, k in enumerate(spec.parameter_names)}
+    constrained_dict = spec.bijector.forward(unconstrained_dict)
+    posterior = {k: constrained_dict[k].numpy() for k in spec.parameter_names}
+    return posterior, acceptance, {}
 
 
 _SAMPLERS = {
@@ -436,23 +531,28 @@ def run_mcmc(spec: BayesianSpec,
     """Run one MCMC chain set on ``observed_data`` at the given seed.
 
     Steps (Bayesian.md §2.6):
-      1. Convert observed data to tf.Tensor and build the joint target.
-      2. Sample n_chains independent initial points from the prior.
-      3. Dispatch to NUTS or RW-MH per ``spec.sampler_kind``.
-      4. Map samples back to constrained scale, compute R̂ / ESS.
+      1. Convert observed data to tf.Tensor.
+      2. Dispatch by ``spec.sampler_kind``:
+           NUTS  -> ``windowed_adaptive_nuts`` over a packed JointDistribution
+                    (initial state, bijection, and adaptation all internal).
+           RW-MH -> hand-composed RW-MH over the explicit unconstrained
+                    target_log_prob; initial state sampled from the prior.
+      3. Compute R̂ / ESS on the returned constrained-scale samples.
 
     Args:
         spec:           BayesianSpec from a per-env factory.
-        observed_data:  Dict matching ``spec.observation_keys``.  Arrays are
+        observed_data:  Dict matching ``spec.observation_keys``. Arrays are
                         cast to float32 tensors before use.
         run_config:     Sampler runtime config.
-        seed:           Length-2 int seed pair.  All subsequent seeds (init,
-                        sampler) are derived from this via ``fold_in_seed``
-                        so a single value reproduces the entire run.
+        seed:           Length-2 int seed pair. Passed straight to NUTS; for
+                        RW-MH, init/sample sub-seeds are derived via
+                        ``fold_in_seed``. Same master seed reproduces the
+                        run bit-identically on a given TFP version + CPU.
 
     Returns:
         BayesianMCMCResult with per-parameter posterior samples, R̂, ESS,
-        average acceptance probability, and wall time.
+        average acceptance probability, wall time, and (for NUTS) leapfrog
+        and divergence diagnostics in ``metadata``.
     """
 
     _validate_filter_sampler_combo(spec.filter_kind, spec.sampler_kind)
@@ -469,22 +569,10 @@ def run_mcmc(spec: BayesianSpec,
     }
 
     start = time.perf_counter()
-    target = _build_target_log_prob(spec, data_tensors)
-
-    init_seed   = fold_in_seed(seed, "init")
-    sample_seed = fold_in_seed(seed, "sample")
-
-    initial_state = _draw_initial_state(spec, run_config.n_chains, init_seed)
-
     sampler_fn = _SAMPLERS[spec.sampler_kind]
-    raw_samples, acceptance = sampler_fn(target, initial_state, run_config, sample_seed)
+    posterior, acceptance, sampler_metadata = sampler_fn(
+        spec, data_tensors, run_config, seed)
 
-    # Map back to constrained scale and pack as {name: array shape (n_samples, n_chains)}.
-    unconstrained_dict = {k: raw_samples[i]
-                          for i, k in enumerate(spec.parameter_names)}
-    constrained_dict = spec.bijector.forward(unconstrained_dict)
-
-    posterior = {k: constrained_dict[k].numpy() for k in spec.parameter_names}
     r_hat = {k: float(tfp.mcmc.potential_scale_reduction(posterior[k]).numpy())
              for k in spec.parameter_names}
     ess = {k: float(tf.reduce_sum(tfp.mcmc.effective_sample_size(posterior[k])).numpy())
@@ -503,6 +591,7 @@ def run_mcmc(spec: BayesianSpec,
             "n_chains":      run_config.n_chains,
             "n_warmup":      run_config.n_warmup,
             "n_samples":     run_config.n_samples,
+            **sampler_metadata,
         },
     )
 
