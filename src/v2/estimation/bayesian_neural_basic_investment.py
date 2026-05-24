@@ -394,62 +394,23 @@ def load_policy_with_normalizer(
 # Public: factory.
 # ---------------------------------------------------------------------------
 
-def make_neural_bayesian_spec(
+def _make_ekf_bayesian_spec(
     env: ParameterizedBasicInvestmentEnv,
-    policy_nn: ParameterizedPolicyNetwork,
+    policy_callable,
     *,
-    sigma_eta_prior_scale: float = 0.1,
-    sigma_xi_prior_scale:  float = 0.1,
-    initial_state_variance: float = 10.0,
-    uniform_bounds: Optional[Mapping[str, tuple[float, float]]] = None,
+    sigma_eta_prior_scale: float,
+    sigma_xi_prior_scale:  float,
+    initial_state_variance: float,
+    uniform_bounds: Optional[Mapping[str, tuple[float, float]]],
 ) -> BayesianSpec:
-    """Build the §3.4 neural-surrogate ``BayesianSpec``.
+    """Internal helper. Build an EKF BayesianSpec from any policy callable.
 
-    Priors follow Bayesian.md §3.3 — the surrogate is only reliable on its
-    training box, so α, ρ, σ_ε get Uniform priors aligned with that box;
-    σ_η, σ_ξ get HalfNormal priors. Filter / sampler: EKF (labeled as
-    KALMAN in the spec, since the generic dispatch doesn't distinguish) + NUTS.
-
-    **State-space alignment contract.** Both the NN training data and the
-    synthetic panel come from this same ``ParameterizedBasicInvestmentEnv``:
-    training data via ``sample_initial_*`` + ER/SHAC's internal rollout,
-    synthetic panel via ``env.simulate_panel``. Same bounds, same initial
-    distribution, same transitions. This eliminates the divergence that
-    used to exist when the panel was synthesized through
-    ``BasicInvestmentEnv.simulate_smm_panel_data`` (different bound formula,
-    bounds recomputed per candidate β).
-
-    Args:
-        env:                    ParameterizedBasicInvestmentEnv in the
-                                frictionless case (nominal_econ.cost_convex
-                                == 0 and cost_fixed == 0; asserted).
-                                Provides ``r``, ``δ``, the panel simulator,
-                                and the analytical policy.
-        policy_nn:              Pre-trained ParameterizedPolicyNetwork, with
-                                frictionless dims frozen at zero by training
-                                under ``BetaSampler(freeze_dims=(3, 4))``.
-                                Set ``policy_nn.trainable = False`` before
-                                building the spec.
-        sigma_eta_prior_scale:  HalfNormal scale for σ_η.
-        sigma_xi_prior_scale:   HalfNormal scale for σ_ξ.
-        initial_state_variance: V_0 (Bayesian.md §2.3) — diffuse prior on x_1.
-        uniform_bounds:         Override per-coordinate (low, high) box for
-                                α, ρ, σ_ε. ``None`` → ``DEFAULT_UNIFORM_BOUNDS``
-                                (matches the surrogate's training box).
-
-    Returns:
-        BayesianSpec with filter_kind=KALMAN, sampler_kind=NUTS, and a
-        synthesize_panel_fn closing over ``env`` (closed-form analytical
-        policy ⇒ ground-truth β can be recovered).
+    Both ``make_neural_bayesian_spec`` (NN surrogate) and
+    ``make_closed_form_bayesian_spec`` (analytical regression test) delegate
+    here. The only thing they vary is ``policy_callable``: the NN model in
+    the production path, ``env.analytical_policy`` in the diagnostic path.
+    Priors, bijectors, observation equations, and synthesizer are identical.
     """
-    # Note: ``ParameterizedBasicInvestmentEnv`` structurally enforces
-    # ``cost_convex == cost_fixed == 0`` on its nominal — frictions enter
-    # only via per-sample β (``φ_quad``, ``φ_prop``). For this factory we
-    # additionally require the policy_nn to have been trained with
-    # ``freeze_dims=(3, 4)`` so it always evaluates on the frictionless
-    # slice; we cannot statically detect that, but the diagnostic in
-    # NB09 Sec 3 will catch a mismatched NN via the slope test.
-
     V0 = float(initial_state_variance)
     if V0 <= 0:
         raise ValueError(f"initial_state_variance must be > 0. Got {V0}.")
@@ -485,7 +446,7 @@ def make_neural_bayesian_spec(
 
     # ---- Likelihood (EKF) --------------------------------------------------
     log_likelihood_fn = _build_ekf_log_likelihood(
-        policy_nn=policy_nn,
+        policy_nn=policy_callable,
         delta_rate=float(env.delta_rate),
         V0=V0,
     )
@@ -570,6 +531,103 @@ def make_neural_bayesian_spec(
         log_likelihood_fn=log_likelihood_fn,
         synthesize_panel_fn=synthesize_panel_fn,
         observation_keys=OBSERVATION_KEYS,
+    )
+
+
+def make_neural_bayesian_spec(
+    env: ParameterizedBasicInvestmentEnv,
+    policy_nn: ParameterizedPolicyNetwork,
+    *,
+    sigma_eta_prior_scale: float = 0.1,
+    sigma_xi_prior_scale:  float = 0.1,
+    initial_state_variance: float = 10.0,
+    uniform_bounds: Optional[Mapping[str, tuple[float, float]]] = None,
+) -> BayesianSpec:
+    """Build the §3.4 neural-surrogate ``BayesianSpec``.
+
+    Priors follow Bayesian.md §3.3: the surrogate is only reliable on its
+    training box, so α, ρ, σ_ε get Uniform priors aligned with that box;
+    σ_η, σ_ξ get HalfNormal priors. Filter / sampler: EKF (labeled as
+    KALMAN in the spec, since the generic dispatch doesn't distinguish) + NUTS.
+
+    **State-space alignment contract.** Both the NN training data and the
+    synthetic panel come from this same ``ParameterizedBasicInvestmentEnv``:
+    training data via ``sample_initial_*`` + ER/SHAC's internal rollout,
+    synthetic panel via ``env.simulate_panel``. Same bounds, same initial
+    distribution, same transitions.
+
+    Args:
+        env:                    ParameterizedBasicInvestmentEnv in the
+                                frictionless case (nominal_econ.cost_convex
+                                == 0 and cost_fixed == 0; asserted).
+                                Provides ``r``, ``δ``, the panel simulator,
+                                and the analytical policy.
+        policy_nn:              Pre-trained ParameterizedPolicyNetwork, with
+                                frictionless dims frozen at zero by training
+                                under ``BetaSampler(freeze_dims=(3, 4))``.
+                                Set ``policy_nn.trainable = False`` before
+                                building the spec.
+        sigma_eta_prior_scale:  HalfNormal scale for σ_η.
+        sigma_xi_prior_scale:   HalfNormal scale for σ_ξ.
+        initial_state_variance: V_0 (Bayesian.md §2.3) — diffuse prior on x_1.
+        uniform_bounds:         Override per-coordinate (low, high) box for
+                                α, ρ, σ_ε. ``None`` → ``DEFAULT_UNIFORM_BOUNDS``
+                                (matches the surrogate's training box).
+
+    Returns:
+        BayesianSpec with filter_kind=KALMAN, sampler_kind=NUTS, and a
+        synthesize_panel_fn closing over ``env`` (closed-form analytical
+        policy ⇒ ground-truth β can be recovered).
+    """
+    return _make_ekf_bayesian_spec(
+        env=env,
+        policy_callable=policy_nn,
+        sigma_eta_prior_scale=sigma_eta_prior_scale,
+        sigma_xi_prior_scale=sigma_xi_prior_scale,
+        initial_state_variance=initial_state_variance,
+        uniform_bounds=uniform_bounds,
+    )
+
+
+def make_closed_form_bayesian_spec(
+    env: ParameterizedBasicInvestmentEnv,
+    *,
+    sigma_eta_prior_scale: float = 0.1,
+    sigma_xi_prior_scale:  float = 0.1,
+    initial_state_variance: float = 10.0,
+    uniform_bounds: Optional[Mapping[str, tuple[float, float]]] = None,
+) -> BayesianSpec:
+    """Closed-form regression-test variant of ``make_neural_bayesian_spec``.
+
+    Diagnostic factory: substitutes ``env.analytical_policy`` for the NN
+    inside the same EKF likelihood. Priors, bijectors, observation
+    equations, and synthesizer are identical to the NN spec; only the
+    policy callable differs.
+
+    Use case. When the neural-surrogate spec produces a biased posterior,
+    swap to this spec and rerun. On the frictionless slice the analytical
+    policy is exactly linear in log z, so the EKF linearization is zero-
+    error and the data exactly matches the model:
+
+    * If this spec recovers ground-truth β within its CIs, the bias in the
+      NN spec comes entirely from the NN approximation (NN retraining or
+      a different surrogate architecture is the fix).
+    * If this spec is also biased, the bias is from the pipeline (EKF,
+      observation equation, prior structure, or sampler). The NN is not
+      the cause; a different filter or prior is needed.
+
+    σ_ξ posterior should concentrate near zero in this spec because the
+    panel was generated by the same analytical policy that the likelihood
+    uses (no NN-vs-truth gap). 95th percentile of σ_ξ < 0.05 is the
+    expected pass.
+    """
+    return _make_ekf_bayesian_spec(
+        env=env,
+        policy_callable=env.analytical_policy,
+        sigma_eta_prior_scale=sigma_eta_prior_scale,
+        sigma_xi_prior_scale=sigma_xi_prior_scale,
+        initial_state_variance=initial_state_variance,
+        uniform_bounds=uniform_bounds,
     )
 
 
