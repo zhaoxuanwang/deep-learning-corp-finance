@@ -20,7 +20,7 @@ Two facts from codebase exploration shape this plan:
 1. **The policy network change is the easy half.** All v2 trainers ([`src/v2/trainers/`](../../src/v2/trainers/)) consume a [`PolicyNetwork`](../../src/v2/networks/policy.py) whose input dim they don't care about. A subclass that accepts `[s_endo, s_exo, β]` is drop-in.
 2. **The hard half is the env API.** ER and SHAC compute losses via `env.euler_residual(...)`, `env.reward(...)`, `env.endogenous_transition(...)`. These currently read β off immutable `EconomicParams` / `ShockParams` on the env instance ([`src/v2/environments/basic_investment.py:254-288`](../../src/v2/environments/basic_investment.py)). For a β-conditional surrogate, each minibatch sample must have its own β flowing through the env, not a fixed instance attribute.
 
-A third, sharper observation: **in the Phase A frictionless model the policy does not enter the Kalman likelihood at all** — capital is treated as observed without error and enters the observation equation as a known offset (Bayesian.md §2.3 line 110; confirmed in [`src/v2/estimation/bayesian_basic_investment.py`](../../src/v2/estimation/bayesian_basic_investment.py) lines 138–168). Swapping in a surrogate changes the *simulator* side only. Therefore: validating a frictionless surrogate against the closed-form policy is a sanity check, not a Bayesian-pipeline stress test. The surrogate becomes load-bearing for the **full basic model with frictions** (no closed-form) and any model where capital is latent. The validation notebook proposed here is calibrated to that reality — it validates the surrogate as a *policy approximator over (k, z, β)*, not as a Bayesian inference improvement.
+A third, sharper observation: **in the Phase A frictionless model the policy does not enter the Kalman likelihood at all** (Bayesian.md §2.3). Capital is treated as observed without error and enters the observation equation as a known offset. Swapping in a surrogate changes the *simulator* side only. Therefore: validating a frictionless surrogate against the closed-form policy is a sanity check, not a Bayesian-pipeline stress test. The surrogate becomes load-bearing for the **full basic model with frictions** (no closed-form) and any model where capital is latent. The validation notebook proposed here is calibrated to that reality — it validates the surrogate as a *policy approximator over (k, z, β)*, not as a Bayesian inference improvement.
 
 ---
 
@@ -69,7 +69,7 @@ Add `ParameterizedPolicyNetwork(PolicyNetwork)`:
 - Forward: identical hidden stack, just wider input. Reuses existing RunningZScore normalization treating β-components as extra coordinates.
 - Add a β-conditional value head if SHAC needs one (it does — V depends on β).
 
-**Why σ_η is excluded from the surrogate's input — and why this is still feasible "train once."** σ_η is observation-noise scale in the Bayesian model; it enters the Kalman filter via the LGSSM's `observation_noise` R-matrix ([`src/v2/estimation/bayesian_basic_investment.py`](../../src/v2/estimation/bayesian_basic_investment.py) lines 158–168). It is **downstream of the policy**: the firm's optimal `k_{t+1}(z; β)` depends only on `(α, ρ, σ_ε, r, δ)` (Bayesian.md eq. line 97). Observation noise is a property of the *econometrician's measurement instrument*, not the firm's optimization. So:
+**Why σ_η is excluded from the surrogate's input — and why this is still feasible "train once."** σ_η is observation-noise scale in the Bayesian model; it enters the Kalman filter via the LGSSM's `observation_noise` R-matrix (Bayesian.md §2.4). It is **downstream of the policy**: the firm's optimal `k_{t+1}(z; β)` depends only on `(α, ρ, σ_ε, r, δ)` (Bayesian.md eq. line 97). Observation noise is a property of the *econometrician's measurement instrument*, not the firm's optimization. So:
 - The surrogate is parameterized over `(k, z, α, ρ, σ_ε)` only and trained once.
 - Inside MCMC, σ_η remains a sampled parameter. The log-target evaluates `φ_NN(k, z, α, ρ, σ_ε)` for the policy-relevant pieces and plugs `σ_η` directly into the LGSSM's R-matrix — exactly as in Phase A.
 - σ_η is therefore still identified, via its role in the Kalman observation variance, independent of the surrogate. No re-training needed across σ_η.
@@ -82,7 +82,7 @@ File: `src/v2/estimation/beta_sampler.py` (NEW)
 
 Lives next to the existing Bayesian priors module rather than under [`src/v2/data/`](../../src/v2/data/) — β-from-prior sampling is an inference concern, not a data-pipeline concern. Existing [`DataGenerator`](../../src/v2/data/generator.py) is untouched.
 
-`BetaSampler` samples β **uniformly** over per-coordinate boxes (`DEFAULT_UNIFORM_BOUNDS`). Rationale: BetaSampler is only used by the surrogate trainers and validation notebooks; the Bayesian inference pipeline ([`src/v2/estimation/bayesian_basic_investment.py`](../../src/v2/estimation/bayesian_basic_investment.py)) defines its own `tfd.JointDistributionNamed({"alpha": tfd.Beta(2, 2), …})` independently. The two roles are decoupled, so the surrogate's training distribution can be chosen for *uniform fit quality across the prior support*, not to mimic the inference prior. With Beta(2, 2) the surrogate would be 3–4× less accurate at the validation-sweep tails than at the bulk; uniform avoids that.
+`BetaSampler` samples β **uniformly** over per-coordinate boxes (`DEFAULT_UNIFORM_BOUNDS`). Rationale: BetaSampler is only used by the surrogate trainers and validation notebooks; the Bayesian inference pipeline (`src/v2/estimation/bayesian_basic_investment.py`) defines its own `tfd.JointDistributionNamed({"alpha": tfd.Beta(2, 2), …})` independently. The two roles are decoupled, so the surrogate's training distribution can be chosen for *uniform fit quality across the prior support*, not to mimic the inference prior. With Beta(2, 2) the surrogate would be 3–4× less accurate at the validation-sweep tails than at the bulk; uniform avoids that.
 
 `freeze_dims` (e.g., `(3, 4)`) zeros friction dims for nb 08 frictionless validation.
 
@@ -114,7 +114,7 @@ Diff from [`shac.py`](../../src/v2/trainers/shac.py):
 
 The validation is split into two notebooks so each has a single, transparent purpose:
 
-* [`docs/08_neural_surrogate_validation.ipynb`](../08_neural_surrogate_validation.ipynb) — **frictionless** β-amortization vs closed-form analytical. 3-D effective β via `BetaSampler(mode="uniform", freeze_dims=(3, 4))`. Single-stage training. **`MODE` toggle**: `"SMOKE"` (3×128, ER 4000 / SHAC 800 steps, ~6 min) for fast iteration; `"FULL"` (4×256, ER 8000 / SHAC 1600 steps, ~25 min) for production-quality verification.
+* [`experiments/notebooks/08_neural_surrogate_validation.ipynb`](../../experiments/notebooks/08_neural_surrogate_validation.ipynb) — **frictionless** β-amortization vs closed-form analytical. 3-D effective β via `BetaSampler(mode="uniform", freeze_dims=(3, 4))`. Single-stage training. **`MODE` toggle**: `"SMOKE"` (3×128, ER 4000 / SHAC 800 steps, ~6 min) for fast iteration; `"FULL"` (4×256, ER 8000 / SHAC 1600 steps, ~25 min) for production-quality verification.
 * [`docs/09_neural_surrogate_frictional.ipynb`](../09_neural_surrogate_frictional.ipynb) — **full 5-D frictional** baseline for Phase B. Direct single-stage training on the full prior. No analytical reference; validation is held-out Euler residual + ER↔SHAC cross-check + qualitative comparative statics + frictionless-limit info-only.
 
 Both notebooks use:
@@ -214,7 +214,7 @@ Out of scope for this plan. Once gates pass, write a separate plan covering:
 | `src/v2/trainers/er_param.py` | β-conditional ER | **NEW** |
 | `src/v2/trainers/shac_param.py` | β-conditional SHAC | **NEW** |
 | [`src/v2/trainers/core.py`](../../src/v2/trainers/core.py) | shared helpers | Read only (reuse via import) |
-| `docs/08_neural_surrogate_validation.ipynb` | validation deliverable | **NEW** |
+| `experiments/notebooks/08_neural_surrogate_validation.ipynb` | validation deliverable | **NEW** |
 | [`docs/01_basic_investment_benchmark.ipynb`](../01_basic_investment_benchmark.ipynb) | template to mirror | Read only |
 
 Net change to existing production code: **a single subclass added to `policy.py`**. Everything else is new files.
@@ -226,7 +226,7 @@ Net change to existing production code: **a single subclass added to `policy.py`
 1. Unit test: `env.endogenous_transition(k, a, z, beta=…)` returns batched outputs that match per-sample manual computation. Add to `src/v2/tests/`.
 2. Unit test: `ParameterizedPolicyNetwork([s, β])` forward + backward through TF autodiff; β-gradient is non-zero where it should be.
 3. Run `train_er_param` for 50 epochs on a small `(N=200, horizon=40)` panel with 1000 β samples; verify Euler residual decreases monotonically.
-4. Open `docs/08_neural_surrogate_validation.ipynb` end-to-end. Inspect comparative-statics plots against gates 1–2 above.
+4. Open `experiments/notebooks/08_neural_surrogate_validation.ipynb` end-to-end. Inspect comparative-statics plots against gates 1–2 above.
 5. Reproducibility: rerun the notebook with the same `master_seed`; assert bit-identical β samples and final policy parameters.
 
 ---

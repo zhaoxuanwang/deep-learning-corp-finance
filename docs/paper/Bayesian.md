@@ -8,19 +8,21 @@
 A prior encodes belief about a parameter before seeing data. It is specified as a probability density function of the parameter, $p(\beta)$. Practical specification depends on domain-knowledge. I discuss the specific priors I choose for different parameters in later section.
 
 **(b) What filtering method do you use, and what are its pros and cons vs alternatives?**
-When the model can be cast as a Linear Gaussian state-space model (LGSSM), Kalman is the right choice: exact, fast, differentiable. When the observation equation is nonlinear in the latent state but the nonlinearity is mild, the Extended Kalman Filter linearizes around the predicted latent mean and preserves differentiability. When nonlinearity is strong, a particle filter is needed, at the cost of a non-differentiable, noisy likelihood. I discuss specific filtering choice later when applying to different models.
+By default, I use Kalman Filter when the model can be cast as a Linear Gaussian state-space model (LGSSM). When the likelihood is differentiable but non-linear, I consider Extended Kalman Filter or Unscented Kalman Filter as alternatives. When the likelihood is non-differentiable, I consider the Particle Filter and Random Walk Metropolis–Hastings (RW-MH) as fallback. I discuss specific filtering choice later when applying to different models.
 
-**(c) Which MCMC method (in TFP), and how is it chosen?** I use an adaptive variant of HMC, No-U-Turns (NUTS) sampler by default. It uses $\nabla L(\beta)$ via TFP autodiff and adapts the trajectory length via the no-U-turn criterion, removing the trajectory-length hyperparameter that vanilla HMC requires. When the likelihood is non-differentiable (particle filter), the fallback sampler is Random-Walk MH with adaptive proposal covariance. The particle-filter + RW-MH pair is PMMH (Andrieu, Doucet, Holenstein 2010), which targets the exact posterior provided the likelihood estimate is unbiased.
+**(c) Which MCMC method (in TFP), and how is it chosen?** I built and tested two main options: (1) No-U-Turns (NUTS) Hamiltonian Monte Carlo with Extended Kalman Filter; (2) Random-Walk Metropolis-Hastings (RW-MH) with Extended Kalman Filter. NUTS are more efficient when gradient info $\nabla L(\beta)$ is available, RW-MH is used when gradient is not available or too computationally costly.
 
 **(d) What tests assess the validity of the estimation method?**
-I apply three set of validation metrics. The first set are generic metrics for a single run: including chain convergence per run $\hat{R} \approx 1$, Effective Sample Siee (ESS) in the range 100 to 400 depending on budget, visual inspection of the chain trace plot, and the posterior marginals histogram plot. The second set requires calibration of credible intervals: choose a specific structural model, draw $R$ ground-truth $\beta_0$ from the prior, generate a synthetic panel from each, run MCMC, and check whether the 95% credible interval contains the truth in roughly 95% of replicates. I implement a minimal version of this coverage check, while for future production it should be extended to the full [Simulation-Based Calibration](https://mc-stan.org/docs/stan-users-guide/simulation-based-calibration.html).
+For generic diagnostic metrics, I report split-$\hat{R}$ and effective sample size (ESS), as well as several method-specific metrics such as diverged transitions and leapfrog tree depth (for NUTS-HMC). For posterior analysis, I report visualization of the posterior marginals, summary statistics (median and mean), and trace plot. For more complete tests, I implement a minimal version of coverage check in the spirit of [Simulation-Based Calibration](https://mc-stan.org/docs/stan-users-guide/simulation-based-calibration.html), as well as posterior predictive checks (simulate data to match real data) and prior sensitivity analysis (robustness of result when varying prior).
 
 **(e) How does Bayesian estimation compare to GMM and SMM?**
 GMM matches model-implied moments (analytical functions of $\theta$) to sample moments. It requires the optimal policy function itself to be expressible analytically in $\theta$. In this project only the basic model without adjustment cost satisfies that. SMM replaces the analytical moments with simulated ones: one model solve per parameter evaluation, so any model that can be simulated is in scope. SMM gives a point estimate with asymptotic-sandwich standard errors, no full posterior; the analyst must pick the moments (a modeling choice that affects identification); and it is prone to weak identification when the chosen moments don't pin down $\theta$. 
 
 Bayesian estimation uses the full likelihood (no moment selection), delivers the joint posterior distribution, and quantifies parameter uncertainty. It often worked better in identification of high-dimensional models compared with SMM. For models more complicated than the basic model, I introduce a Neural Surrogate approach to cut per-evaluation model solve cost for both Bayesian MCMC and SMM. This is done by pre-training a neural network (NN) to approximate the optimal policy function in state-by-parameter space. Thus, the choice between Bayesian and SMM reduces to a methodological one: full posterior characterization (Bayesian) versus a frequentist point estimate (SMM).
 
-### 1.1 Target
+## 1. Overview
+
+### Target
 
 Treat the parameter vector $\beta$ as a random variable. Given observed data $y$, the target is the posterior distribution
 
@@ -32,61 +34,100 @@ $$L(\beta) \;:=\; \log p(\beta) + \log p(y \mid \beta)$$
 
 Since $\log p(y)$ does not depend on $\beta$, it cancels in every Metropolis-Hastings (MH) acceptance ratio and never needs to be computed. The pipeline reduces to two tasks: specify a prior, and evaluate the log-likelihood $\log p(y \mid \beta)$ at any candidate $\beta$.
 
-### 1.2 Policy-free vs Policy-based Approach
+### Model specification
 
-The Bayesian pipeline has one upstream modeling choice that shapes everything downstream: do we assume that observed actions (e.g., investment, leverage) are generated by the firm's optimal policy?
+The Bayesian pipeline has one upstream modeling choice that shapes everything downstream: Do we assume that observed actions (e.g., investment, leverage) are generated by the firms acting by optimal policy? If so, what structural form shall we impose on the residual gaps?
 
-Both approaches share the same parametric primitives. Cobb-Douglas production $\pi = z k^\alpha$, log-AR(1) shocks on $z$, and Gaussian measurement noise. They differ in how they treat observed actions such as capital $k$ and debt $b$.
+In principle, there are many ways to cast the structural model into a set of empirical specifications for Bayesian estimation. This specification choice largely depend on (1) the complexity of the model itself (e.g., risky debt); (2) the target parameters to be estimated (e.g., firm's deviation from optimal leverage); and (3) the additional assumptions we are willing to impose on top of the original theoretical model (e.g., Gaussian noise or systematic error).
 
-**Policy-free approach.** Treat observed actions $(k, b, \ldots)$ as exogenous covariates. The likelihood uses only the production function and the AR(1) on the latent state. No parametric assumption is made about how firms chose those actions. The approach is robust to misspecification of the decision problem: firms may not invest or borrow according to the model's optimal policy, and the inference still recovers the parameters that appear in the observation equation.
+To illustrate this concretely, I use the simple basic model of optimal investment as example. Consider that we observe a panel data of firms. The basic optimal investment model has a solution defined as an optimal policy function $\varphi$ mapping states to actions. 
 
-**Policy-based approach.** Add a structural assumption: observed actions are outputs of the firm's optimal policy plus measurement noise. For example, observed investment and leverages are generated from firms following optimal policy: $\log k_{i,t+1} = \pi_k(k_{i,t}, b_{i,t}, z_{i,t}; \beta) + \xi^k_{i,t}$ and $\log b_{i,t+1} = \pi_b(k_{i,t}, b_{i,t}, z_{i,t}; \beta) + \xi^b_{i,t}$. The policy $\pi$ comes from the model solver at $\beta$. This couples the action data to the structural parameters and identifies parameters that affect the firm's decisions, not just the observation equation.
+**Observed data.** We observe a firm-year panel of capital, leverage, and revenue:
+$$
+\text{Panel data:} \quad (k_{it}, b_{it}, \Pi_{it}).
+$$
 
-**Trade-off.**
+**Structural model.** A vector $\beta \equiv (\alpha, \rho, \sigma_\epsilon)$ of structural parameters underlying the data-generating process (DGP):
+$$
+\begin{aligned}
+\text{Cobb-Douglas production:} \quad \log \Pi_{it} &= \log z_{it} + \alpha \cdot \log k_{it} + \eta_{it} \\
+\text{Latent AR(1) productivity:} \quad \log z_{it} &= \rho \log z_{i,t-1} + \sigma_\varepsilon \cdot \mathcal{N}(0, 1) \\
+\text{Investment policy:} \quad \log k_{it} &= \varphi_k(z_{it}, k_{it}, b_{it} \mid \beta) + \xi^k_{it} \\
+\text{Leverage policy:} \quad \log b_{it} &= \varphi_b(z_{it}, k_{it}, b_{it} \mid \beta) + \xi^b_{it}
+\end{aligned}
+$$
+where $z$ is the latent productivity shock, $\varphi_k$ and $\varphi_b$ are the optimal investment and leverage policies implied by the model at $\beta$, and the unconditional mean of $\log z$ is normalized to zero so the production residual carries all level information.
 
-| Property | Policy-free | Policy-based |
-|---|---|---|
-| Identifiable parameters | Only those in the observation equation | All structural parameters |
-| Model-solve per MCMC step | Not required | Required |
-| Robust to mis-specification | Yes | No |
-| Counterfactual analysis | Need extra calibration | Flexible for all params|
+**Residual specification.** The three residuals absorb the gap between model implications and observed data:
+$$
+\eta_{it} \sim \mathcal{N}(\mu_\eta, \sigma^2_\eta), \quad \xi^k_{it} \sim \mathcal{N}(\mu_{\xi^k}, \sigma^2_{\xi^k}), \quad \xi^b_{it} \sim \mathcal{N}(\mu_{\xi^b}, \sigma^2_{\xi^b}).
+$$
+The Gaussian shape is a likelihood assumption that can be relaxed (Student-t, mixture). I take Gaussian as the baseline. The means and variances are additional parameters to be estimated.
 
-**Bottom line.** Both approaches yield valid posteriors over the parameters they identify. For the simplest frictionless basic model (Strebulaev §3.1), all four structural parameters $(\alpha, \rho, \sigma_\varepsilon, \sigma_\eta)$ appear in the observation equation, so policy-free is complete and is the natural baseline. For every other model in the project (frictional basic, risky debt, extensions), cost or default parameters enter only through the optimal policy. Policy-free can identify only the production-and-shock subset; policy-based is required to recover the full parameter vector. **Real-world end-product applications will involve models more complex than basic model, so policy-based Bayesian inference is unavoidable in production**. Policy-free is a baseline test confined to the simplest no-adjustment-cost model. This is the central justification for the neural-surrogate work in §3: solving the model at every MCMC step requires the policy to be amortized in $\beta$ so each evaluation is one forward pass instead of a full re-solve.
+**Economic interpretation.** Each residual has important economic meanings:
 
-### 1.3 Generic Algorithm
+- $\eta$ is production misspecification or measurement error in revenue. A nonzero $\mu_\eta$ indicates the production function omits a systematic factor (e.g., labor input). $\sigma_\eta^2$ measures production-equation fit quality.
+- $\xi^k$ and $\xi^b$ are *policy deviations*: the systematic gap between observed investment / leverage and the model-implied optimal choices. A nonzero $\mu_{\xi^k}$ indicates firms invest more or less on average than the model-implied optimal decisions; $\sigma_{\xi^k}^2$ measures dispersion of that deviation. Analogously for $\xi^b$. This is the cross-sectional analog of the investment and labor "wedges" in DSGE business-cycle accounting (Chari, Kehoe, McGrattan 2007).
+
+**Identification.** Generally, we need to constraints for identification:
+
+1. The unconditional mean of $\log z$ is normalized to zero. Without this, $E[\log z]$ and $\mu_\eta$ are observationally equivalent in the production equation. The normalization is harmless: any nonzero unconditional mean of latent productivity is absorbed by $\mu_\eta$.
+2. The policy intercept of $\varphi_k(\cdot \mid \beta)$ is a deterministic function of $\beta$. A free additive $\mu_{\xi^k}$ is partially collinear with shifts in $\beta$ that move this intercept. Depending on the specific models, identification is enabled by (i) informative priors on $\mu_{\xi^k}$ centered at zero, and (ii) $\beta$ enters $\eta$, $\xi^k$, and $\xi^b$ jointly, so the posterior anchors $\beta$ from production and AR(1) variations, leaving the residual policy gap to $\mu_{\xi^k}$.
+
+These choices capture the argument for identifying firm's deviation from optimal actions: $\mu_{\xi^k}$ captures "policy deviation that cannot be explained by a different $\beta$ within the model class."
+
+**Baseline choice of priors**
+
+I consider the following baseline choice of priors:
+
+| Parameters | Prior | Support | Rationale |
+|---|---|---|---|
+| $\alpha$ | Beta(2, 2) | $(0, 1)$ | Moderate return to scale |
+| $\rho$ | Beta(2, 2) | $(0, 1)$ | Moderate persistence |
+| $\sigma_\varepsilon$ | HalfNormal(0.3) | $(0, \infty)$ | More mass on low variance|
+| $\sigma_\eta$ | HalfNormal(0.1) | $(0, \infty)$ | More mass on less measurement error |
+| $μ_η, μ_{ξ^k}, μ_{ξ^b} $ | Normal(0, 0.1) | $(-\infty, \infty)$ | Center around zero |
+| $σ_η, σ_{ξ^k}, σ_{ξ^b} $ | HalfNormal(0.5) | $(0, \infty)$ | More mass on low variance |
+
+
+**Special case: observation-only inference.** When the only goal is to identify parameters that appear in the production equation $(\alpha, \rho, \sigma_\varepsilon, \mu_\eta, \sigma_\eta)$, the policy residuals can be dropped from the likelihood entirely. Observed $(k, b)$ are then treated as exogenous covariates and no policy solve is needed. This case applies to the frictionless basic model (§3.1), where the policy adds no extra identifying information beyond what the production equation provides. For every other model in the project (frictional basic, risky debt, extensions), cost and default parameters enter only through the policy, so the policy residuals must be kept in the likelihood. This is the central motivation for the neural-surrogate work in §3: solving the model at every MCMC step requires the policy to be amortized in $\beta$ so each evaluation is one forward pass.
+
+
+
+### Generic Algorithm
 
 The pipeline is generic across choices of filter and MCMC sampler. The Evaluate step branches by approach.
 
 **Setup.**
 
-- Specify a prior $p(\beta)$.
+- Specify priors $p(\cdot)$
 - Specify a filtering algorithm that, given fixed data $y$ and a candidate $\beta$, returns the scalar $\log p(y \mid \beta)$.
 - Fix the number of MCMC iterations $J$ and the number of chains.
 
 **Pre-training NN surrogate policy**
 
-This step may be skipped if the optimal policy can be written in closed-form formula, or if policy-free inference is feasible.
+This step may be skipped if the optimal policy can be written in closed-form formula, or if inference does not need optimal policy to form the observation equations.
 
 - Takes firm panel dataset as input, extract state space bounds (e.g., min and max capital observed)
 - Use the extracted state bounds from panel and parameter bounds from prior to simulate a panel of training dataset
-- Train NN on the simulated data and obtain the parametrized policy surrogate, $\varphi_\theta(s, \beta)$, which is stored as NN weights and biases.
-   -  Current options: Euler residual minimization or Short-horizon Actor Critic
+- Train NN on the simulated data and obtain the parametrized policy surrogate, $\varphi_\theta(s, \beta)$, which is stored as NN weights and biases. Discard the training and validation set.
+   -  Model solve method: Short-horizon Actor Critic (default) and Euler residual minimization (special case)
 - Pass the stored NN surrogate to the likelihood estimation in next stage
 
 
-**Bayesian Inference: MCMC + Filtering loop** 
+**Bayesian Inference: MCMC + Filtering Algorithm** 
 
 For each MC chain, per iteration $j = 1, \ldots, J$:
 
-1. **Propose** a candidate $\beta'$ by perturbing the current $\beta$. Two baseline schemes:
-   - *Random-Walk Metropolis-Hastings (RW-MH):* draw $\beta' = \beta + $ Gaussian noise. Gradient-free.
-   - *No-U-Turn Sampler with Hamiltonian Monte Carlo (NUTS-HMC):* use $\nabla_\beta L(\beta)$ to simulate Hamiltonian dynamics on $-L$, then slice-sample a candidate from the trajectory. Gradient-based; requires $L$ to be differentiable in $\beta$.
+1. **Propose** a candidate $\beta'$ by perturbing the current $\beta$. I built three options:
+   - *Random-Walk Metropolis-Hastings (RW-MH):* draw $\beta' = \beta + $ Gaussian noise. Gradient-free default.
+   - *Robust Adaptive Metropolis (RAM):* Adaptive version of RW-MH that avoids manual tuning of the search step size.
+   - *No-U-Turn Sampler with Hamiltonian Monte Carlo (NUTS-HMC):* use $\nabla_\beta L(\beta)$ to simulate Hamiltonian dynamics on $L$, then slice-sample a candidate from the trajectory. Gradient-based; requires $L$ to be differentiable in $\beta$.
 2. **Evaluate** $L(\beta') = \log p(\beta') + \log p(y \mid \beta')$. The likelihood step depends on the approach:
-   - *Option 1: Policy-free.* Form the observation equation directly from the structural primitives (production function, AR(1)). Treat observed actions as exogenous offsets. Run the filter on the fixed observations.
-   - *Option 2: Policy-based with neural surrogate.* Take the pre-trained NN surrogate policy function $\varphi_\theta(s,\beta)$, plug into observation and transition equations, run the filter.  
-   - *Option 3: Naive policy-based case.* (Not implemented) Solve the model at $\beta'$ to obtain the optimal policy $\pi(\cdot; \beta')$. Plug the policy into the observation and transition equations for observed actions. Run the filter.
+   - *Option 1: Closed-form Policy.* Form the observation equation using closed-form formula of optimal policy. Run the filter. 
+   - *Option 2: Neural Surrogate Policy.* Take the pre-trained NN surrogate policy $\varphi_\theta(s,\beta)$, plug into observation and transition equations, run the filter.  
 
-3. **Accept or reject.** RW-MH accepts $\beta'$ with probability $\min(1, \exp(L(\beta') - L(\beta)))$ under symmetric proposal. NUTS-HMC uses the joint Hamiltonian ratio.
+3. **Accept or reject.** MH test accepts $\beta'$ with probability $\min(1, \exp(L(\beta') - L(\beta)))$ under symmetric proposal. NUTS-HMC uses the joint Hamiltonian ratio.
 4. **Record** the current chain position as sample $\beta^{(j)}$.
 
 **Output.** A pooled set of samples $\{\beta^{(j)}\}$ across chains. Their empirical distribution approximates $p(\beta \mid y)$. Posterior means, quantiles, and credible intervals are computed from this set.
@@ -96,11 +137,11 @@ For each MC chain, per iteration $j = 1, \ldots, J$:
 - Filter and sampler are independent components and can be swapped separately.
 - The MH accept/reject step guarantees correctness. The proposal rule controls only efficiency.
 
-### 1.4 Validation and Diagnostics
+### Validation and Diagnostics
 
-Bayesian inference results are validated at three layers. Each layer answers a distinct question; the metrics are largely standard.
+Below are the metrics and tests I use to validate the inference implementation.
 
-**Layer A. Per-run MCMC convergence.** Has the sampler converged on this dataset?
+**Per-run MCMC convergence.** The following metrics are reported to test whether the sampler converged on this dataset?
 
 - *Split R-hat* (Vehtari et al. 2021). Between- vs within-chain variance ratio after splitting each chain in half. Target $\hat{R} < 1.01$ at production budget; loosened to $\hat{R} < 1.05$ at smoke budget.
 - *Effective Sample Size (ESS).* Autocorrelation-corrected count of independent samples,
@@ -113,231 +154,197 @@ Bayesian inference results are validated at three layers. Each layer answers a d
 
 TFP modules: `tfp.mcmc.potential_scale_reduction`, `tfp.mcmc.effective_sample_size`. Divergence counts and per-iteration tree depth are returned in the trace metadata of `tfp.experimental.mcmc.windowed_adaptive_nuts`.
 
-**Layer B. Calibration of the inference machinery.** Do the credible intervals attain their nominal coverage on data drawn from the model? This validates the implementation against the data-generating process, not against any single dataset.
+**Calibration of the inference machinery.** Do the credible intervals attain their nominal coverage on data drawn from the model? This validates the implementation against the data-generating process.
+- *Coverage check.* Draw $R$ parameter vectors $\beta_0$ from the prior; for each, simulate a panel under the model at $\beta_0$, run the full inference pipeline, and record per-parameter 95% credible intervals. Pass when the empirical hit rate per parameter falls inside the binomial 95% interval around true coverage 0.95 at the chosen $R$.
+- Future extension: *Simulation-Based Calibration (Talts et al. 2018).* Rank-based formal test at $R \geq 100$ with rank histograms; the rigorous version of the coverage check. Not implemented in current version
 
-- *Coverage check.* Draw $R$ parameter vectors $\beta_0$ from the prior; for each, simulate a panel under the model at $\beta_0$, run the full inference pipeline, and record per-parameter 95% credible intervals. Pass when the empirical hit rate per parameter falls inside the binomial 95% interval around true coverage 0.95 at the chosen $R$. At $R = 30$ this band is approximately $[0.87, 1.00]$.
-- *Simulation-Based Calibration (Talts et al. 2018).* Rank-based formal test at $R \geq 100$ with rank histograms; the rigorous version of the coverage check. Deferred to Future Extensions.
 
-Layer B has two granularities. *Algorithm-level* calibration runs the coverage check at a small spec that still identifies the parameters; passing implies asymptotic calibration at any larger spec. *Spec-faithful* calibration replays the check at the production spec, and is required only when the asymptotic identification argument is in doubt.
-
-**Layer C. Model-data fit.** Once the machinery is validated, does the fitted model actually describe the real data?
+**Model-data fit.** The last set of tests aim to examine how the fitted model describe the real data?
 
 - *Posterior predictive checks (PPC).* Compare summary statistics of replicated panels $Y^{\mathrm{rep}} \sim p(\cdot \mid \beta^{(s)})$ to the observed $Y$. Systematic mismatch in a summary that the model should reproduce flags misspecification.
 - *Prior sensitivity analysis.* Vary the prior within a defensible range and confirm that posterior summaries move by less than their credible-interval widths. Bounded movement indicates the posterior is data-driven rather than prior-driven on the parameters of interest.
 
-Layer C is deferred to real-data application; the validation work in this report is synthetic-data only and therefore sits within Layers A and B.
-
-**Project-wide validation strategy.** The frictionless basic model (Strebulaev §3.1) has a closed-form optimal policy linear in $\log z$, providing a synthetic ground-truth fixture in which $\beta_0$ is known and the data are exactly the model's. The strategy:
-
-1. Validate the **policy-free** pipeline (Kalman + NUTS) end-to-end on the toy model (§2). Layers A and B both apply.
-2. Validate the **policy-based with neural surrogate** pipeline (EKF + NUTS over $\varphi_\theta$) on the same toy model (§3.4). Layers A and B apply at a smaller scale. The $\sigma_\xi$ posterior absorbs the NN-vs-truth residual and serves as an inline per-run diagnostic of surrogate quality.
-
-If both pipelines pass on the closed-form fixture, the inference machinery is qualified to extend to frictional and risky-debt models, where no closed-form ground truth exists and only Layers A and C are available. The $\sigma_\xi$ inline diagnostic is the only Layer-B signal that survives the extension; making it informative on the toy is the reason it earns its own per-run posterior in §3.
-
-### 1.5 Method Selection Across Project Models
-
-Filter and sampler depend on (i) the modeling approach and (ii) the linearity and differentiability of the policy in $\beta$.
-
-**Under policy-free, the likelihood is always Cobb-Douglas + AR(1), linear-Gaussian.** Kalman filter and NUTS-HMC apply uniformly across the three project models. The solver is not invoked inside MCMC. Only a subset of parameters is identified:
-
-| # | Model | Filter | Sampler | Identifiable parameters |
-|---|---|---|---|---|
-| 1 | Frictionless basic (Strebulaev §3.1) | Kalman (LGSSM) | NUTS-HMC | $(\alpha, \rho, \sigma_\varepsilon, \sigma_\eta)$ (complete) |
-| 2 | Frictional basic | Kalman (LGSSM) | NUTS-HMC | $(\alpha, \rho, \sigma_\varepsilon, \sigma_\eta)$ (cost params not identified) |
-| 3 | Risky debt (Strebulaev §3.6) | Kalman (LGSSM) | NUTS-HMC | $(\alpha, \rho, \sigma_\varepsilon, \sigma_\eta)$ (cost and default params not identified) |
-
-**Under policy-based, the policy enters the likelihood and filter/sampler depend on its properties.** This is the approach required to identify all structural parameters:
-
-| # | Model | Solver | Filter | Sampler |
-|---|---|---|---|---|
-| 1 | Frictionless basic | Closed-form (linear in latent state) | Kalman (extended LGSSM) | NUTS-HMC |
-| 2 | Frictional basic | Neural Surrogate, amortized in $\beta$ | Particle (Kalman if linearizable) | NUTS-HMC if NN differentiable in $\beta$; else RW-MH |
-| 3 | Risky debt | Neural Surrogate, amortized in $\beta$ | Particle | RW-MH (NUTS-HMC if NN differentiable in $\beta$) |
-
-Selection rules:
-
-- **NUTS-HMC** when $L(\beta)$ is differentiable end-to-end in $\beta$.
-- **RW-MH** (with adaptive proposal covariance) otherwise. When combined with a particle filter, this is Particle Marginal Metropolis-Hastings (PMMH; Andrieu, Doucet, Holenstein 2010), which targets the exact posterior despite a noisy likelihood estimate.
-
-In the policy-based table, "amortized in $\beta$" means a single network is trained once across the prior support of $\beta$, so that the policy at any candidate $\beta$ is one forward pass rather than a full retraining. See §3.
-
-### 1.6 Example: Risky Debt under Both Approaches
-
-The risky-debt model (Hennessy and Whited 2007; Strebulaev §3.6; cf. [docs/models/risky_debt.md](../models/risky_debt.md)) is the sharpest illustration of the trade-off. Observed variables in real data: revenue $\pi_{i,t}$, capital $k_{i,t}$, debt $b_{i,t}$. Structural parameters: $(\alpha, \rho, \sigma_\varepsilon, \sigma_\eta, \psi_1, \eta_0, \eta_1, c_d)$.
-
-**Policy-free likelihood.** Treat $k$ and $b$ as exogenous covariates. The observation equation is the production function:
-
-$$y_{i,t} = \log \pi_{i,t} = \alpha \log k_{i,t} + \log z_{i,t} + \eta_{i,t}.$$
-
-With AR(1) on $\log z$, this is the same LGSSM as the frictionless basic case. Kalman + NUTS-HMC works.
-
-The likelihood depends on $(\alpha, \rho, \sigma_\varepsilon, \sigma_\eta)$ and identifies exactly these four parameters. The cost parameters $(\psi_1, \eta_0, \eta_1, c_d)$ do not appear in the likelihood and are not identifiable. In particular $c_d$ (deadweight default cost) drives the firm's debt choice, so any signal about $c_d$ has to come from $b$, which policy-free ignores by construction.
-
-**Policy-based likelihood.** Add two structural observation equations for the observed actions:
-
-$$\log k_{i,t+1} = \pi_k(k_{i,t}, b_{i,t}, z_{i,t}; \beta) + \xi^k_{i,t}, \qquad \xi^k \sim \mathcal{N}(0, \sigma_k^2),$$
-
-$$\log b_{i,t+1} = \pi_b(k_{i,t}, b_{i,t}, z_{i,t}; \beta) + \xi^b_{i,t}, \qquad \xi^b \sim \mathcal{N}(0, \sigma_b^2).$$
-
-The latent state extends to $(\log z_{i,t}, \log k_{i,t}, \log b_{i,t})$ with measurement-noise structure absorbing observation errors on capital and debt. The policies $\pi_k$ and $\pi_b$ come from VFI/PFI or NN at each candidate $\beta$. These policies are nonlinear in the latent state, so the LGSSM assumption fails and a particle filter is required. The MCMC sampler is RW-MH unless the NN policy is fully differentiable in $\beta$, in which case NUTS-HMC remains admissible.
-
-The likelihood now depends on the full parameter vector. All eight parameters are identifiable, including the cost and default parameters.
-
-**Implication for the project.** Policy-free is sufficient only for the frictionless basic model. For frictional basic, risky debt, and any future extension with cost or default parameters, policy-based Bayesian inference is required. Production end-product use will always involve such models, so policy-based is the path that must be made tractable. The naive cost (one VFI/PFI solve per MCMC step) is computationally infeasible, which motivates the neural-surrogate work in §3.
-
 ---
 
-## 2. Bayesian Inference Validation with Frictionless Basic Model 
+## 2. Bayesian Inference with Neural Surrogate
 
-The goal is to verify the full Bayesian inference pipeline end-to-end on a model whose solver is exact and analytical. Any inference error is then attributable to the inference machinery rather than to solver approximations.
+The goal is to verify the Bayesian inference pipeline end-to-end on the basic model with no adjustment costs. This is a special case of the toy model because the optimal policy has a closed-form formula, which allows me to validate and test the pipeline with ground-truth. 
 
-This section implements the **policy-free approach** (§1.2). Observed capital $k_{i,t}$ enters the observation equation as an exogenous offset, and the closed-form policy from §2.2 is used only to generate synthetic panels in the validation step (§2.8). The frictionless basic model is the one case in the project where policy-free identifies the full parameter vector $\beta = (\alpha, \rho, \sigma_\varepsilon, \sigma_\eta)$. For every later model the policy-based pipeline of §3 is required (cf. §1.6).
+The main innovation of my implementation is the use of a pre-trained "Neural Surrogate" to approximate the optimal policy function in inference. The benefit is substantial:
+- Typical MCMC + Filtering requires at least **thousands of model solve** (via VFI/PFI/NN-based methods) when evaluating different parameter candidates
+- My approach only needs **one model solve**: pre-train a NN surrogate over the entire States $\times$ Parameter space, then pass it to the inference pipeline for each evaluation.
 
-### 2.1 Structural Model
+I illustrate my pre-training + inference pipeline below using the toy basic investment model.
+
+### Environment: Basic Model
 
 Following Strebulaev and Whited (2012, Section 3.1), each firm $i = 1, \ldots, N$ solves an infinite-horizon investment problem with no adjustment costs and no debt.
 
-$$\pi_{i,t} = z_{i,t} \cdot k_{i,t}^{\alpha}, \qquad \alpha \in (0,1).$$
+The log-productivity follows a first-order autoregressive process (AR1):
 
-$$k_{i,t+1} = (1 - \delta)\, k_{i,t} + I_{i,t}, \qquad \delta \in (0,1).$$
+$$\log z_{i,t+1} = \rho \cdot \log z_{i,t} + \sigma_\varepsilon \cdot \varepsilon_{i,t+1}$$
 
-The log-productivity follows a first-order autoregressive process (AR(1)):
+where $\varepsilon_{i,t+1} \sim \mathcal{N}(0,1)$, $\rho \in (0,1)$, $\sigma_\varepsilon > 0$. Shocks $\varepsilon_{i,t+1}$ are iid across firms and time.
 
-$$\log z_{i,t+1} = \rho \cdot \log z_{i,t} + \sigma_\varepsilon \cdot \varepsilon_{i,t+1}, \qquad \varepsilon_{i,t+1} \sim \mathcal{N}(0,1), \quad \rho \in (0,1), \quad \sigma_\varepsilon > 0.$$
+Firm's observed revenue and capital stock is assumed to be generated by:
+$$
+\begin{aligned}
+\log \Pi_{it} &= \log z_{it} + \alpha \cdot \log k_{it} + \eta_{it}  \\
+\log k_{it} &= \varphi_k(z_{it}, k_{it} \mid \beta) + \xi^k_{it}
+\end{aligned} 
+$$
 
-Shocks $\varepsilon_{i,t+1}$ are independent across firms and time.
+where as before I assume that model specification error are Gaussian:
+$$
+\eta_{it} \sim N(\mu_\eta, \sigma_\eta), \qquad \xi^k_{it} \sim N(\mu_\xi, \eta_\xi)
+$$
 
-**Estimated parameters:** $\beta = (\alpha, \rho, \sigma_\varepsilon, \sigma_\eta)$. The first three are structural; $\sigma_\eta$ is the scale of revenue measurement error (defined in 2.3).
+Using capital accumulation identity, $k_{i,t+1} = (1 - \delta)\, k_{i,t} + I_{i,t}$, the control (action) variable can be re-written from investment $I$ to $k_{t+1}$, that is, firm directly choose the optimal capital level of next period. 
 
-**Calibrated parameters:** $r = 0.04$ (risk-free rate) and $\delta = 0.10$ (depreciation rate), both fixed.
+Without adjustment costs, firm's optimal policy function has closed-form solution:
 
-### 2.2 Analytical Policy Function
+$$ \begin{aligned}
+\varphi_k(z_{it}, k_{it} \mid \beta) &= \frac{\rho}{1-\alpha}\, \log z_{i,t} + \frac{1}{1-\alpha}\!\left[\log \alpha + \frac{\sigma_\varepsilon^2}{2} - \log(r + \delta)\right]\\
+&= \frac{\rho}{1-\alpha}\, \log z_{i,t} + \kappa(\alpha,\sigma_\epsilon,r,\delta)
+\end{aligned}$$
 
-Without adjustment costs, the firm's Euler equation reduces to $E_t[\alpha \, z_{i,t+1} \, k_{i,t+1}^{\alpha-1}] = r + \delta$. Since $k_{i,t+1}$ is chosen at time $t$,
+where we denote the second intercept term as $\kappa(\cdot)$ for simplicity. This formula can be derived easily using the Euler equation $E_t[\alpha \, z_{i,t+1} \, k_{i,t+1}^{\alpha-1}] = r + \delta$ and $E_t[z_{i,t+1}] = \exp(\rho \log z_{i,t} + \sigma_\varepsilon^2 / 2)$ for log-normal variable $z$. 
 
-$$k_{i,t+1}(z_{i,t}; \beta) = \left( \frac{\alpha \cdot E_t[z_{i,t+1}]}{r + \delta} \right)^{\frac{1}{1-\alpha}}.$$
+This means capital is log-linear in $\log z_{i,t}$, enabling the linear Gaussian state-space form.
 
-Under log-normal $z$, $E_t[z_{i,t+1}] = \exp(\rho \log z_{i,t} + \sigma_\varepsilon^2 / 2)$. Taking logs:
+**Target parameters to be estimated** include economic parameters $\beta \equiv (\alpha, \rho, \sigma_\varepsilon, \sigma_\eta)$ and the mean $(μ_η, μ_{ξ^k})$ and variances $(\sigma_η, \sigma_{ξ^k})$ for the model-specification errors.
 
-$$\log k_{i,t+1}(z_{i,t}; \beta) = \frac{\rho}{1-\alpha}\, \log z_{i,t} + \kappa(\beta), \qquad \kappa(\beta) := \frac{1}{1-\alpha}\!\left[\log \alpha + \frac{\sigma_\varepsilon^2}{2} - \log(r + \delta)\right].$$
+**Calibrated parameters:** $r = 0.04$ (risk-free rate) and $\delta = 0.10$ (depreciation rate).
 
-This is linear in $\log z_{i,t}$, enabling the linear Gaussian state-space form below.
+### Pre-training the Neural Surrogate
 
-### 2.3 Linear Gaussian State-Space Form
+The pre-training part uses two NN-based methods to solve for firm's optimal policy:
+- Default: Short-Horizon Actor Critic (SHAC)
+- Optional: Euler Residual Minimization (ER)
 
-A **Linear Gaussian State-Space Model (LGSSM)** has three properties: state transition and observation equations are linear in the latent state, all shocks and residuals are Gaussian, and an unobserved state evolves over time. Under these properties, the Kalman filter computes the exact likelihood in closed form.
+These methods have been introduced and tested in part 1. The key point is instead of mapping from state space to action space, the NN surrogate is trained on the higher-dimensional state $\times$ parameter space. 
 
-**Panel data assumed available** for each firm $i = 1, \ldots, N$:
+Concretely, let $\beta \equiv (\alpha, \rho, \sigma_\varepsilon)$ denote the structural economic parameters of the basic model. The pre-trained NN surrogate here is $\varphi(z,k; \beta)$ mapping to the optimal next-period capital $k'$. This is different from pure model solve (Part 1) where parameters are fixed and the NN policy is only 2-dim over $(z,k)$.
 
-- Operating income $\pi_{i,t}$ for $t = 1, \ldots, T$.
-- Capital stock $k_{i,t}$ for $t = 1, \ldots, T$.
+This approach is only feasible with NN-based policy approximator. Traditional numerical methods like VFI, PFI, or Linear Programming are grid-based and cannot be solved once over a high-dimensional parameter space. It would require repeatedly solving the model under different parameters, which is intractible even for toy model of this scale (with 8 parameters to be estimated).
 
-Both quantities are treated as observed without error. (Measurement error on capital is deferred; see Future Extensions.)
+To validate the quality of the pre-trained NN surrogate policy, I use the same set of metrics computed on held-out validation dataset. I also plot the NN solution against true analytical solution over $k$ slices. @fig-nb09a-slices shows that SHAC learned a highly precise NN surrogate (orange) with mean absolute error (MAE) lower than 1% when compared against the true closed-form formula (dash). The pre-trained NN surrogate maps $(z,k, \alpha, \rho, \sigma_\varepsilon)$ to the optimal next-period capital $k'$. SHAC is also efficient as this training took about 30min on a CPU (Apple M1). In future, this can be scale up with GPU and more training budget to learn more complex models and to achieve lower mean absolute error. The results can be reproduced in `docs/08a_pretrain_nn_surrogate.ipynb`.
 
-**Latent state:** $x_{i,t} := \log z_{i,t}$ (scalar).
+![Training curves: held-out MAE vs SHAC/ER step. Red dashed line marks the best-checkpoint restore; the gap to final-step weights illustrates why best-step restoration matters.](figures/paramNN-validate/training_curve_full.png){#fig-training-curve}
 
-**State transition:** $x_{i,t+1} = \rho \cdot x_{i,t} + \sigma_\varepsilon \cdot \varepsilon_{i,t+1}$, $\varepsilon_{i,t+1} \sim \mathcal{N}(0,1)$.
-
-**Initial state distribution.** Wide Gaussian prior, fixed independently of $(\rho, \sigma_\varepsilon)$:
-
-$$x_{i,1} \sim \mathcal{N}(0, V_0), \qquad V_0 = 10.$$
-
-Diffuse prior, standard initialization that avoids the divergence of $\sigma_\varepsilon^2 / (1 - \rho^2)$ as $\rho \to 1$.
-
-**Observation equation.** The single observable is log-revenue:
-
-$$y_{i,t} := \log \pi_{i,t} = x_{i,t} + \alpha \log k_{i,t} + \eta_{i,t}, \qquad \eta_{i,t} \sim \mathcal{N}(0, \sigma_\eta^2).$$
-
-The term $\alpha \log k_{i,t}$ enters as a known offset (time-varying input from observed capital). In LGSSM matrix form: $C(\beta) = 1$, $d_{i,t}(\beta) = \alpha \log k_{i,t}$, $R(\beta) = \sigma_\eta^2$.
-
-The observation equation includes an iid residual term $\eta_{i,t}$ for two reasons: (1) it gives the data-generating density a non-degenerate likelihood — without it $y_t$ is a deterministic transform of the latent state given $(\alpha, \log k_t)$ and inference would be numerically pathological. (2) it is more realistic that log-revenue observed in real-world data contain measurement error or model fit error. However, we should expect it to be weakly identified because it likely only accounts for a tiny fraction of the variation in observed revenue.
-
-This is the **policy-free** observation equation: the optimal policy function does not appear, because $\log k_{i,t}$ is treated as observed input rather than as an output of firm's optimal actions. The frictionless policy is linear in $\log z$, so the system remains LGSSM and Kalman applies.
+![Pre-trained Neural Surrogate.](figures/bonus1-bayesian-basic/slices_pretrain.png){#fig-nb09a-slices}
 
 
-### 2.4 Likelihood via Kalman Filter
- 
+
+### Likelihood: Extended Kalman Filter
+
+I use Extended Kalman Filter (EKF) to compute likelihood.
 Independence across firms gives
- 
-$$\log p(Y \mid \beta) = \sum_{i=1}^{N} \sum_{t=1}^{T} \log p(y_{i,t} \mid y_{i,1:t-1}, \beta).$$
- 
-For each firm $i$, the Kalman recursion produces each predictive density $p(y_{i,t} \mid y_{i,1:t-1}, \beta)$ as a univariate Gaussian. Use the notation $m_{t \mid s}$ and $V_{t \mid s}$ for the conditional mean and variance of $x_{i,t}$ given $y_{i,1:s}$.
- 
-**Initialize** with the prior from 2.3: $m_{1 \mid 0} = 0$, $V_{1 \mid 0} = V_0 = 10$.
- 
+$$\log p(Y \mid \beta) = \sum_{i=1}^{N} \sum_{t=1}^{T} \log p(y_{i,t} \mid y_{i,1:t-1}, \beta),$$
+where $y_{i,t} = (\log \Pi_{i,t}, \log k_{i,t+1})^T$ stacks the two observations at firm-year $(i, t)$ and $\beta$ collects every estimable parameter from §2.3.
+
+The latent state is scalar, $x_{i,t} \equiv \log z_{i,t}$. Let $m_{t|s}, V_{t|s}$ denote the conditional mean and variance of $x_{i,t}$ given $y_{i,1:s}$ (firm index suppressed).
+
+**Two observation equations.** From §2.3,
+$$
+y_{i,t}^{(1)} \;=\; x_{i,t} + \alpha \log k_{i,t} + \mu_\eta + \eta_{i,t}, \qquad \eta \sim \mathcal{N}(0, \sigma_\eta^2),
+$$
+$$
+y_{i,t}^{(2)} \;=\; g(x_{i,t}, k_{i,t}; \beta) + \mu_{\xi^k} + \xi^k_{i,t}, \qquad \xi^k \sim \mathcal{N}(0, \sigma_{\xi^k}^2),
+$$
+where $g(x, k; \beta) := \log \varphi_k(\exp x, k; \beta)$ is the log-policy prediction for $\log k_{t+1}$. Eq 1 is linear in $x$; Eq 2 is **potentially nonlinear** in $x$ through $g$.
+
+**When the EKF is appropriate.** The EKF replaces $g(x; \beta)$ with its first-order Taylor expansion around the predicted latent mean,
+$$
+g(x; \beta) \;\approx\; g(m_{t|t-1}; \beta) + H_2(t) \cdot (x - m_{t|t-1}), \qquad H_2(t) := \frac{\partial g}{\partial x}\bigg|_{x = m_{t|t-1}}.
+$$
+The Taylor remainder is of order $\tfrac{1}{2} |g''(m_{t|t-1})| \cdot V_{t|t-1}$, so the linearization is accurate when *either* the policy is close to linear in $x$ (small $|g''|$) *or* the predictive uncertainty is small (small $V_{t|t-1}$, i.e. the data anchors the latent state tightly). Two regimes apply here.
+
+- **Closed-form policy.** $g(x; \beta) = \rho (1-\alpha)^{-1} x + \kappa(\alpha, \sigma_\varepsilon)$ is **globally linear in $x$**, so $H_2 = \rho/(1-\alpha)$ is a constant, the Taylor expansion is exact, and EKF reduces to standard Kalman with zero linearization error. I use this as "ground-truth" for validation.
+- **Neural surrogate policy.** $g$ is the cached neural network $\varphi_\theta$ that is pre-trained and used to approximate the optimal policy function. Linearity holds only approximately; the surrogate's slope against $\log z$ is checked offline via `diagnose_nn_linear_slope` and the residual variance $\sigma_{\xi^k}^2$ absorbs whatever gap survives.
+
+**Linearized state-space form.** Stack the two equations at the linearization point:
+$$
+y_{i,t} \;=\; H_t \, x_{i,t} + d_{i,t} + \epsilon_{i,t}, \qquad \epsilon_{i,t} \sim \mathcal{N}(0, R),
+$$
+with
+$$
+H_t = \begin{pmatrix} 1 \\ H_2(t) \end{pmatrix}, \quad
+d_{i,t} = \begin{pmatrix} \alpha \log k_{i,t} + \mu_\eta \\ g(m_{t|t-1}, k_{i,t}; \beta) - H_2(t)\,m_{t|t-1} + \mu_{\xi^k} \end{pmatrix}, \quad
+R = \begin{pmatrix} \sigma_\eta^2 & 0 \\ 0 & \sigma_{\xi^k}^2 \end{pmatrix},
+$$
+and AR(1) state transition $x_{i,t+1} = \rho \, x_{i,t} + \sigma_\varepsilon \, \nu_{i,t+1}$, $\nu \sim \mathcal{N}(0, 1)$.
+
+**Initialize** $m_{1|0} = 0$, $V_{1|0} = V_0 = 10$.
+
 **For $t = 1, \ldots, T$:**
- 
-1. **Predict the observation** (uses the observation equation from 2.3):
-$$\hat{y}_t = m_{t \mid t-1} + \alpha \log k_{i,t}, \qquad S_t = V_{t \mid t-1} + \sigma_\eta^2.$$
- 
-Likelihood contribution:
- 
-$$\log p(y_{i,t} \mid y_{i,1:t-1}, \beta) = -\tfrac{1}{2}\!\left[\log(2\pi S_t) + (y_{i,t} - \hat{y}_t)^2 / S_t\right].$$
- 
-2. **Update the state** with Kalman gain $K_t = V_{t \mid t-1} / S_t$:
-$$m_{t \mid t} = m_{t \mid t-1} + K_t (y_{i,t} - \hat{y}_t), \qquad V_{t \mid t} = (1 - K_t)\, V_{t \mid t-1}.$$
- 
-3. **Predict next state** (uses the AR(1) state transition from 2.3):
-$$m_{t+1 \mid t} = \rho \, m_{t \mid t}, \qquad V_{t+1 \mid t} = \rho^2 V_{t \mid t} + \sigma_\varepsilon^2.$$
- 
-Sum likelihood contributions across $t$ and $i$ to obtain $\log p(Y \mid \beta)$. Total cost: $O(N \cdot T)$.
- 
-The structural model enters in exactly two places: $(\alpha, \sigma_\eta, \log k_{i,t})$ in step 1 via the observation equation, and $(\rho, \sigma_\varepsilon)$ in step 3 via the AR(1) state transition. Everything else is generic Gaussian filtering.
- 
-**TensorFlow Probability (TFP) module:** `tfp.distributions.LinearGaussianStateSpaceModel`. We do not transcribe the recursion above into code. Instead, we feed it the model-specific pieces of the state-space form from 2.3 and TFP runs the recursion internally. Per candidate $\beta$, construct one LGSSM instance with these arguments:
 
-- `transition_matrix=[[ρ]]`, `transition_noise=MVN(scale_diag=[σ_ε])`: the AR(1) state dynamics.
-- `observation_matrix=[[1]]`, `observation_noise=MVN(scale_diag=[σ_η])`: the constant slope on the latent state and revenue noise scale.
-- `observation_offset=α·log k`: the only batch- and time-varying piece, passed as a tensor of shape `[N, T, 1]`. The leading dim $N$ is the firm batch (the only place batch information enters the LGSSM).
-- `initial_state_prior=MVN(loc=[0], scale_diag=[√V_0])`.
+1. **Predict the state** (AR(1) transition; at $t=1$ use initialization):
+$$
+m_{t|t-1} = \rho \, m_{t-1|t-1}, \qquad V_{t|t-1} = \rho^2 V_{t-1|t-1} + \sigma_\varepsilon^2.
+$$
 
-Then `.log_prob(Y)` on the observation tensor of shape `[N, T, 1]` returns the per-firm log-likelihoods as a tensor of shape `[N]`; sum to obtain the scalar $\log p(Y \mid \beta)$. The whole call is auto-differentiable in $\beta$, so NUTS-HMC gets $\nabla_\beta \log p(Y \mid \beta)$ without any hand-coded backward pass.
- 
-### 2.5 Priors
+2. **Evaluate the policy and its Jacobian** at $x = m_{t|t-1}$, $k = k_{i,t}$:
+$$
+g_t := g(m_{t|t-1}, k_{i,t}; \beta), \qquad H_2(t) := \partial g / \partial x \big|_{x = m_{t|t-1}}.
+$$
+Closed-form: $H_2(t) = \rho/(1-\alpha)$ analytically. NN surrogate: $H_2(t)$ via autodiff through the network.
 
-| Parameter | Prior | Support |
-|---|---|---|
-| $\alpha$ | Beta(2, 2) | $(0, 1)$ |
-| $\rho$ | Beta(2, 2) | $(0, 1)$ |
-| $\sigma_\varepsilon$ | HalfNormal(0.3) | $(0, \infty)$ |
-| $\sigma_\eta$ | HalfNormal(0.1) | $(0, \infty)$ |
+3. **Innovation** (observed minus predicted):
+$$
+\nu_t = \begin{pmatrix} \nu_1 \\ \nu_2 \end{pmatrix} = \begin{pmatrix} y_{i,t}^{(1)} - (m_{t|t-1} + \alpha \log k_{i,t} + \mu_\eta) \\ y_{i,t}^{(2)} - (g_t + \mu_{\xi^k}) \end{pmatrix}.
+$$
 
-Beta is the natural family on $(0, 1)$ and lightly downweights boundary degeneracies. HalfNormal is preferred to Uniform for scale parameters: no arbitrary upper bound and smooth gradients.
+4. **Innovation covariance** $S_t = H_t V_{t|t-1} H_t^T + R$ (closed-form $2 \times 2$):
+$$
+S_t = \begin{pmatrix} V_{t|t-1} + \sigma_\eta^2 & H_2(t)\,V_{t|t-1} \\ H_2(t)\,V_{t|t-1} & H_2(t)^2 V_{t|t-1} + \sigma_{\xi^k}^2 \end{pmatrix}.
+$$
 
-NUTS-HMC operates on $\mathbb{R}^4$. Each constrained parameter is transformed to the real line via a TFP bijector (`Sigmoid` for $(0, 1)$, `Exp` for positive scales). TFP applies the Jacobian correction automatically through `tfp.mcmc.TransformedTransitionKernel`.
+5. **Likelihood contribution** (bivariate Gaussian):
+$$
+\log p(y_{i,t} \mid y_{i,1:t-1}, \beta) = -\tfrac{1}{2}\!\left[2 \log(2\pi) + \log |S_t| + \nu_t^T S_t^{-1} \nu_t\right].
+$$
 
-### 2.6 Sampler Configuration
+6. **Kalman gain and update.** $K_t = V_{t|t-1} H_t^T S_t^{-1}$ (a $1 \times 2$ row); then
+$$
+m_{t|t} = m_{t|t-1} + K_t \nu_t, \qquad V_{t|t} = V_{t|t-1} (1 - K_t H_t).
+$$
 
-**Target.** $L(\beta) = \sum_j \log p_j(\beta_j) + \log p(Y \mid \beta)$, auto-differentiable in $\beta$.
+Sum likelihood contributions across $t$ and $i$ to obtain $\log p(Y \mid \beta)$. Cost per evaluation: $O(N \cdot T)$ filter steps, each requiring one $g$ evaluation and one Jacobian.
 
-**Sampler.** `tfp.experimental.mcmc.windowed_adaptive_nuts`. Jointly adapts step size (dual averaging) and mass matrix (windowed empirical covariance) during warm-up. The mass matrix is essential because $\alpha, \rho, \sigma_\varepsilon, \sigma_\eta$ have different posterior scales on the unconstrained side.
-
-| Setting | Value |
-|---|---|
-| Number of chains | 4 |
-| Warm-up iterations | 1000 |
-| Sampling iterations per chain | 2000 |
-| Target acceptance rate | 0.80 |
-
-Chains start from independent prior draws. After sampling, map back via inverse bijectors to recover values on the natural scale. Output: 8000 posterior samples $\{\beta^{(s)}\}$.
-
-**Compute Bottleneck**: Each NUTS-HMC iteration builds a binary tree of leapfrog steps. Each leapfrog step executes:
-- One $\nabla L(\beta)$ evaluation.
-- Autodiff requires one forward $L(\beta)$ evaluation under the hood.
-- $L(\beta) = $ (log-prior) + (log-likelihood). **The log-likelihood is where we need to solve the structural model at candidate $\beta$**
-
-In this application, each leapforg step is cheap because it directly call the closed-form solution for each $\beta$ evaluation. But it is worth emphasizing that the wall time exploded if we move beyond the basic frictionless model where VFI/NN-based solver are requried.
+**Implementation.** TFP's `LinearGaussianStateSpaceModel` does not apply because $g$ is nonlinear in $x$ for the NN surrogate, so the EKF is hand-rolled in `src/v2/estimation/bayesian_basic_investment.py` (`_build_ekf_log_likelihood`). The per-step Jacobian $H_2(t)$ is computed inside `tf.GradientTape` (reverse-mode autodiff; at scalar latent state this matches forward-mode efficiency and is XLA-compatible). The whole filter loop is wrapped in `@tf.function(reduce_retracing=True, jit_compile=True)` so NUTS-HMC obtains $\nabla_\beta \log p(Y \mid \beta)$ end-to-end through one compiled graph, with no hand-coded backward pass. The same `_build_ekf_log_likelihood` factory serves both the closed-form path (§2, with `policy_callable = env.analytical_policy`) and the NN-surrogate path (§3.4, with `policy_callable = policy_nn`); only the policy callable differs.
 
 
-### 2.7 Convergence Diagnostics
+### MCMC Sampler: NUTS and RW-MH
 
-This pipeline applies the Layer-A diagnostics from §1.4 with the targets stated there ($\hat{R} < 1.01$, $\mathrm{ESS} > 400$, no divergences, no max-tree-depth saturation). If any target fails, the remedy order is: raise warm-up iterations, raise target acceptance to 0.95, then revisit priors.
+I implemented two main samplers: NUTS-HMC and RW-MH. I also add an adaptive version of RW-MH known as Robust Adaptive Metropolis (RAM) introduced by Vihola (2012).
 
-### 2.8 Validation: Coverage Check
+**MCMC Sampler Algorithm**
 
-NB07 instantiates the Layer-B coverage check from §1.4 with $R = 30$ and per-replicate panel $(N, T) = (30, 18)$. Synthetic panels are produced by `spec.synthesize_panel_fn`, which rolls out AR(1) shocks under the closed-form policy at $\beta_0$ and adds $\eta_{i,t} \sim \mathcal{N}(0, \sigma_\eta^2)$. At $R = 30$ the 95% binomial interval around true coverage 0.95 is approximately $[0.87, 1.00]$, the pass band used in §2.10. The smaller per-rep spec delivers algorithm-level calibration; spec-faithful calibration at the FULL spec $(N, T) = (80, 30)$ is asserted asymptotically rather than separately tested. Full SBC (Talts et al. 2018) at $R \geq 100$ remains deferred to Future Extensions.
+1. Start at $\beta_0$ (drawn from the prior).
+2. At each iteration: 
+   - Propose $\beta'$ from a proposal distribution $q(\cdot \mid \beta)$, 
+   - Accept it with probability $\min\bigl(1,, \tfrac{p(\beta' \mid y)}{p(\beta \mid y)} \cdot \tfrac{q(\beta \mid \beta')}{q(\beta' \mid \beta)}\bigr)$; otherwise stay at $\beta$.
+3. After a warmup phase, the visited $\beta$ values are samples from the posterior $p(\beta \mid y)$.
 
-### 2.9 Reproducibility
+**Sampler comparison.** I summarize the three samplers by what they do and where each is preferred.
+
+| Sampler | What it does | Use case | Reason |
+|---|---|---|---|
+| **NUTS-HMC** | Uses the log-target's gradient $\nabla L(\beta)$ to simulate informed trajectories through parameter space. Trajectory length, step size, and per-axis scale are auto-tuned during warmup. | Closed-form policy function | Likelihood is differentiable and the gradient is cheap to compute (e.g., closed-form policy). Highest per-iteration efficiency.
+| **RW-MH** | Proposes the next $\beta$ by adding Gaussian random noise to the current value. Uses no gradient or local geometry. Step size is fixed and tuned manually. | NN policy surrogate | Default fallback when the gradient is unavailable or too expensive (e.g., nonlinear NN surrogate). Simple and gradient-free, but needs many more iterations to mix. 
+
+**Why gradient-free is the default for the NN-surrogate pipeline.** NUTS achieves its efficiency by running many small inner steps per iteration, each requiring one gradient of the log-target. With a closed-form policy, this gradient flows through analytical formulas and is cheap to compute. With the NN surrogate, computing the same gradient requires backpropagation through the entire network, which is much more expensive than a single forward evaluation. In our pipeline this gap is dramatic: NUTS with the NN surrogate runs more than 30 hours of wall time on CPU for the basic model, while RW-MH or RAM with the same NN finishes in minutes. The trade-off is that gradient-free samplers need more iterations to reach the same posterior precision, but each iteration is so much cheaper that they remain practical where NUTS+NN does not.
+
+### Implementation Issues
+
+There are several practical issues need to be noted:
+- The NN surrogate (SHAC) must be trained over a region that contains the prior's bulk mass. If the prior puts non-negligible probability outside the trained box, MCMC will visit points where the NN extrapolates and the likelihood is junk. At the code level I strictly align the box for parameters between pre-training and inference, and I also let NN training extract the box range of observables (e.g., capital) from the panel data first and align the simulated training data with it.
+- In my notebook demo, I slice the full dataset into smaller sub-samples to better control compute cost and wall time (specified by `n_firms` and `horizon`). For production we should obviously use the full panel dataset.
+- For this specific model, $\mu_\xi$ is weakly identified because it is highly correlated with $\alpha$. I did not patch this to keep the baseline algorithm simple and minimal. For future implementation, weak identification would need to be handled carefully with re-parameterization tricks or other treatment.
+
+
+### Reproducibility
 
 The pipeline reuses the project's existing stateless-seed infrastructure (`src/v2/data/rng.py`, `src/v2/utils/seeding.py`). A single master seed pair `(m0, m1)` controls every RNG-consuming step. Per-replicate child seeds are derived deterministically via `fold_in_seed(master, *tokens)`, where `tokens` are short namespace strings. Two key properties:
 
@@ -346,238 +353,135 @@ The pipeline reuses the project's existing stateless-seed infrastructure (`src/v
 
 No global RNG state is used. All randomness enters through explicit seed arguments.
 
-### 2.10 Results
 
-The frictionless model is exercised at ground truth $\beta = (\alpha, \rho, \sigma_\varepsilon, \sigma_\eta) = (0.6, 0.7, 0.15, 0.05)$ through two notebook profiles, both reproducible from [`docs/07_bayesian_validation.ipynb`](../07_bayesian_validation.ipynb). `FULL` runs a single-run sanity at the production spec: panel $N = 80$, $T = 30$, burn-in 30; 2 chains × (600 warmup + 800 samples); approximately 12 minutes on a single CPU. `COVERAGE_CHECK` runs $R = 30$ replicates at a smaller per-rep spec: panel $N = 30$, $T = 18$, burn-in 15; 2 chains × (150 warmup + 200 samples) per replicate; approximately 50 minutes on a single CPU. Per §2.8, the smaller per-rep spec validates algorithm-level calibration; spec-faithful coverage at the FULL spec is not separately tested.
+## 3. Validation Results
 
-#### Single-run posterior
+This section reports results by applying Bayesian estimation on simulated panels and verify if it can recover the ground-truth. There are two layers to be validated: 
 
-**Table 1: Posterior summary at ground-truth $\beta$ (`FULL` profile).**
+- Correctness of the inference pipeline itself: MCMC + filtering algorithms
+- Whether integrating the NN surrogate (instead of closed-form policy) into the inference pipeline lead to any bias and issues
 
-| Parameter            | True | Median | 95% CI         | $\hat{R}$ | ESS |
-|----------------------|------|--------|----------------|-----------|-----|
-| $\alpha$             | 0.60 | 0.603  | [0.596, 0.609] | 1.006     | 696 |
-| $\rho$               | 0.70 | 0.678  | [0.645, 0.715] | 1.002     | 654 |
-| $\sigma_\varepsilon$ | 0.15 | 0.159  | [0.151, 0.165] | 0.999     | 467 |
-| $\sigma_\eta$        | 0.05 | 0.018  | [0.001, 0.045] | 0.999     | 327 |
+For the first layer, I already implemented unit tests and integration tests, and the validation here is an additional replication to confirm that we can recover the true parameters (posteriors) of a toy model with closed-form optimal policy `kp = exp((log α + log E[z] - log(r+δ))/(1-α))`. 
 
-$\hat{R}$ is the Gelman-Rubin ratio of between-chain to within-chain variance; values near 1 mean the chains have mixed to a common distribution. ESS is the autocorrelation-corrected count of effectively independent samples; with 1600 nominal post-warmup draws, ESS of 400 implies roughly 5% Monte Carlo error on the credible-interval quantiles. All $\hat{R}$ are below 1.01 and all ESS exceed 200; $\sigma_\eta$'s ESS of 327 falls short of §2.7's stricter target of 400 but remains usable.
+For the second layer, the only difference is one-line code change that inject the pretrained and cached neural network `policy_nn` to replace the closed-form policy formula inside the likelihood `_build_ekf_log_likelihood`.
 
-The structural triple $(\alpha, \rho, \sigma_\varepsilon)$ is tightly identified: medians lie within 1-5% of truth and 95% CI half-widths are 1.1%, 5.0%, and 4.7% of the true value. The $\sigma_\eta$ posterior shifted below truth in this run and the 95% CI narrowly missed (truth 0.05, CI $[0.001, 0.045]$). $\sigma_\eta$ is weakly identified by design (§2.3): measurement noise accounts for only a small fraction of revenue variance, so the per-run posterior has substantial sampling variance across panel realizations. A single-run miss on a weakly-identified parameter is consistent with calibration. Calibration is the property tested by the coverage check across many realizations, not by any one run.
+More specifically, the validation has three steps:
 
-![Plot 1. Trace plots: two chains per parameter, overlaid with the truth line. Convergence shows as the two chains exploring the same region with no drift or stuck plateaus.](figures/bonus1-bayesian-basic/plot1_trace.png){#fig-nb07-trace}
+1. Fix a set of ground-truth parameters $(\alpha, \rho, \sigma_\varepsilon, \sigma_\eta, μ_η, μ_{ξ^k}, \sigma_η, \sigma_{ξ^k})$, simulate a panel of firms using the observation equations of the model, drop latent variable $z$, the final data include $(k_{it},\Pi_{it})$
+2. Extract the range of observables $k_{it}$ from panel, simulate new training and validation set on the same support, pre-train the NN surrogate policy using SHAC, save the learned NN $\varphi_\theta$ after convergence
+3. Pass the panel $(k_{it},\Pi_{it})$ and the policy (using either pre-trained $\varphi_\theta$ or closed-form) to MCMC sampler + filtering algorithm. Verify that the posterior median and credible intervals recover the ground-truth.
 
-![Plot 2. Posterior marginals: dashed black = true value, red = posterior median. The x-axis is fixed at the posterior median $\pm 4$ standard deviations, expanded to include the true value if it falls outside, clipped to support.](figures/bonus1-bayesian-basic/plot2_marginals.png){#fig-nb07-marginals}
 
-A clean trace plot (chains overlap, no drift, no stuck regions) is necessary for any further claim about the posterior to be trustworthy, and Plot 1 satisfies this for all four parameters. A unimodal posterior with truth in the bulk is what well-identified parameters should look like; a wide posterior whose bulk may or may not include truth is what weakly-identified ones should look like. Plot 2 shows both patterns. Neither plot validates calibration on its own: a tight posterior containing truth could be correctly calibrated or over-confident, and a wide posterior missing truth could be miscalibrated or simply unlucky.
 
-#### Coverage check
+###  NUTS + Kalman Filter with closed-form policy
 
-![Plot 3. Per-replicate 95% credible intervals (horizontal lines) with the ground-truth $\beta_0$ for each replicate marked as a black dot. Blue = CI contains truth; red = miss.](figures/bonus1-bayesian-basic/plot3_coverage_intervals.png){#fig-nb07-coverage}
+As the first validation exercise, I use the toy basic investment model to verify the code-level correctness of the inference pipeline for NUTS Sampler + Extended Kalman Filter. The implementation follow these steps:
 
-**Table 2: Empirical coverage rates over $R = 30$ replicates (`COVERAGE_CHECK` profile).**
+1. Fix a set of ground-truth parameters $(\alpha, \rho, \sigma_\varepsilon, \sigma_\eta, μ_η, μ_{ξ^k}, \sigma_η, \sigma_{ξ^k})$, simulate a panel of firms using the observation equations of the model, drop latent variable $z$, the final data include $(k_{it},\Pi_{it})$
+2. Use closed-form optimal policy to form the LGSSM.
+3. Run NUTS-HMC with Kalman filtering on the panel data $(k_{it},\Pi_{it})$, store and verify that the posteriors recover the ground-truth
 
-| Parameter            | Hits / R | Empirical | In $[0.87, 1.00]$? |
-|----------------------|----------|-----------|--------------------|
-| $\alpha$             | 24 / 30  | 0.80      | no                 |
-| $\rho$               | 23 / 30  | 0.77      | no                 |
-| $\sigma_\varepsilon$ | 25 / 30  | 0.83      | no                 |
-| $\sigma_\eta$        | 28 / 30  | 0.93      | yes                |
+By default, I use 4 chains, 1000 warmup steps, 500 post-warmup sample, and 0.9 MH test acceptance rate. I slice the panel to a small sample with 50 firms over 20 periods so that the estimation finished in one hour on Apple M1 (2020). 
 
-The band $[0.87, 1.00]$ is the 95% binomial interval around true coverage 0.95 at $R = 30$. Only $\sigma_\eta$ falls inside; the structural triple shows mild under-coverage. Under true 0.95 calibration the binomial probability of observing 23-25 hits out of 30 is about 1% to 7%, so the shortfall is unlikely to be sampling noise alone.
+**Table 1: Posterior summary at ground-truth $\beta$ (single run).**
 
-Interpretations. The likeliest explanation is under-adapted per-rep MCMC: with only 150 warmup steps per replicate, the windowed mass-matrix adaptation may not fully converge before sampling begins, biasing the per-rep credible intervals slightly. Per-rep $\hat{R}$ values are mostly below 1.05 but occasionally reach 1.06, which supports some convergence concern. A second possibility, mild genuine under-coverage at the smaller spec, is consistent with the data but cannot be localized without formal SBC at $R \geq 100$. The actionable fix in either case is to raise per-rep warmup (e.g., to 500) at proportionally higher wall time, or to run SBC.
+| Parameter            | True  | Median | 95% CI          | $\hat{R}$ | ESS  |
+|----------------------|-------|--------|-----------------|-----------|------|
+| $\alpha$             |  0.50 |  0.495 | [0.479, 0.511]  | 1.005     |  404 |
+| $\rho$               |  0.50 |  0.507 | [0.494, 0.520]  | 1.002     |  832 |
+| $\sigma_\varepsilon$ |  0.24 |  0.232 | [0.221, 0.244]  | 1.002     | 1240 |
+| $\mu_\eta$           |  0.00 |  0.014 | [-0.032, 0.065] | 1.004     |  480 |
+| $\sigma_\eta$        |  0.05 |  0.051 | [0.032, 0.065]  | 1.000     |  705 |
+| $\mu_{\xi^k}$        | -0.10 | -0.048 | [-0.197, 0.100] | 1.006     |  408 |
+| $\sigma_{\xi^k}$     |  0.05 |  0.048 | [0.025, 0.062]  | 1.001     |  624 |
 
-What the evidence supports: coverage is in the correct ballpark (around 80%, not 50% or 100%), and the inference handles the weakly-identified $\sigma_\eta$ with calibrated intervals. What it does not support: a strict claim of well-calibrated 95% intervals for $\alpha$, $\rho$, $\sigma_\varepsilon$.
+All 7 parameters recover truth within the 95% credible interval. As rule of thumb, All $\hat{R} < 1.01$ and all ESS exceed 400. The three economic parameters $\alpha, \rho, \sigma_\epsilon$ are tightly identified. Out of the 4 remaining parameters, $\mu_{\xi^k}$ is of interest because it captures firm's deviation from the model-implied optimal policy, in this case the true deviation is set of be -10%. The $\mu_{\xi^k}$ posterior correctly cover the -20% to 10% range with median close to -5%, but the CI is wide due to weak identification as $\mu_{\xi^k}$ is partially collinear with $\alpha$. For future production, we'll need larger sample, more training budget, and re-parameterization to solve the weak identification issue.
 
-#### Conclusion
+Split-$\hat{R}$ is the Gelman-Rubin ratio of between-chain to within-chain variance. $\hat{R}$ near 1 mean the chains have mixed to a common distribution. ESS is the autocorrelation-corrected count of effectively independent samples. For all posteriors, our ESS $\gt 400$ pass the minimal threshold. I interpret that both metrics pass the posterior diagnostic checks.
 
-NB07's purpose is to validate that the Bayesian inference machinery (MCMC + Kalman) is correctly implemented for the policy-free frictionless basic model. The §2.10 evidence supports four claims:
+![Plot Posterior marginals: dashed black = true value, red = posterior median. The x-axis is fixed at the posterior median $\pm 4$ standard deviations, expanded to include the true value if it falls outside, clipped to support.](figures/bonus1-bayesian-basic/validate-closedform/marginals.png){#fig-bayes-marginals}
 
-- **Kalman likelihood is correctly wired.** Single-run posterior medians for well-identified parameters concentrate within 1-5% of truth, which requires the implemented likelihood to be correctly proportional to $p(y \mid \beta)$.
-- **NUTS converges and explores the posterior.** Trace plots show overlapping chains; $\hat{R} < 1.01$ for every parameter; ESS is sufficient for reportable summaries.
-- **Prior and bijection plumbing are correct.** Posteriors respect their supports and $\sigma_\eta$ is wide as §2.3 predicts, not pathological.
-- **Credible intervals are approximately calibrated.** Coverage rates 0.77-0.93 are in the correct ballpark and $\sigma_\eta$ meets target.
+@fig-bayes-marginals plots the posterior marginals for all parameters, where dashed line is ground-truth and the red line is the estimated posterior median. @fig-bayes-trace plots the trace of post-warmup draws. The visual evidence is clean and suggest that the code-level implementation of the Bayesian inference pipeline does not have major defects and bugs.
 
-The evidence does not establish strict spec-faithful calibration at the FULL spec (asserted asymptotically, not separately tested), nor publication-precision calibration for the structural triple (coverage falls below the $[0.87, 1.00]$ binomial band; the fix is larger per-rep warmup or formal SBC), nor validity for the neural-surrogate + EKF pipeline of §3 (the EKF linearization error, NN approximation error, and $\sigma_\xi$ identification each need their own validation in §3.4.3).
 
-The frictionless-basic Bayesian pipeline is sound enough to proceed to §3 with reasonable confidence. The coverage shortfall is worth investigating before any production deployment but does not block §3.
+![Plot Trace: two chains per parameter, overlaid with the truth line. Convergence shows as the two chains exploring the same region with no drift or stuck plateaus.](figures/bonus1-bayesian-basic/validate-closedform/trace.png){#fig-bayes-trace}
 
----
 
-## 3. Accelerated Bayesian Inference with Neural Surrogate
+**Coverage and Sensitivity Checks**.
+To show additional checks, I re-run the estimation and the full post-inference analysis with smaller budget per replication: 2 chains, 500 warmup, 200 post-warmup samples, 15 firms and 10 periods (~90 min on Apple M1). This is obviously not sufficient, so the following results should be interpreted as a *budget-limited demo* under time pressure. Future production will use much larger budget for credible validation results.
 
-### 3.1 The Main Problem
+![Plot coverage of 95% CI over R=5 replications.](figures/bonus1-bayesian-basic/validate-closedform/coverage_intervals.png){#fig-bayes-coverage}
 
-Section 2 implements the policy-free approach on the frictionless basic model. The solver is not called inside MCMC, and the likelihood evaluates at near-zero cost. This works only because all four structural parameters of that model appear in the observation equation.
+@fig-bayes-coverage shows whether each replicate's 95% credible interval contains its ground-truth $\beta_0$. A well-calibrated estimator hits truth in roughly 95% of replicates. At the demo budget of $R = 5$ most parameters hit 3 or 4 times out of 5, just below the binomial pass-band and consistent with both small-$R$ noise and modest per-replicate warmup. The pipeline runs end-to-end here. A production calibration claim requires $R \geq 30$ and longer per-rep adaptation.
 
-For every other model in the project (frictional basic, risky debt, future extensions with measurement noise on capital), policy-based Bayesian inference is required to identify cost and default parameters (§1.2, §1.6). Under policy-based, the optimal policy must be re-evaluated at every candidate $\beta$ inside the MCMC log-target. The central design question becomes: **how to integrate the model solver into the Bayesian estimation pipeline without exploding computational time?**
+![Plot coverage of 95% CI over R=5 replications.](figures/bonus1-bayesian-basic/validate-closedform/ppc_distributions.png){#fig-bayes-ppc}
 
-A representative MCMC run requires on the order of $10^4$ to $10^5$ log-target evaluations. Each evaluation needs solving for the optimal policy at a different $\beta$. The per-solve cost multiplies through directly.
+@fig-bayes-ppc compares six summary statistics of the observed panel against their distributions under panels simulated from the posterior. If the model fits the data well, each observed value should sit somewhere in the bulk of its simulated distribution. An extreme tail position flags a feature the model cannot reproduce. All six posterior median estimates sit in the central range. The fitted model reproduces these data features without systematic misspecification.
 
-### 3.2 Why the Naive Approach Doesn't Work
+![Plot coverage of 95% CI over R=5 replications.](figures/bonus1-bayesian-basic/validate-closedform/sensitivity_comparison.png){#fig-bayes-sensitivity}
 
-Wiring the model solver (VFI/PFI/NN-based) directly into the per-MCMC-step likelihood is intractable.
+@fig-bayes-sensitivity overlays the posterior under three variants of the residual standard-deviation priors: tight, baseline, and loose. A posterior that barely moves across variants is data-driven, in contrast, one that tracks the prior is prior-driven. For all seven parameters the medians shift by a fraction of the credible-interval width and the intervals largely overlap. The data carries the identifying information here and the posterior estimates are generally robust.
 
-Under NUTS-HMC + Kalman, the number of model solves is roughly `#leapfrog steps ≈ N_chains × (N_warmup + N_samples) × avg_tree_size`. The frictionless baseline in Section 2 implies about $10^6$ solves per run; even at one minute per solve this is $\sim 10^4$ hours.
+### RW-MH + Kalman Filter with Neural Surrogate Policy
 
-Switching to RW-MH cuts the count but not enough. For a 6-8 dimensional $\beta$ at typical 1-5% efficiency, $\sim 80{,}000$ solver calls are needed across 4 chains. At one minute per solve, that is $\sim 1{,}300$ hours. This is impractical as a production pipeline.
+The second validation exercise switches the gradient-based NUTS for a gradient-free RW-MH sampler, holding the Kalman filter unchanged. I argue that when using a pre-trained NN surrogate, RW-MH sampler is  better than NUTS-HMC because backpropagation through the cached NN is still very slow per leapfrog iteration (>40 hours of wall time on Apple M1).
 
-### 3.3 Solution Method: Neural Surrogate
+To make the attribution clean, I run three configurations side-by-side on the same observed panel at the same scalar proposal step size:
 
-**Idea.** Pre-train the neural network only once, across the entire prior support of structural parameters $\beta$. The network takes $(s, \beta)$ as input where $s$ is the state vector (e.g., $(k, z)$ for basic, $(k, b, z)$ for risky debt) and returns the policy. After training, evaluating the policy at any $\beta$ is one forward pass.
+- **Closed-form RWMH** (control): RW-MH with the closed-form analytical policy. Isolates the sampler from any NN approximation error.
+- **NN-RWMH** (test): same RW-MH, with the cached SHAC NN as the EKF's policy. Difference vs CF-RWMH attributes to NN approximation error.
+- **NN-RAM** (adaptive variant): same NN spec, but with the proposal covariance adapted during warmup (Vihola 2012). Difference vs NN-RWMH attributes to the adaptive proposal.
 
-**Definition (neural surrogate policy).** Let $\varphi^*(s; \beta)$ denote the true (unknown) optimal policy function of the structural model at parameter $\beta$. A **neural surrogate policy** is a neural network $\varphi_{NN}(s, \beta; \theta_{NN})$, with weights $\theta_{NN}$, that approximates $\varphi^*$ jointly over the state space and the prior support of $\beta$:
+All three are run at 4 chains $\times$ (20000 warmup + 5000 samples) on a 100 firms $\times$ 15 periods panel slice. CF finishes in about 30 seconds; the two NN methods take roughly 50 minutes each. The per-step NN evaluation accounts for the entire wall-time gap.
 
-$$\varphi_{NN}(s, \beta; \theta_{NN}) \;\approx\; \varphi^*(s; \beta) \quad \text{for all } (s, \beta) \text{ in the relevant region.}$$
 
-The network is trained only once before MCMC starts; the trained weights $\theta_{NN}$ are stored and reused. Inside the Bayesian pipeline, the pre-trained $\varphi_{NN}$ acts as a fast, differentiable surrogate for the expensive structural model solver (e.g., VFI or NN-based). The term "surrogate" follows the surrogate-modeling literature . The qualifier "neural" identifies the function approximator. "Policy" identifies what is being approximated, in contrast to a neural surrogate *likelihood* or *posterior*, which target the inference output directly and replace MCMC entirely.
+![Posterior marginal densities under CF-RWMH (green, control with no NN), NN-RWMH (blue, baseline), and NN-RAM (orange, adaptive variant). Dashed black is truth; solid vertical lines are per-method medians.](figures/bonus1-bayesian-basic/rwmh-surrogate/density_overlay.png){#fig-rwmh-density}
 
-**Training.** $\beta$ is sampled from a distribution covering the prior support (the prior itself, or a tempered version of it). $s$ is sampled from a relevant region of the state space. I built two algorithms that have been tested and validated in previous section:
+![Trace plots: three columns (CF-RWMH, NN-RWMH, NN-RAM), one row per parameter, four chains overlaid in each cell. Well-mixed parameters show overlapping chains; ridge parameters show chains stuck in disjoint regions.](figures/bonus1-bayesian-basic/rwmh-surrogate/trace.png){#fig-rwmh-trace}
 
-- Euler residual minimization (Maliar21)
-- Short-Horizon Actor Critic
+**Does the evidence validate the pipeline?** Partially. The results suggest the inference pipeline and the NN surrogate approach worked, but the identification is weak for several parameters which is attributed to the structural model specification.
 
-The network learns the optimal policy function over the joint (state $\times$ parameter) space, treating $\beta$ as additional inputs alongside state vector. $\beta$ are not state variables in the dynamic-programming sense (they do not evolve with time), but the network handles them identically to state variables for purposes of function approximation.
+@fig-rwmh-density overlays the marginal posterior density (instead of histogram) of the three configurations. The vertical lines mark the posterior medina and the dashed line marks the true parameter value. It shows that:
 
-**Two use cases for the surrogate.** The same trained network serves both.
+- **Closed-form RWMH** (green) confirms the inference pipeline itself is correct, with posterior median very close to true value and a tight 95% CI
+- **NN-RWMH** (blue) are noisier but the posterior density is still close to **Closed-form-RWMH**. This is important to confirm that the NN surrogate's approximation error does NOT break the inference. It just adds upfront pre-training cost for achieving better precision.
+- **NN-RAM** (adaptive variant) rejects adaptive RW-MH as a usable variant at least for the basic model.
 
-1. *Primary: Inside MCMC under policy-based inference.* Each leapfrog step calls the network at the current $\beta$ candidate to evaluate the likelihood. Cost: milliseconds per call. NUTS-HMC remains feasible when $\varphi_{NN}$ is end-to-end differentiable in $\beta$.
-2. *Post-MCMC counterfactual analysis.* After MCMC produces posterior samples $\{\beta^{(s)}\}$, the surrogate evaluates the policy at each sample to compute counterfactual quantities (out-of-sample forecasts, comparative dynamics, firm value under alternative parameter regimes).
+On the other hand, however, both the posterior density and the trace plot show failures in mixing. I view it as part of the model's specification issue. In particular, two parameters ($\rho$ and $\mu_\eta$) actively miss truth at the 95% level, consistent with their broken chains and the inflated $\hat{R}$ and insuffcieint ESS.
 
-**Main advantages.**
+The six poorly-mixed parameters all lie along the $\kappa(\alpha) + \mu_{\xi^k}$ ridge already flagged in the identification discussion in previous section: a tightly correlated subspace that a scalar Gaussian random walk cannot traverse efficiently within a practical wall budget. The CF-RWMH control reproduces the same failure pattern, which rules out NN approximation error as the dominant cause and isolates the bottleneck to the sampler class. In other words, **the NN surrogate is validated: it does not inject the mixing failure.** What fails is the gradient-free scalar random walk on a posterior geometry that the previous NUTS+CF baseline (with gradient information) handled cleanly. NN-RAM helps somewhat (max $\hat{R}$ 1670 vs 4138) but does not break the structural ceiling at this budget.
 
-- Much lower computational cost and wall time.
-- Gradient in $\beta$ is available, enabling NUTS-HMC instead of RW-MH.
-- Solver cost is paid once upfront, not per MCMC iteration nor per posterior sample.
+**How to fix weak identification**. Resolving the mixing failure requires two changes, both beyond the scope of the simple baseline reported here. First, the observation equations need to be reparametrized so that the ridge direction aligns with a single sampled quantity. Concretely, $\mu_{\xi^k}$ and $\kappa(\alpha, \sigma_\varepsilon)$ both enter the $\log k$ equation additively as level terms, so sampling the composite offset $\zeta = \mu_{\xi^k} + \kappa(\alpha, \sigma_\varepsilon)$ in place of $\mu_{\xi^k}$ removes the partial collinearity at sampler level; $\mu_{\xi^k}$ is recovered post-hoc as $\zeta - \kappa(\alpha, \sigma_\varepsilon)$ from the joint posterior of $(\alpha, \sigma_\varepsilon, \zeta)$. Second, the MCMC and filtering stack needs either a substantive extension or a replacement, for example particle filter with adaptive Metropolis (PMMH), sequential Monte Carlo with tempering, or full-covariance adaptive proposals that learn the ridge direction during warmup. Both directions are deferred to future implementation and testing.
 
-**Cost.** Pre-training is a separate one-time step; its wall time depends on network size and model dimensionality. Once trained, the surrogate evaluation inside MCMC is two orders of magnitude faster than a full model solve: a single NUTS-HMC leapfrog step takes about 0.8–1.0 s (dominated by EKF construction and the NN forward + JVP at every $t$), versus 3–6 minutes for a PFI/ER solve. Across the $10^4$–$10^5$ leapfrog steps in a representative MCMC run, this amounts to a wall-time saving on the order of hundreds to thousands of hours.
 
-### 3.4 Validation: Neural Surrogate + Bayesian on Frictionless Basic Model
+**Table 2: NN-RWMH posterior summary against truth (baseline NN + gradient-free path).**
 
-The frictionless basic model serves as the integration test for the full
-neural-surrogate + Bayesian pipeline: it has a closed-form ground truth
-against which posterior recovery can be compared, while still exercising
-every step of the surrogate-policy machinery that §3 builds. If recovery
-holds here, the same pipeline can be applied to frictional / risky-debt
-models where no closed-form policy exists.
+| Parameter            | True  | Median | 95% CI            | $\hat{R}$ | ESS  |
+|----------------------|-------|--------|-------------------|-----------|------|
+| $\alpha$             |  0.50 |  0.547 | [0.534, 0.846]    | 4138      |  23  |
+| $\rho$               |  0.50 |  0.481 | [0.103, 0.496]    | 2394      |  25  |
+| $\sigma_\varepsilon$ |  0.24 |  0.235 | [0.229, 0.242]    | 1.3       |  65  |
+| $\mu_\eta$           |  0.05 | -0.073 | [-0.824, -0.034]  | 2015      |  270 |
+| $\sigma_\eta$        |  0.05 |  0.036 | [0.015, 0.052]    | 185       |  29  |
+| $\mu_{\xi^k}$        | -0.10 | -0.528 | [-1.219, -0.406]  | 250       |  347 |
+| $\sigma_{\xi^k}$     |  0.05 |  0.060 | [0.048, 0.280]    | 3691      |  142 |
 
-#### 3.4.1 Workflow
+### NUTS + Kalman Filter with Neural Surrogate Policy
 
-The pipeline is split across two notebooks, with Steps 1-2 owned by [`docs/09_neural_surrogate_pretrain.ipynb`](../09_neural_surrogate_pretrain.ipynb) and Steps 3-4 owned by [`docs/09_neural_surrogate_bayesian.ipynb`](../09_neural_surrogate_bayesian.ipynb). The pretrain notebook produces a four-file artifact bundle (NN weights, normalizer, panel, metadata) at `outputs/notebooks/09_neural_surrogate_pretrain/`; the inference notebook loads the bundle and runs the MCMC. The panel-with-NN bundling is the integration contract: NN training bounds and MCMC observations both derive from the same panel, eliminating cross-notebook config drift. [`docs/08_neural_surrogate_validation.ipynb`](../08_neural_surrogate_validation.ipynb) remains as a separate comparative-statics playground (ER vs SHAC visual comparison) and is untouched by this split.
 
-**Step 1 — Simulate the panel at ground truth.** Roll out
-$(k_{i,t}, z_{i,t})$ under the closed-form policy and form observed
-log-revenue:
 
-$$\log k_{i,t+1}(z_{i,t}; \beta) = \frac{\rho}{1-\alpha}\, \log z_{i,t} + \frac{1}{1-\alpha}\!\left[\log \alpha + \frac{\sigma_\varepsilon^2}{2} - \log(r + \delta)\right],$$
-
-$$\log \Pi_{i,t} = \log z_{i,t} + \alpha \log k_{i,t}.$$
-
-The result $y \equiv (\Pi_{i,t}, k_{i,t})$ is handed to the inference
-pipeline as "real-world" data; $z$ stays latent. Inference remains
-agnostic of the underlying DGP.
-
-**Step 2 — Pre-train the surrogate policy.** Derive the state-space
-support from the *panel only*:
-
-- $k$ bounds: panel $[k_{\min}, k_{\max}]$ with multiplicative margin 1.2.
-- $z$ bounds: fixed log-z half-width — $\log z \in [\mu - 1, \mu + 1]$.
-  Wide enough that the EKF's predicted latent state during MCMC stays
-  inside (the Kalman update anchors $m_{t|t-1}$ to the data); narrow
-  enough that the closed-form optimal action stays within the action box
-  for most $(z, \beta)$ pairs, so SHAC's gradient signal isn't dominated
-  by structural clipping.
-- $\beta$ bounds: prior box (the `BetaSampler` uniform default).
-
-Build a `ParameterizedBasicInvestmentEnv` with those explicit bounds,
-sample initial states from it, train SHAC with held-out MAE validation
-and plateau early-stop, then restore weights from the best-MAE
-checkpoint. A hard MAE gate (<2% of $k$-range) prevents a poor NN from
-silently biasing downstream MCMC. Persist weights + normalizer state to
-disk.
-
-**Step 3 — Run MCMC with two observation equations.**
-
-$$\log \Pi_{i,t} = x_{i,t} + \alpha \log k_{i,t} + \eta_{i,t}, \qquad \eta_{i,t} \sim \mathcal{N}(0, \sigma_\eta^2),$$
-
-$$\log k_{i,t+1} = \log \varphi_{\theta}(k_{i,t}, z_{i,t}; \beta) + \xi^k_{i,t}, \qquad \xi^k \sim \mathcal{N}(0, \sigma_\xi^2),$$
-
-where $x_{i,t} := \log z_{i,t}$. The second equation is **nonlinear in
-the latent state** through $\varphi_\theta$. We use the Extended Kalman
-Filter (EKF): at each step linearize $\log \varphi_\theta$ around the
-predicted latent mean $m_{t|t-1}$ via forward-mode JVP. Kalman + NUTS-HMC
-remain applicable. Estimated parameter vector is 5-dimensional:
-$\beta = (\alpha, \rho, \sigma_\varepsilon, \sigma_\eta, \sigma_\xi)$.
-The posterior of $\sigma_\xi$ is a direct Bayesian readout of the NN
-approximation error — a free diagnostic of surrogate quality.
-
-**Step 4 — Validate posteriors against ground truth** (analogous to §2.10).
-
-#### 3.4.2 Pre-Training Results
-
-[`docs/08_neural_surrogate_validation.ipynb`](../08_neural_surrogate_validation.ipynb)
-trains the surrogate in isolation against the closed-form $k'$ — a clean
-test of the training pipeline before plugging the surrogate into MCMC.
-FULL profile (4 hidden layers × 256 neurons; ER 8000 steps / SHAC 1600
-steps with plateau early-stop):
-
-![Training curves: held-out MAE vs SHAC/ER step. Red dashed line marks the best-checkpoint restore; the gap to final-step weights illustrates why best-step restoration matters.](figures/paramNN-validate/training_curve_full.png){#fig-training-curve}
-
-![Comparative-statics check. NN $k'$ (colored) overlaid on the closed-form (dashed black) along 1-D slices through $(α, ρ, σ_ε, z, k)$. Both ER and SHAC track the closed form within 1–2% of the $k$-range across the slice grid.](figures/paramNN-validate/slices_full.png){#fig-slices}
-
-**Held-out MAE summary (% of k-range):**
-
-| Slice         | ER % | SHAC % |
-|---------------|------|--------|
-| $\alpha$      | 1.07 | 1.99   |
-| $\rho$        | 1.19 | 1.68   |
-| $\sigma_\varepsilon$ | 1.42 | 1.34   |
-| $z$ (anchor $\beta$) | 0.93 | 1.52   |
-| $k$ (anchor $\beta$) | 0.86 | 1.99   |
-
-Both methods produce surrogates accurate to under 2% of the k-range —
-sufficient for the downstream Bayesian step.
-
-#### 3.4.3 Bayesian Inference Results
-
-##### Methodological justification: EKF + NUTS over PMMH
-
-Three reasons we use the EKF + NUTS pairing rather than a particle filter + RW-MH (PMMH) baseline at this stage:
-
-1. **The frictionless slice is exactly linear in the latent state.** From §2.2, the closed-form policy gives $\log k_{t+1}(z_t; \beta) = \frac{\rho}{1-\alpha}\log z_t + \kappa(\beta)$, a linear function of $\log z_t = x_t$. As the NN approximation $\log \varphi_\theta(\cdot)$ approaches this exact policy, the EKF's first-order linearization error vanishes and EKF reduces to a standard Kalman filter on the augmented LGSSM. EKF is essentially exact here.
-
-2. **σ_ξ posterior is the inline diagnostic of NN approximation error.** The likelihood includes $\xi^k_{i,t} \sim \mathcal{N}(0, \sigma_\xi^2)$ on Eq 2 specifically to absorb the residual NN-vs-truth gap. The posterior of $\sigma_\xi$ then reads out the data-driven estimate of NN error inside the inference. If $\sigma_\xi$ posterior concentrates near 0.01-0.05, the NN is a tight surrogate; higher concentration is a retrain signal. We do not need a separate offline NN-quality validation to detect bias; it is reported on every MCMC run.
-
-3. **PMMH would be 100-1000× slower at the same posterior quality.** A particle filter requires $\sim$100 particles per step, multiplying per-leapfrog cost by that factor. The non-differentiable likelihood forces RW-MH instead of NUTS, which in 5-D loses another 10-100× in iteration efficiency (Roberts-Gelman-Gilks optimal-scaling theory). The combined slowdown is 10³-10⁵ relative to EKF + NUTS, with no posterior-quality gain on this differentiable problem. PMMH remains the right tool for the risky-debt model where the policy is genuinely nonlinear in the latent state and the EKF linearization breaks down.
-
-For the risky-debt extension with 3-D latent state $(\log z, \log k, \log b)$ and three observation equations, the hand-rolled 2×2 Kalman algebra used here scales to 3×3 and becomes error-prone; the recorded follow-up is to migrate the EKF loop to `tfp.experimental.sequential.extended_kalman_filter_one_step` at that point.
-
-##### Results (placeholder)
-
-Posterior summary table, trace + marginal plots, and the $\sigma_\xi$ diagnostic populate after a successful end-to-end run of [`docs/09_neural_surrogate_bayesian.ipynb`](../09_neural_surrogate_bayesian.ipynb). Numbers hand-render from `outputs/notebooks/NB09_bayesian_surrogate_validation/posterior_summary_{mode}.csv` (same pattern as §2.10 Table 1). Comparison to §2.10's closed-form posterior for the structural parameters $(\alpha, \rho, \sigma_\varepsilon, \sigma_\eta)$ is the primary correctness check: if NB09's NN-surrogate posterior agrees with NB07's policy-free posterior on the shared parameters within their credible intervals, the NN surrogate is not introducing systematic bias.
 
 
 ---
 
 ## Future Extensions
 
-Deferred from Phase 1 to keep the baseline minimal:
+I consider the following directions as promising future extensions to better design and implementation of the final commercial product.
 
-- **Firm-specific outputs.** Apply the Kalman smoother per posterior draw to obtain per-firm latent productivity estimates $p(x_{i,t} \mid y_{i,1:T}, \beta)$.
-- **Policy-based extension of Phase 1.** Add Gaussian measurement noise on $\log k$ and treat the closed-form policy from §2.2 as a second observation equation (cf. §1.6). The frictionless policy is linear in $\log z$, so the extended system remains LGSSM and Kalman + NUTS-HMC still apply. This is the natural bridge from policy-free Phase 1 to the policy-based Phase 2 frictional and risky-debt extensions, where the policy becomes nonlinear and a particle filter is required.
-- **Firm-specific structural parameters.** Hierarchical extension $\beta_i \sim p(\cdot \mid \beta_{\text{population}})$.
-- **Simulation-Based Calibration (SBC; Talts et al. 2018).** Rank-based formal test of posterior calibration against the prior-implied DGP. Run before real-data deployment.
-- **Posterior predictive checks (PPC).** Compare statistics of replicated $Y_{\mathrm{rep}} \sim p(\cdot \mid \beta^{(s)})$ to observed $Y$. Essential for detecting model misspecification on real data.
-- **Real-data application.** After synthetic validation passes.
+- **Neural Likelihood Estimation**. Train a neural network to replace the model-specific likelihood evaluation step, such as the Kalman filter likelihood in a state-space model. The MCMC sampler can remain unchanged, except that each likelihood evaluation inside MCMC is replaced by the neural likelihood surrogate. This is a major extension to our current policy surrogate approach. It shares the same motivation of **amortizing the cost of expensive model solves**: instead of resolving the structural model at every MCMC proposal, we solve/simulate the model many times upfront and train a neural network to approximate the likelihood. Once trained, the surrogate likelihood can be evaluated cheaply inside MCMC, making Bayesian inference feasible for models where repeated likelihood evaluation is computationally prohibitive.
 
----
+- Benchmark the NN-surrogate inference under alternative filter + sampler pairings, especially **particle filter + Random Walk Metropolis-Hastings (PMMH)**. Although NUTS + Kalman is theoretically more efficient per iteration, the per-leapfrog gradient via autodiff through the NN is a measurable bottleneck on CPU; a gradient-free sampler paired with a non-Gaussian filter trades per-iteration efficiency for cheaper per-evaluation cost and parallelises more naturally on GPU. The cross-comparison would clarify whether the gradient-based pipeline remains the right default for NN-surrogate inference at scale.
 
-## References
+- Address **weak-identification via re-parameterisation**. For example, in the current toy model $\mu_{\xi^k}$ (deviation) is weakly identified as it correlate strongly with $\alpha$. Depending on the model and parameters of interest, we may need the re-parameterisation at algorithm level.
 
-- Andrieu, C., A. Doucet, and R. Holenstein (2010). "Particle Markov chain Monte Carlo methods." *Journal of the Royal Statistical Society, Series B* 72, 269–342.
-- Hamilton, J. D. (1994). *Time Series Analysis*. Princeton University Press. Chapter 13 (Kalman filter).
-- Hoffman, M. D., and A. Gelman (2014). "The No-U-Turn Sampler." *Journal of Machine Learning Research* 15, 1593–1623.
-- Strebulaev, I. A., and T. M. Whited (2012). "Dynamic Models and Structural Estimation in Corporate Finance." *Foundations and Trends in Finance* 6, 1–163.
-- Talts, S., M. Betancourt, D. Simpson, A. Vehtari, and A. Gelman (2018). "Validating Bayesian Inference Algorithms with Simulation-Based Calibration." arXiv:1804.06788.
-- Vehtari, A., A. Gelman, D. Simpson, B. Carpenter, and P.-C. Bürkner (2021). "Rank-normalization, folding, and localization: An improved R-hat for assessing convergence of MCMC." *Bayesian Analysis* 16, 667–718.
+- **Hierarchical (multilevel) Bayesian model** for estimating firm-specific posteriors, which is more useful for the commercial product (e.g., firm's deviation from optimal capital structure). In this framework, each firm $i$ has its own parameter vector $\beta_i$, linked through a shared population prior $\beta_i \sim p(\cdot \mid \beta_{\text{pop}})$ with $\beta_{\text{pop}}$ drawn from a hyperprior. This sits between two extremes: full pooling (one $\beta$ shared across all firms in the current setup) and full separation (independent per-firm MCMCs, which discard cross-sectional information). The mechanism is partial pooling: each firm's $\beta_i$ deviates from $\beta_{\text{pop}}$ where its own time series demands, but shrinks toward the population mean for parameters that are weakly identified within a single firm.
