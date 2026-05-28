@@ -419,14 +419,15 @@ class SMMSolveResult:
     error_type: ErrorType
     stage1: SMMStageResult
     stage2: SMMStageResult
-    omega_hat: np.ndarray
+    omega_hat: Optional[np.ndarray]
+    """None when two_step and compute_standard_errors are both False (Ω̂ not formed)."""
     omega_hat_condition_number: float
-    jacobian: np.ndarray
-    """Jacobian D (R × K) of the moment function w.r.t. β at β̂."""
-    asymptotic_variance: np.ndarray
-    """Asymptotic variance matrix V (K × K).  NaN if D'WD is singular."""
-    standard_errors: np.ndarray
-    """Per-parameter standard errors SE_k = sqrt(V_kk / N_d).  NaN if D'WD is singular."""
+    jacobian: Optional[np.ndarray]
+    """Jacobian D (R × K) of the moment function w.r.t. β at β̂.  None if SEs skipped."""
+    asymptotic_variance: Optional[np.ndarray]
+    """Asymptotic variance matrix V (K × K).  NaN if D'WD is singular, None if SEs skipped."""
+    standard_errors: Optional[np.ndarray]
+    """Per-parameter SE_k = sqrt(V_kk / N_d).  NaN if D'WD is singular, None if SEs skipped."""
     j_statistic: float
     j_p_value: float
     j_df: int
@@ -788,6 +789,9 @@ def solve_smm(
     target: SMMTargetMoments,
     config: SMMRunConfig | None = None,
     simulation_seed: Optional[tuple[int, int]] = None,
+    *,
+    two_step: bool = True,
+    compute_standard_errors: bool = True,
 ) -> SMMSolveResult:
     """Run the generic two-step SMM estimator.
 
@@ -802,6 +806,18 @@ def solve_smm(
     Total model solves ≈ stage1.optimizer_nfev + stage2.optimizer_nfev
     + 2 × K (Jacobian finite differences).  For expensive model solves
     (VFI/PFI/NN) this dominates wall time — see module docstring.
+
+    Args:
+        two_step: When False, skip Part 3 (Ω̂) and the stage-2 reweighting and
+            return the stage-1 (W = I) first-step estimator as the headline.
+            ``stage2`` is set equal to ``stage1``.
+        compute_standard_errors: When False, skip Part 4 entirely (the
+            finite-difference Jacobian costs 2·K extra model solves, plus the
+            asymptotic variance and J-statistic).  The corresponding result
+            fields are set to None/NaN.  Use for a fast point estimate.
+
+    When both flags are False the ``n_sim_panels > n_moments`` requirement is
+    waived because Ω̂ is never formed.
     """
     config = config or SMMRunConfig()
     simulation_seed = simulation_seed or fold_in_seed(
@@ -818,7 +834,10 @@ def solve_smm(
             "target moment count does not match spec.moment_names. "
             f"Got {target.values.size} and {len(moment_names)}."
         )
-    if config.n_sim_panels <= len(moment_names):
+    # Ω̂ is needed for stage-2 reweighting and for the sandwich/efficient
+    # variance.  Only enforce S > R when we will actually form Ω̂.
+    need_omega = two_step or compute_standard_errors
+    if need_omega and config.n_sim_panels <= len(moment_names):
         raise ValueError(
             "The two-step SMM estimator requires n_sim_panels > n_moments "
             f"to form Omega_hat. Got n_sim_panels={config.n_sim_panels} "
@@ -857,69 +876,93 @@ def solve_smm(
         optimizer_seed=stage1_seed,
     )
 
-    # --- Part 3: Build Omega_hat at stage-1 estimate ---
-    omega_hat, omega_cond = _build_omega_hat(
-        stage1_panel_moments=stage1.panel_moments,
-        target_values=target.values,
-        config=config,
-        n_moments=n_moments,
-    )
-
-    j_test_valid = True
-    if omega_cond > _OMEGA_COND_WARN:
-        warnings.warn(
-            f"Omega_hat condition number {omega_cond:.2e} exceeds "
-            f"{_OMEGA_COND_WARN:.0e}. W = Omega_hat^{{-1}} is numerically "
-            "unstable. Falling back to W = I for Stage 2 (first-step "
-            "estimator). J-test and efficient standard errors are not "
-            "available. Increase n_sim_panels (recommended S >> R, e.g., "
-            "50x n_moments) to obtain the efficient estimator.",
-            RuntimeWarning,
-            stacklevel=2,
+    # --- Part 3: Build Omega_hat at stage-1 estimate (only if needed) ---
+    # Omega_hat is required for stage-2 reweighting AND as the "meat" of the
+    # inference sandwich, so build it whenever either is requested.
+    if need_omega:
+        omega_hat, omega_cond = _build_omega_hat(
+            stage1_panel_moments=stage1.panel_moments,
+            target_values=target.values,
+            config=config,
+            n_moments=n_moments,
         )
-        j_test_valid = False
-        # Fall back to W = I: the first-step estimator is consistent,
-        # and using an ill-conditioned W would distort the estimate.
-        weighting_matrix = identity
     else:
-        weighting_matrix = np.linalg.inv(omega_hat)
+        omega_hat = None
+        omega_cond = float("nan")
+
+    # Weighting matrix USED BY THE ESTIMATOR.  Only the two-step path reweights
+    # by Omega_hat^{-1}; the one-step (two_step=False) estimator and the
+    # ill-conditioned fallback both use W = I.  Inference must use the SAME W as
+    # the estimator, with Omega_hat entering only the sandwich "meat", so this
+    # variable feeds both stage 2 and Part 4.
+    weighting_matrix = identity
+    j_test_valid = False
+    if two_step:
+        if omega_cond <= _OMEGA_COND_WARN:
+            weighting_matrix = np.linalg.inv(omega_hat)
+            j_test_valid = True
+        else:
+            warnings.warn(
+                f"Omega_hat condition number {omega_cond:.2e} exceeds "
+                f"{_OMEGA_COND_WARN:.0e}. W = Omega_hat^{{-1}} is numerically "
+                "unstable. Falling back to W = I for Stage 2 (first-step "
+                "estimator). J-test and efficient standard errors are not "
+                "available. Increase n_sim_panels (recommended S >> R, e.g., "
+                "50x n_moments) to obtain the efficient estimator.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
 
     # --- Part 2 (stage 2): Minimise Q with W ---
     # Stage 2 warm-starts from β̂₁ (already consistent) and only runs
     # local refinement.  When W = Omega_hat^{-1}, this is the efficient
-    # two-step estimator.  When W = I (fallback), Stage 2 reconverges
-    # to β̂₁ immediately — the two-step gracefully degrades to one-step.
-    stage2_seed = fold_in_seed(
-        simulation_seed, "smm", "stage2", "optimizer", config.global_method
-    )
-    stage2 = _run_smm_stage(
-        evaluate_beta=evaluate_beta,
-        weighting_matrix=weighting_matrix,
-        x0=stage1.beta.copy(),
-        bounds=bounds,
-        config=config,
-        optimizer_seed=stage2_seed,
-        local_only=True,
-    )
-    if not stage2.optimizer_success:
-        j_test_valid = False
+    # two-step estimator.  When two_step=False the stage-1 (W = I) first-step
+    # estimator is the headline and stage 2 is skipped.
+    if two_step:
+        stage2_seed = fold_in_seed(
+            simulation_seed, "smm", "stage2", "optimizer", config.global_method
+        )
+        stage2 = _run_smm_stage(
+            evaluate_beta=evaluate_beta,
+            weighting_matrix=weighting_matrix,
+            x0=stage1.beta.copy(),
+            bounds=bounds,
+            config=config,
+            optimizer_seed=stage2_seed,
+            local_only=True,
+        )
+        if not stage2.optimizer_success:
+            j_test_valid = False
+    else:
+        stage2 = stage1
 
-    # --- Part 4: Inference ---
-    beta_hat = stage2.beta.copy()
-    final_eval = evaluate_beta(beta_hat)
-    inference = _compute_smm_inference(
-        beta_hat=beta_hat,
-        evaluate_beta=evaluate_beta,
-        weighting_matrix=weighting_matrix,
-        omega_hat=omega_hat,
-        final_eval=final_eval,
-        lower=lower,
-        upper=upper,
-        n_params=n_params,
-        n_moments=n_moments,
-        n_sim_panels=config.n_sim_panels,
-        efficient=j_test_valid,
-    )
+    # --- Part 4: Inference (optional) ---
+    if compute_standard_errors:
+        beta_hat = stage2.beta.copy()
+        final_eval = evaluate_beta(beta_hat)
+        inference = _compute_smm_inference(
+            beta_hat=beta_hat,
+            evaluate_beta=evaluate_beta,
+            weighting_matrix=weighting_matrix,
+            omega_hat=omega_hat,
+            final_eval=final_eval,
+            lower=lower,
+            upper=upper,
+            n_params=n_params,
+            n_moments=n_moments,
+            n_sim_panels=config.n_sim_panels,
+            efficient=j_test_valid,
+        )
+    else:
+        inference = dict(
+            jacobian=None,
+            asymptotic_variance=None,
+            standard_errors=None,
+            j_statistic=float("nan"),
+            j_p_value=float("nan"),
+            j_df=n_moments - n_params,
+        )
+        j_test_valid = False
 
     return SMMSolveResult(
         parameter_names=parameter_names,

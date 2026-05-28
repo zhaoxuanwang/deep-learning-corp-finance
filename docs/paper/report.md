@@ -1,17 +1,22 @@
 ---
-title: "Deep Learning Methods for Corporate Finance"
+title: "Deep Learning and Quantitative Methods for Structural Corporate Finance"
 author: Zhaoxuan Wang
-number-sections: false
+number-sections: true
+top-level-division: chapter
+colorlinks: true
 date: 2026-04-27
 bibliography: ../references.bib
-thanks: Email - [wxuan.econ@gmail.com](mailto:wxuan.econ@gmail.com) or [zxwang13@student.ubc.ca](mailto:zxwang13@student.ubc.ca).
+thanks: Email me at [wxuan.econ@gmail.com](mailto:wxuan.econ@gmail.com)
 format:
   html:
     toc: false
   pdf:
-    toc: false
+    toc: true
+    toc-depth: 2
     pdf-engine: xelatex
-    documentclass: article
+    documentclass: book
+    classoption:
+      - oneside
     geometry:
       - margin=1in
     fontsize: 11pt
@@ -22,13 +27,37 @@ format:
     link-citations: true
     include-in-header:
       text: |
-        \usepackage{etoolbox}
-        \pretocmd{\section}{\clearpage}{}{}
+        \usepackage{newunicodechar}
+        \newunicodechar{μ}{\ensuremath{\mu}}
+        \newunicodechar{η}{\ensuremath{\eta}}
+        \newunicodechar{ξ}{\ensuremath{\xi}}
+        \newunicodechar{σ}{\ensuremath{\sigma}}
+        \newunicodechar{α}{\ensuremath{\alpha}}
+        \newunicodechar{δ}{\ensuremath{\delta}}
+        \providecommand{\gt}{>}
+        \providecommand{\lt}{<}
+        \setmainfont{LibertinusSerif}[Extension=.otf,UprightFont=*-Regular,BoldFont=*-Bold,ItalicFont=*-Italic,BoldItalicFont=*-BoldItalic]
+        \setmonofont{Inconsolatazi4}[Extension=.otf,UprightFont=*-Regular,BoldFont=*-Bold,Scale=MatchLowercase]
+        \setmathfont{LibertinusMath-Regular.otf}
+        \definecolor{linknavy}{HTML}{1A3E6E}
+        \definecolor{codebg}{HTML}{F2F2F2}
+        \AtBeginDocument{\hypersetup{colorlinks=true,allcolors=linknavy}}
+        \let\oldtexttt\texttt
+        \renewcommand{\texttt}[1]{{\setlength{\fboxsep}{1pt}\colorbox{codebg}{\oldtexttt{#1}}}}
+        \definecolor{shadecolor}{HTML}{F2F2F2}
 ---
 
-**Abstract.** This report examines quantitative methods for solving and estimating structural corporate finance models. On the solution side, I implement and evaluate the three deep-learning methods proposed in @maliar2021 — Lifetime Reward Maximization (LRM), Euler Residual Minimization (ERM), and Bellman Residual Minimization (BRM) — and benchmark them against classical Value Function Iteration and Policy Function Iteration. I also develop a new solution method based on Short-Horizon Actor-Critic (SHAC) reinforcement learning [@xu2022] and show that it converges to the analytical solution in settings where @maliar2021's methods are inapplicable. On the estimation side, I implement Generalized Method of Moments (GMM) and Simulated Method of Moments (SMM), validate both via Monte Carlo on the basic investment model, and apply SMM to the @hennessy2007costly endogenous default (risky debt) model. I document the practical and structural challenges in these applications.
+**Abstract.** This report examines quantitative methods for solving and estimating structural corporate finance models. On the solution side, I implement and evaluate the three deep-learning methods proposed in @maliar2021 (Lifetime Reward Maximization (LRM), Euler Residual Minimization (ERM), and Bellman Residual Minimization (BRM)) and benchmark them against classical Value Function Iteration and Policy Function Iteration. I also develop a new solution method based on Short-Horizon Actor-Critic (SHAC) reinforcement learning [@xu2022] and show that it converges to the analytical solution in settings where @maliar2021's methods are inapplicable. On the estimation side, I implement Generalized Method of Moments (GMM) and Simulated Method of Moments (SMM), validate both via Monte Carlo on the basic investment model, and apply SMM to the @hennessy2007costly endogenous default (risky debt) model. I document the practical and structural challenges in these applications.
 
-# Part I. Solving Dynamic Models
+# Introduction {.unnumbered}
+
+This report collects my ongoing work on solving and estimating structural corporate finance models. The main objective is to implement and validate a set of solution methods, and test them on different baseline model variants in finance and economics. All the algorithms and results are reproducible and can be found at: [https://github.com/zhaoxuanwang/deep-learning-corp-finance](https://github.com/zhaoxuanwang/deep-learning-corp-finance). The coverage of current project is summarized as below.
+
+
+
+Chapter 1 solves dynamic investment models using deep-learning and classical methods, and benchmarks them on a basic investment model and a risky-debt model. Chapter 2 estimates these models with the Generalized Method of Moments (GMM) and the Simulated Method of Moments (SMM). Chapter 3 develops a Bayesian estimation pipeline that uses a pre-trained neural surrogate policy to keep repeated model solves tractable. Chapter 5 solves the three Nikolov, Schmid, and Steri (2021) financing models by linear programming and estimates the trade-off model by indirect inference on Hong Kong data. Chapter 4 is reserved for future material. Each chapter is supported by an appendix collected at the end of the report.
+
+# Solving Dynamic Models
 
 To keep this report clear and concise, I focus on presenting the findings and the direct answers to the interview questions. In appendix, I provide a more detailed description of the models, solution methods (algorithms), additional results, and other implementation details.
 
@@ -162,7 +191,7 @@ k^*(z) \;=\; \left[\,\frac{\beta \cdot \mathbb{E}[z' \mid z]}{\bar r + \delta}\,
 \mathbb{E}[z' \mid z] \;=\; \exp\!\bigl((1-\rho)\mu + \rho \log z + \tfrac{1}{2}\sigma^2\bigr).
 $$
 
-The conditional expectation is given by the log-normal mean in closed form — no numerical quadrature is needed, because $\log (z' | z)$ is exactly normal with mean $(1-\rho)\mu + \rho \log z$ and variance $\sigma^2$. This makes $k^*(z)$ an exact, parameter-free anchor that I use repeatedly throughout the paper: 
+The conditional expectation is given by the log-normal mean in closed form: no numerical quadrature is needed, because $\log (z' | z)$ is exactly normal with mean $(1-\rho)\mu + \rho \log z$ and variance $\sigma^2$. This makes $k^*(z)$ an exact, parameter-free anchor that I use repeatedly throughout the paper: 
 
 - $k^*$ used as anchor for the space bounds of $k$ and $b$.
 - $k^*$ as the ground-truth policy for [benchmarking solution methods](#part1-validate);
@@ -291,6 +320,7 @@ $(s, a)$ and $(s', a')$ at each observation independently. At the optimum, the p
 $$\mathbb{E}_\varepsilon \left[F(s, \pi_\theta(s), s', \pi_\theta(s'))\right] = 0$$
 
 where $F: \mathcal{S} \times \mathcal{A} \times \mathcal{S} \times \mathcal{A} \to \mathbb{R}$ is the Euler residual function derived analytically from the first-order conditions of the Bellman equation, and $s' = f(s, \pi_\theta(s), \varepsilon)$ is the known state transition function. Two important implementation details:
+
 1. The empirical loss is the squared Euler residual $\frac{1}{B}\sum_{i \in B}^{B} F(s_i, a_i, s'_{i,1}, a'_{i,1}) \cdot F(s_i, a_i, s'_{i,2}, a'_{i,2})$ using two i.i.d. draws $s'_{i,1}$ and $s'_{i,2}$, which is an unbiased estimator for $\mathbb{E}_\varepsilon \left[ F(\cdot)^2 \right]$.
 2. Both @maliar2021 and @fernandez-villaverde2025 use a single policy network $\pi_\theta$ inside the Euler residual function $F$. In practice, this creates a
 moving-target problem that prevents convergence: the gradient of $\theta$ flows through both the current policy $\pi_\theta(s)$ and the next-period policy $\pi_\theta(s')$, which appear on both side of the Euler equation. To fix this, I uses a separate target network $\pi_{\theta^-}$ for the next-period action, which stablizes training and faciliates convergence.
@@ -595,7 +625,7 @@ There are two promising fixes: (1) use stochastic policy method instead of a det
 
 However, stochastic policy methods are usually not sample-efficient. For our model, nested VFI method is clearly faster and more robust. Fix (2) is a practical choice if we are willing to deviate from this version of the endogenous default model, but the standard VFI still performs better for this low-dimensional problem with few states.
 
-# Part II. Structural Estimation
+# Structural Estimation
 
 ## GMM and SMM  {#part2-validate}
 
@@ -637,7 +667,7 @@ I validate the GMM implementation on the basic investment model with smooth (con
 - **"Real" data simulation.** I first run a single PFI solve at $\beta^*$ on a dense grid (exogenous = 50, endogenous = 100, action = 100), then simulate $N = 100$ firms over $T = 25$ periods after a 275-period burn-in to ensure ergodic sampling. The GMM estimator treats $(\pi, k, I)$ as observed data and never re-solves the model. PFI approximation error in the policy enters the Euler residuals as a small systematic bias, kept below the sampling noise floor by the dense grid.
 - **Monte Carlo.** $J = 20$ independent panels, each generated from $\beta^*$ under a different master seed; the full two-step procedure is run on each.
 
-**Result 1 — optimizer reaches an interior minimum.** If GMM is correctly implemented, the six moment conditions at $\hat\beta$ should be near zero, well below the sampling noise floor. @tbl-gmm-moment-fit confirms this: five of six conditions are below $10^{-3}$ and the largest residual (Shock $\times 1$) is $3.5 \times 10^{-3}$. The Stage-1 global search and Stage-2 Powell refinement together find an interior minimum.
+**Result 1: optimizer reaches an interior minimum.** If GMM is correctly implemented, the six moment conditions at $\hat\beta$ should be near zero, well below the sampling noise floor. @tbl-gmm-moment-fit confirms this: five of six conditions are below $10^{-3}$ and the largest residual (Shock $\times 1$) is $3.5 \times 10^{-3}$. The Stage-1 global search and Stage-2 Powell refinement together find an interior minimum.
 
 | Moment              | $g(\hat\beta)$                    |
 | ------------------- | --------------------------------- |
@@ -650,7 +680,7 @@ I validate the GMM implementation on the basic investment model with smooth (con
 
 : Moment-condition vector $g(\hat\beta)$ on a single representative panel. {#tbl-gmm-moment-fit}
 
-**Result 2 — point estimate and sandwich SE are correctly calibrated on a single panel.** If they are, every estimate should be within roughly 1 SE of the truth and the parameter t-tests should fail to reject at 5%. @tbl-gmm-single-rep confirms both: every estimate is within 1 SE of $\beta^*$, all four parameter t-tests have $p > 0.10$ (the smallest is $\sigma$ at $p = 0.11$), and the over-identification J-test is also insignificant ($J = 4.11$, $p = 0.13$, df = 2). The single-panel pipeline behaves correctly.
+**Result 2: point estimate and sandwich SE are correctly calibrated on a single panel.** If they are, every estimate should be within roughly 1 SE of the truth and the parameter t-tests should fail to reject at 5%. @tbl-gmm-single-rep confirms both: every estimate is within 1 SE of $\beta^*$, all four parameter t-tests have $p > 0.10$ (the smallest is $\sigma$ at $p = 0.11$), and the over-identification J-test is also insignificant ($J = 4.11$, $p = 0.13$, df = 2). The single-panel pipeline behaves correctly.
 
 | Parameter | True   | Estimate | SE       | $t$-stat | $p$-value |
 | --------- | ------ | -------- | -------- | -------- | --------- |
@@ -661,7 +691,7 @@ I validate the GMM implementation on the basic investment model with smooth (con
 
 : Parameter estimates, sandwich SEs, and t-tests against the true parameter. J-statistic = 4.11, $p$ = 0.13, df = 2. {#tbl-gmm-single-rep}
 
-**Result 3 — point estimate is unbiased on average and asymptotic SE is correctly calibrated.** This requires three things together: bias should be much smaller than the within-replication SE, the empirical SD across replications should match the average SE, and the J-test rejection rate at 5% nominal should be $\approx 0.05$. @tbl-gmm-mc partially confirms this. The point estimates are economically close to the truth (relative bias is below 4% for every parameter). However, the empirical SD across replications is systematically $1.3$–$2 \times$ the average within-replication SE, so the asymptotic sandwich formula understates the true sampling variability. This propagates into J-test over-rejection at $0.20$ vs the nominal $0.05$. Both failures are consistent with PFI grid approximation in the panel-generation step entering the Euler residuals as a small systematic bias.
+**Result 3: point estimate is unbiased on average and asymptotic SE is correctly calibrated.** This requires three things together: bias should be much smaller than the within-replication SE, the empirical SD across replications should match the average SE, and the J-test rejection rate at 5% nominal should be $\approx 0.05$. @tbl-gmm-mc partially confirms this. The point estimates are economically close to the truth (relative bias is below 4% for every parameter). However, the empirical SD across replications is systematically $1.3$–$2 \times$ the average within-replication SE, so the asymptotic sandwich formula understates the true sampling variability. This propagates into J-test over-rejection at $0.20$ vs the nominal $0.05$. Both failures are consistent with PFI grid approximation in the panel-generation step entering the Euler residuals as a small systematic bias.
 
 | Parameter | True   | Mean estimate | Bias        | RMSE     | SD across MC | Avg SE   |
 | --------- | ------ | ------------- | ----------- | -------- | ------------ | -------- |
@@ -688,7 +718,7 @@ I validate the SMM implementation on the frictionless basic investment model, wh
 - **Simulation budget.** $N = 500$ firms, horizon $T = 25$, burn-in = 75, and $S = 50$ simulated panels per moment evaluation.
 - **Monte Carlo.** $J = 10$ independent fake-real panels, each generated from $\beta^*$ under a different master seed.
 
-**Result 1 — optimizer reaches an interior minimum.** If SMM is correctly implemented, the simulated moments at $\hat\beta$ should match their data-side targets to within Monte-Carlo noise. @tbl-smm-moment-fit confirms this: every fitted moment is within $\sim 1\%$ of its target, so the Stage-1 global search and Stage-2 Powell refinement find an interior minimum.
+**Result 1: optimizer reaches an interior minimum.** If SMM is correctly implemented, the simulated moments at $\hat\beta$ should match their data-side targets to within Monte-Carlo noise. @tbl-smm-moment-fit confirms this: every fitted moment is within $\sim 1\%$ of its target, so the Stage-1 global search and Stage-2 Powell refinement find an interior minimum.
 
 | Moment              | Target    | Fitted    |
 | ------------------- | --------- | --------- |
@@ -699,7 +729,7 @@ I validate the SMM implementation on the frictionless basic investment model, wh
 
 : Moment fit at $\hat\beta$ on a single representative panel. {#tbl-smm-moment-fit}
 
-**Result 2 — point estimate and sandwich SE are correctly calibrated on a single panel.** If they are, every estimate should fall within roughly 1 SE of the truth and the parameter t-tests should fail to reject at 5%. @tbl-smm-single-rep confirms both: every estimate is within 0.2 SE of $\beta^*$ and all parameter t-tests have $p > 0.85$. The over-identification J-test is also insignificant ($J = 0.62$, $p = 0.43$, df = 1).
+**Result 2: point estimate and sandwich SE are correctly calibrated on a single panel.** If they are, every estimate should fall within roughly 1 SE of the truth and the parameter t-tests should fail to reject at 5%. @tbl-smm-single-rep confirms both: every estimate is within 0.2 SE of $\beta^*$ and all parameter t-tests have $p > 0.85$. The over-identification J-test is also insignificant ($J = 0.62$, $p = 0.43$, df = 1).
 
 | Parameter | True   | Estimate | SE       | $t$-stat | $p$-value |
 | --------- | ------ | -------- | -------- | -------- | --------- |
@@ -709,7 +739,7 @@ I validate the SMM implementation on the frictionless basic investment model, wh
 
 : Parameter estimates, sandwich SEs, and t-tests against the true parameter. J-statistic = 0.62, $p$ = 0.43, df = 1. {#tbl-smm-single-rep}
 
-**Result 3 — point estimate is unbiased on average and asymptotic SE is correctly calibrated.** This requires bias much smaller than the within-replication SE, empirical SD $\approx$ average SE, and J-test rejection rate at 5% nominal not exceeding $0.05$. @tbl-smm-mc confirms all three. Bias is more than an order of magnitude below SE for every parameter, the empirical SD agrees with the average SE within $\sim 30\%$ (consistent with the small MC sample of $J = 10$), and the J-test never rejects across 10 replications — $0/10$ is statistically consistent with any size at or below $0.05$.
+**Result 3: point estimate is unbiased on average and asymptotic SE is correctly calibrated.** This requires bias much smaller than the within-replication SE, empirical SD $\approx$ average SE, and J-test rejection rate at 5% nominal not exceeding $0.05$. @tbl-smm-mc confirms all three. Bias is more than an order of magnitude below SE for every parameter, the empirical SD agrees with the average SE within $\sim 30\%$ (consistent with the small MC sample of $J = 10$), and the J-test never rejects across 10 replications; $0/10$ is statistically consistent with any size at or below $0.05$.
 
 | Parameter | True   | Mean estimate | Bias       | RMSE     | SD across MC | Avg SE   |
 | --------- | ------ | ------------- | ---------- | -------- | ------------ | -------- |
@@ -724,11 +754,11 @@ I validate the SMM implementation on the frictionless basic investment model, wh
 
 ## Applying SMM to the risky debt model
 
-Applying SMM to the basic investment model identifies four parameters: production-function curvature ($\alpha$), smooth adjustment cost ($\psi_1$), AR(1) persistence ($\rho$), and AR(1) shock variance ($\sigma$). Adding costly equity issuance from section 3.3 of @strebulaev2012 brings two more parameters into scope: the fixed and proportional cost components ($\eta_0$ and $\eta_1$). The full endogenous-default model adds one final parameter, the deadweight bankruptcy cost $c_{\text{def}}$ — the fraction of firm value lost when the firm defaults. From a pure estimation perspective, the endogenous-default extension only adds one parameter; the rest can be estimated from the simpler frictional model in section 3.3.
+Applying SMM to the basic investment model identifies four parameters: production-function curvature ($\alpha$), smooth adjustment cost ($\psi_1$), AR(1) persistence ($\rho$), and AR(1) shock variance ($\sigma$). Adding costly equity issuance from section 3.3 of @strebulaev2012 brings two more parameters into scope: the fixed and proportional cost components ($\eta_0$ and $\eta_1$). The full endogenous-default model adds one final parameter, the deadweight bankruptcy cost $c_{\text{def}}$, the fraction of firm value lost when the firm defaults. From a pure estimation perspective, the endogenous-default extension only adds one parameter; the rest can be estimated from the simpler frictional model in section 3.3.
 
 The cost of applying SMM to risky debt model is computational: each candidate $\beta$ in the optimizer's inner loop requires a fresh nested-VFI solve on the discrete $(k, b, z)$ grid. A Monte-Carlo replication study at this scale is infeasible (on my current device), so I report a single representative run rather than MC summary statistics. The full SMM target is $\beta = (\alpha,\, \psi_1,\, \eta_0,\, \eta_1,\, c_{\text{def}},\, \rho,\, \sigma)$ with $K = 7$, matched against $R = 11$ moments following @hennessy2007costly's selection (see [Appendix B](#sec-smm-appendix)). The results can be reproduced from `docs/06_risky_debt_smm_workflow.ipynb`. It took about 40 hours to run the full SMM on my 2020 Macbook Pro (M1).
 
-**Result 1 — moment fit.** Fitted moments deviate noticeably from their targets. The conditional-issuance, AR(1)-shock-std, and variance-of-investment moments miss by 50%+ of their target value, indicating the optimizer cannot find a $\beta$ that matches all 11 moments simultaneously.
+**Result 1: moment fit.** Fitted moments deviate noticeably from their targets. The conditional-issuance, AR(1)-shock-std, and variance-of-investment moments miss by 50%+ of their target value, indicating the optimizer cannot find a $\beta$ that matches all 11 moments simultaneously.
 
 | Moment              | Target      | Fitted      |
 | ------------------- | ----------- | ----------- |
@@ -746,7 +776,7 @@ The cost of applying SMM to risky debt model is computational: each candidate $\
 
 : Moment fit at $\hat\beta$ on a single representative panel (11 moments, 7 estimated parameters). {#tbl-smm-debt-moment-fit}
 
-**Result 2 — parameter estimates.** Five of seven t-tests reject $H_0:\, \hat\beta_k = \beta_k^*$ at the 5% level. The two that fail to reject ($c_{\text{def}}$, $\rho$) do so only because their standard errors are abnormally large.
+**Result 2: parameter estimates.** Five of seven t-tests reject $H_0:\, \hat\beta_k = \beta_k^*$ at the 5% level. The two that fail to reject ($c_{\text{def}}$, $\rho$) do so only because their standard errors are abnormally large.
 
 | Parameter        | True   | Estimate | SE       | $t$-stat   | $p$-value      |
 | ---------------- | ------ | -------- | -------- | ---------- | -------------- |
@@ -803,17 +833,1245 @@ One simple solution is to use the same time schedule as in the trade-off model i
 
 Defect 2 is directly related to the critique by @deangelo2022: Can manager and lender precisely estimate the continuation value $V$ and default states given by $\{z: V(\cdot, z)\leq 0\}$? This is the key important assumption of the model: the endogenous default decision is a going-concern and manager would only default when the firm's continuation value is negative. The pricing of bonds is from a bargaining between the firm and the lender based on $\mathbb{E}_{z'|z} [V(k',b',z')]$ where there exist a critical value of shock $z'_d$ such that all $z'<z'_d$ are default states [@hennessy2007costly, Proposition 6]. However, if manager and lender cannot learn $V$ with any realistic precision, this core mechanism is broken.
 
-@deangelo2022 [Section VI] reviews direct evidence of imperfect manager knowledge. There are two key takeaways. First, large-scale surveys of CFOs indicated that "most managers have nothing close to the knowledge assumed in extant dynamic capital structure models, which posit a complete understanding of investment opportunities and capital-market conditions over an infinite horizon" [@graham2022presidential]. Second, a number of studies have estimated a near-flat relationship between firm value and leverage, suggesting that "real-world managers are unable to pin down a uniquely optimal capital structure with any real precision" [@korteweg2010net]. 
+@deangelo2022 [Section VI] reviews direct evidence of imperfect manager knowledge. There are two key takeaways. First, large-scale surveys of CFOs indicated that "most managers have nothing close to the knowledge assumed in extant dynamic capital structure models, which posit a complete understanding of investment opportunities and capital-market conditions over an infinite horizon" [@graham2022presidential]. Second, a number of studies have estimated a near-flat relationship between firm value and leverage, suggesting that "real-world managers are unable to pin down a uniquely optimal capital structure with any real precision" [@korteweg2010net].
 
 
----
+# Bayesian Estimation of the Strebulaev (2012) Models
 
-# References
 
-::: {#refs}
-:::
+## Short answers to the bonus question #1
 
-# Appendix A. Solution Methods to Dynamic Models {#sec-solve}
+**(a) What are your prior assumptions on the parameters?**
+A prior encodes belief about a parameter before seeing data. It is specified as a probability density function of the parameter, $p(\beta)$. Practical specification depends on domain-knowledge. I discuss the specific priors I choose for different parameters in later section.
+
+**(b) What filtering method do you use, and what are its pros and cons vs alternatives?**
+By default, I use Kalman Filter when the model can be cast as a Linear Gaussian state-space model (LGSSM). When the likelihood is differentiable but non-linear, I consider Extended Kalman Filter or Unscented Kalman Filter as alternatives. When the likelihood is non-differentiable, I consider the Particle Filter and Random Walk Metropolis–Hastings (RW-MH) as fallback. I discuss specific filtering choice later when applying to different models.
+
+**(c) Which MCMC method (in TFP), and how is it chosen?** I built and tested two main options: (1) No-U-Turns (NUTS) Hamiltonian Monte Carlo with Extended Kalman Filter; (2) Random-Walk Metropolis-Hastings (RW-MH) with Extended Kalman Filter. NUTS are more efficient when gradient info $\nabla L(\beta)$ is available, RW-MH is used when gradient is not available or too computationally costly.
+
+**(d) What tests assess the validity of the estimation method?**
+For generic diagnostic metrics, I report split-$\hat{R}$ and effective sample size (ESS), as well as several method-specific metrics such as diverged transitions and leapfrog tree depth (for NUTS-HMC). For posterior analysis, I report visualization of the posterior marginals, summary statistics (median and mean), and trace plot. For more complete tests, I implement a minimal version of coverage check in the spirit of [Simulation-Based Calibration](https://mc-stan.org/docs/stan-users-guide/simulation-based-calibration.html), as well as posterior predictive checks (simulate data to match real data) and prior sensitivity analysis (robustness of result when varying prior).
+
+**(e) How does Bayesian estimation compare to GMM and SMM?**
+GMM matches model-implied moments (analytical functions of $\theta$) to sample moments. It requires the optimal policy function itself to be expressible analytically in $\theta$. In this project only the basic model without adjustment cost satisfies that. SMM replaces the analytical moments with simulated ones: one model solve per parameter evaluation, so any model that can be simulated is in scope. SMM gives a point estimate with asymptotic-sandwich standard errors, no full posterior; the analyst must pick the moments (a modeling choice that affects identification); and it is prone to weak identification when the chosen moments don't pin down $\theta$. 
+
+Bayesian estimation uses the full likelihood (no moment selection), delivers the joint posterior distribution, and quantifies parameter uncertainty. It often worked better in identification of high-dimensional models compared with SMM. For models more complicated than the basic model, I introduce a Neural Surrogate approach to cut per-evaluation model solve cost for both Bayesian MCMC and SMM. This is done by pre-training a neural network (NN) to approximate the optimal policy function in state-by-parameter space. Thus, the choice between Bayesian and SMM reduces to a methodological one: full posterior characterization (Bayesian) versus a frequentist point estimate (SMM).
+
+## Overview
+
+### Target
+
+Treat the parameter vector $\beta$ as a random variable. Given observed data $y$, the target is the posterior distribution
+
+$$p(\beta \mid y) \;\propto\; \underbrace{p(\beta)}_{\text{prior}} \cdot \underbrace{p(y \mid \beta)}_{\text{likelihood}}.$$
+
+Markov Chain Monte Carlo (MCMC) operates on the **log-target**
+
+$$L(\beta) \;:=\; \log p(\beta) + \log p(y \mid \beta)$$
+
+Since $\log p(y)$ does not depend on $\beta$, it cancels in every Metropolis-Hastings (MH) acceptance ratio and never needs to be computed. The pipeline reduces to two tasks: specify a prior, and evaluate the log-likelihood $\log p(y \mid \beta)$ at any candidate $\beta$.
+
+### Model specification
+
+The Bayesian pipeline has one upstream modeling choice that shapes everything downstream: Do we assume that observed actions (e.g., investment, leverage) are generated by the firms acting by optimal policy? If so, what structural form shall we impose on the residual gaps?
+
+In principle, there are many ways to cast the structural model into a set of empirical specifications for Bayesian estimation. This specification choice largely depend on (1) the complexity of the model itself (e.g., risky debt); (2) the target parameters to be estimated (e.g., firm's deviation from optimal leverage); and (3) the additional assumptions we are willing to impose on top of the original theoretical model (e.g., Gaussian noise or systematic error).
+
+To illustrate this concretely, I use the simple basic model of optimal investment as example. Consider that we observe a panel data of firms. The basic optimal investment model has a solution defined as an optimal policy function $\varphi$ mapping states to actions. 
+
+**Observed data.** We observe a firm-year panel of capital, leverage, and revenue:
+$$
+\text{Panel data:} \quad (k_{it}, b_{it}, \Pi_{it}).
+$$
+
+**Structural model.** A vector $\beta \equiv (\alpha, \rho, \sigma_\epsilon)$ of structural parameters underlying the data-generating process (DGP):
+$$
+\begin{aligned}
+\text{Cobb-Douglas production:} \quad \log \Pi_{it} &= \log z_{it} + \alpha \cdot \log k_{it} + \eta_{it} \\
+\text{Latent AR(1) productivity:} \quad \log z_{it} &= \rho \log z_{i,t-1} + \sigma_\varepsilon \cdot \mathcal{N}(0, 1) \\
+\text{Investment policy:} \quad \log k_{it} &= \varphi_k(z_{it}, k_{it}, b_{it} \mid \beta) + \xi^k_{it} \\
+\text{Leverage policy:} \quad \log b_{it} &= \varphi_b(z_{it}, k_{it}, b_{it} \mid \beta) + \xi^b_{it}
+\end{aligned}
+$$
+where $z$ is the latent productivity shock, $\varphi_k$ and $\varphi_b$ are the optimal investment and leverage policies implied by the model at $\beta$, and the unconditional mean of $\log z$ is normalized to zero so the production residual carries all level information.
+
+**Residual specification.** The three residuals absorb the gap between model implications and observed data:
+$$
+\eta_{it} \sim \mathcal{N}(\mu_\eta, \sigma^2_\eta), \quad \xi^k_{it} \sim \mathcal{N}(\mu_{\xi^k}, \sigma^2_{\xi^k}), \quad \xi^b_{it} \sim \mathcal{N}(\mu_{\xi^b}, \sigma^2_{\xi^b}).
+$$
+The Gaussian shape is a likelihood assumption that can be relaxed (Student-t, mixture). I take Gaussian as the baseline. The means and variances are additional parameters to be estimated.
+
+**Economic interpretation.** Each residual has important economic meanings:
+
+- $\eta$ is production misspecification or measurement error in revenue. A nonzero $\mu_\eta$ indicates the production function omits a systematic factor (e.g., labor input). $\sigma_\eta^2$ measures production-equation fit quality.
+- $\xi^k$ and $\xi^b$ are *policy deviations*: the systematic gap between observed investment / leverage and the model-implied optimal choices. A nonzero $\mu_{\xi^k}$ indicates firms invest more or less on average than the model-implied optimal decisions; $\sigma_{\xi^k}^2$ measures dispersion of that deviation. Analogously for $\xi^b$. This is the cross-sectional analog of the investment and labor "wedges" in DSGE business-cycle accounting (Chari, Kehoe, McGrattan 2007).
+
+**Identification.** Generally, we need to constraints for identification:
+
+1. The unconditional mean of $\log z$ is normalized to zero. Without this, $E[\log z]$ and $\mu_\eta$ are observationally equivalent in the production equation. The normalization is harmless: any nonzero unconditional mean of latent productivity is absorbed by $\mu_\eta$.
+2. The policy intercept of $\varphi_k(\cdot \mid \beta)$ is a deterministic function of $\beta$. A free additive $\mu_{\xi^k}$ is partially collinear with shifts in $\beta$ that move this intercept. Depending on the specific models, identification is enabled by (i) informative priors on $\mu_{\xi^k}$ centered at zero, and (ii) $\beta$ enters $\eta$, $\xi^k$, and $\xi^b$ jointly, so the posterior anchors $\beta$ from production and AR(1) variations, leaving the residual policy gap to $\mu_{\xi^k}$.
+
+These choices capture the argument for identifying firm's deviation from optimal actions: $\mu_{\xi^k}$ captures "policy deviation that cannot be explained by a different $\beta$ within the model class."
+
+**Baseline choice of priors**
+
+I consider the following baseline choice of priors:
+
+| Parameters | Prior | Support | Rationale |
+|---|---|---|---|
+| $\alpha$ | Beta(2, 2) | $(0, 1)$ | Moderate return to scale |
+| $\rho$ | Beta(2, 2) | $(0, 1)$ | Moderate persistence |
+| $\sigma_\varepsilon$ | HalfNormal(0.3) | $(0, \infty)$ | More mass on low variance|
+| $\sigma_\eta$ | HalfNormal(0.1) | $(0, \infty)$ | More mass on less measurement error |
+| $μ_η, μ_{ξ^k}, μ_{ξ^b}$ | Normal(0, 0.1) | $(-\infty, \infty)$ | Center around zero |
+| $σ_η, σ_{ξ^k}, σ_{ξ^b}$ | HalfNormal(0.5) | $(0, \infty)$ | More mass on low variance |
+
+
+**Special case: observation-only inference.** When the only goal is to identify parameters that appear in the production equation $(\alpha, \rho, \sigma_\varepsilon, \mu_\eta, \sigma_\eta)$, the policy residuals can be dropped from the likelihood entirely. Observed $(k, b)$ are then treated as exogenous covariates and no policy solve is needed. This case applies to the frictionless basic model (§3.1), where the policy adds no extra identifying information beyond what the production equation provides. For every other model in the project (frictional basic, risky debt, extensions), cost and default parameters enter only through the policy, so the policy residuals must be kept in the likelihood. This is the central motivation for the neural-surrogate work in §3: solving the model at every MCMC step requires the policy to be amortized in $\beta$ so each evaluation is one forward pass.
+
+
+
+### Generic Algorithm
+
+The pipeline is generic across choices of filter and MCMC sampler. The Evaluate step branches by approach.
+
+**Setup.**
+
+- Specify priors $p(\cdot)$
+- Specify a filtering algorithm that, given fixed data $y$ and a candidate $\beta$, returns the scalar $\log p(y \mid \beta)$.
+- Fix the number of MCMC iterations $J$ and the number of chains.
+
+**Pre-training NN surrogate policy**
+
+This step may be skipped if the optimal policy can be written in closed-form formula, or if inference does not need optimal policy to form the observation equations.
+
+- Takes firm panel dataset as input, extract state space bounds (e.g., min and max capital observed)
+- Use the extracted state bounds from panel and parameter bounds from prior to simulate a panel of training dataset
+- Train NN on the simulated data and obtain the parametrized policy surrogate, $\varphi_\theta(s, \beta)$, which is stored as NN weights and biases. Discard the training and validation set.
+   -  Model solve method: Short-horizon Actor Critic (default) and Euler residual minimization (special case)
+- Pass the stored NN surrogate to the likelihood estimation in next stage
+
+
+**Bayesian Inference: MCMC + Filtering Algorithm** 
+
+For each MC chain, per iteration $j = 1, \ldots, J$:
+
+1. **Propose** a candidate $\beta'$ by perturbing the current $\beta$. I built three options:
+   - *Random-Walk Metropolis-Hastings (RW-MH):* draw $\beta' = \beta +$ Gaussian noise. Gradient-free default.
+   - *Robust Adaptive Metropolis (RAM):* Adaptive version of RW-MH that avoids manual tuning of the search step size.
+   - *No-U-Turn Sampler with Hamiltonian Monte Carlo (NUTS-HMC):* use $\nabla_\beta L(\beta)$ to simulate Hamiltonian dynamics on $L$, then slice-sample a candidate from the trajectory. Gradient-based; requires $L$ to be differentiable in $\beta$.
+2. **Evaluate** $L(\beta') = \log p(\beta') + \log p(y \mid \beta')$. The likelihood step depends on the approach:
+   - *Option 1: Closed-form Policy.* Form the observation equation using closed-form formula of optimal policy. Run the filter. 
+   - *Option 2: Neural Surrogate Policy.* Take the pre-trained NN surrogate policy $\varphi_\theta(s,\beta)$, plug into observation and transition equations, run the filter.  
+
+3. **Accept or reject.** MH test accepts $\beta'$ with probability $\min(1, \exp(L(\beta') - L(\beta)))$ under symmetric proposal. NUTS-HMC uses the joint Hamiltonian ratio.
+4. **Record** the current chain position as sample $\beta^{(j)}$.
+
+**Output.** A pooled set of samples $\{\beta^{(j)}\}$ across chains. Their empirical distribution approximates $p(\beta \mid y)$. Posterior means, quantiles, and credible intervals are computed from this set.
+
+**Two principles guide method choice:**
+
+- Filter and sampler are independent components and can be swapped separately.
+- The MH accept/reject step guarantees correctness. The proposal rule controls only efficiency.
+
+### Validation and Diagnostics
+
+Below are the metrics and tests I use to validate the inference implementation.
+
+**Per-run MCMC convergence.** The following metrics are reported to test whether the sampler converged on this dataset?
+
+- *Split R-hat* (Vehtari et al. 2021). Between- vs within-chain variance ratio after splitting each chain in half. Target $\hat{R} < 1.01$ at production budget; loosened to $\hat{R} < 1.05$ at smoke budget.
+- *Effective Sample Size (ESS).* Autocorrelation-corrected count of independent samples,
+
+    $$\mathrm{ESS} = \frac{MS}{1 + 2 \sum_{k \geq 1} \rho_k}$$
+
+    for $M$ chains and $S$ post-warmup samples each, with $\rho_k$ the lag-$k$ autocorrelation truncated at the first negative estimate. Target $\mathrm{ESS} > 400$ (about 5% Monte Carlo error on credible-interval quantiles).
+- *NUTS-specific signals.* Zero divergences and no max-tree-depth saturation across post-warmup iterations. Both indicate the sampler is exploring the target geometry without numerical breakdown or premature trajectory termination.
+- *Trace plots.* Overlapping chains, no drift, no stuck plateaus. Necessary but not sufficient; complements the numerical diagnostics.
+
+TFP modules: `tfp.mcmc.potential_scale_reduction`, `tfp.mcmc.effective_sample_size`. Divergence counts and per-iteration tree depth are returned in the trace metadata of `tfp.experimental.mcmc.windowed_adaptive_nuts`.
+
+**Calibration of the inference machinery.** Do the credible intervals attain their nominal coverage on data drawn from the model? This validates the implementation against the data-generating process.
+- *Coverage check.* Draw $R$ parameter vectors $\beta_0$ from the prior; for each, simulate a panel under the model at $\beta_0$, run the full inference pipeline, and record per-parameter 95% credible intervals. Pass when the empirical hit rate per parameter falls inside the binomial 95% interval around true coverage 0.95 at the chosen $R$.
+- Future extension: *Simulation-Based Calibration (Talts et al. 2018).* Rank-based formal test at $R \geq 100$ with rank histograms; the rigorous version of the coverage check. Not implemented in current version
+
+
+**Model-data fit.** The last set of tests aim to examine how the fitted model describe the real data?
+
+- *Posterior predictive checks (PPC).* Compare summary statistics of replicated panels $Y^{\mathrm{rep}} \sim p(\cdot \mid \beta^{(s)})$ to the observed $Y$. Systematic mismatch in a summary that the model should reproduce flags misspecification.
+- *Prior sensitivity analysis.* Vary the prior within a defensible range and confirm that posterior summaries move by less than their credible-interval widths. Bounded movement indicates the posterior is data-driven rather than prior-driven on the parameters of interest.
+
+
+## Bayesian Inference with Neural Surrogate
+
+The goal is to verify the Bayesian inference pipeline end-to-end on the basic model with no adjustment costs. This is a special case of the toy model because the optimal policy has a closed-form formula, which allows me to validate and test the pipeline with ground-truth. 
+
+The main innovation of my implementation is the use of a pre-trained "Neural Surrogate" to approximate the optimal policy function in inference. The benefit is substantial:
+- Typical MCMC + Filtering requires at least **thousands of model solve** (via VFI/PFI/NN-based methods) when evaluating different parameter candidates
+- My approach only needs **one model solve**: pre-train a NN surrogate over the entire States $\times$ Parameter space, then pass it to the inference pipeline for each evaluation.
+
+I illustrate my pre-training + inference pipeline below using the toy basic investment model.
+
+### Environment: Basic Model
+
+Following @strebulaev2012 [Section 3.1], each firm $i = 1, \ldots, N$ solves an infinite-horizon investment problem with no adjustment costs and no debt.
+
+The log-productivity follows a first-order autoregressive process (AR1):
+
+$$\log z_{i,t+1} = \rho \cdot \log z_{i,t} + \sigma_\varepsilon \cdot \varepsilon_{i,t+1}$$
+
+where $\varepsilon_{i,t+1} \sim \mathcal{N}(0,1)$, $\rho \in (0,1)$, $\sigma_\varepsilon > 0$. Shocks $\varepsilon_{i,t+1}$ are iid across firms and time.
+
+Firm's observed revenue and capital stock is assumed to be generated by:
+$$
+\begin{aligned}
+\log \Pi_{it} &= \log z_{it} + \alpha \cdot \log k_{it} + \eta_{it}  \\
+\log k_{it} &= \varphi_k(z_{it}, k_{it} \mid \beta) + \xi^k_{it}
+\end{aligned} 
+$$
+
+where as before I assume that model specification error are Gaussian:
+$$
+\eta_{it} \sim N(\mu_\eta, \sigma_\eta), \qquad \xi^k_{it} \sim N(\mu_\xi, \eta_\xi)
+$$
+
+Using capital accumulation identity, $k_{i,t+1} = (1 - \delta)\, k_{i,t} + I_{i,t}$, the control (action) variable can be re-written from investment $I$ to $k_{t+1}$, that is, firm directly choose the optimal capital level of next period. 
+
+Without adjustment costs, firm's optimal policy function has closed-form solution:
+
+$$ \begin{aligned}
+\varphi_k(z_{it}, k_{it} \mid \beta) &= \frac{\rho}{1-\alpha}\, \log z_{i,t} + \frac{1}{1-\alpha}\!\left[\log \alpha + \frac{\sigma_\varepsilon^2}{2} - \log(r + \delta)\right]\\
+&= \frac{\rho}{1-\alpha}\, \log z_{i,t} + \kappa(\alpha,\sigma_\epsilon,r,\delta)
+\end{aligned}$$
+
+where we denote the second intercept term as $\kappa(\cdot)$ for simplicity. This formula can be derived easily using the Euler equation $E_t[\alpha \, z_{i,t+1} \, k_{i,t+1}^{\alpha-1}] = r + \delta$ and $E_t[z_{i,t+1}] = \exp(\rho \log z_{i,t} + \sigma_\varepsilon^2 / 2)$ for log-normal variable $z$. 
+
+This means capital is log-linear in $\log z_{i,t}$, enabling the linear Gaussian state-space form.
+
+**Target parameters to be estimated** include economic parameters $\beta \equiv (\alpha, \rho, \sigma_\varepsilon, \sigma_\eta)$ and the mean $(μ_η, μ_{ξ^k})$ and variances $(\sigma_η, \sigma_{ξ^k})$ for the model-specification errors.
+
+**Calibrated parameters:** $r = 0.04$ (risk-free rate) and $\delta = 0.10$ (depreciation rate).
+
+### Pre-training the Neural Surrogate
+
+The pre-training part uses two NN-based methods to solve for firm's optimal policy:
+- Default: Short-Horizon Actor Critic (SHAC)
+- Optional: Euler Residual Minimization (ER)
+
+These methods have been introduced and tested in part 1. The key point is instead of mapping from state space to action space, the NN surrogate is trained on the higher-dimensional state $\times$ parameter space. 
+
+Concretely, let $\beta \equiv (\alpha, \rho, \sigma_\varepsilon)$ denote the structural economic parameters of the basic model. The pre-trained NN surrogate here is $\varphi(z,k; \beta)$ mapping to the optimal next-period capital $k'$. This is different from pure model solve (Part 1) where parameters are fixed and the NN policy is only 2-dim over $(z,k)$.
+
+This approach is only feasible with NN-based policy approximator. Traditional numerical methods like VFI, PFI, or Linear Programming are grid-based and cannot be solved once over a high-dimensional parameter space. It would require repeatedly solving the model under different parameters, which is intractible even for toy model of this scale (with 8 parameters to be estimated).
+
+To validate the quality of the pre-trained NN surrogate policy, I use the same set of metrics computed on held-out validation dataset. I also plot the NN solution against true analytical solution over $k$ slices. @fig-nb09a-slices shows that SHAC learned a highly precise NN surrogate (orange) with mean absolute error (MAE) lower than 1% when compared against the true closed-form formula (dash). The pre-trained NN surrogate maps $(z,k, \alpha, \rho, \sigma_\varepsilon)$ to the optimal next-period capital $k'$. SHAC is also efficient as this training took about 30min on a CPU (Apple M1). In future, this can be scale up with GPU and more training budget to learn more complex models and to achieve lower mean absolute error. The results can be reproduced in `docs/08a_pretrain_nn_surrogate.ipynb`.
+
+![Training curves: held-out MAE vs SHAC/ER step. Red dashed line marks the best-checkpoint restore; the gap to final-step weights illustrates why best-step restoration matters.](figures/paramNN-validate/training_curve_full.png){#fig-training-curve}
+
+![Pre-trained Neural Surrogate.](figures/bonus1-bayesian-basic/slices_pretrain.png){#fig-nb09a-slices}
+
+
+
+### Likelihood: Extended Kalman Filter
+
+I use Extended Kalman Filter (EKF) to compute likelihood.
+Independence across firms gives
+$$\log p(Y \mid \beta) = \sum_{i=1}^{N} \sum_{t=1}^{T} \log p(y_{i,t} \mid y_{i,1:t-1}, \beta),$$
+where $y_{i,t} = (\log \Pi_{i,t}, \log k_{i,t+1})^T$ stacks the two observations at firm-year $(i, t)$ and $\beta$ collects every estimable parameter from §2.3.
+
+The latent state is scalar, $x_{i,t} \equiv \log z_{i,t}$. Let $m_{t|s}, V_{t|s}$ denote the conditional mean and variance of $x_{i,t}$ given $y_{i,1:s}$ (firm index suppressed).
+
+**Two observation equations.** From §2.3,
+$$
+y_{i,t}^{(1)} \;=\; x_{i,t} + \alpha \log k_{i,t} + \mu_\eta + \eta_{i,t}, \qquad \eta \sim \mathcal{N}(0, \sigma_\eta^2),
+$$
+$$
+y_{i,t}^{(2)} \;=\; g(x_{i,t}, k_{i,t}; \beta) + \mu_{\xi^k} + \xi^k_{i,t}, \qquad \xi^k \sim \mathcal{N}(0, \sigma_{\xi^k}^2),
+$$
+where $g(x, k; \beta) := \log \varphi_k(\exp x, k; \beta)$ is the log-policy prediction for $\log k_{t+1}$. Eq 1 is linear in $x$; Eq 2 is **potentially nonlinear** in $x$ through $g$.
+
+**When the EKF is appropriate.** The EKF replaces $g(x; \beta)$ with its first-order Taylor expansion around the predicted latent mean,
+$$
+g(x; \beta) \;\approx\; g(m_{t|t-1}; \beta) + H_2(t) \cdot (x - m_{t|t-1}), \qquad H_2(t) := \frac{\partial g}{\partial x}\bigg|_{x = m_{t|t-1}}.
+$$
+The Taylor remainder is of order $\tfrac{1}{2} |g''(m_{t|t-1})| \cdot V_{t|t-1}$, so the linearization is accurate when *either* the policy is close to linear in $x$ (small $|g''|$) *or* the predictive uncertainty is small (small $V_{t|t-1}$, i.e. the data anchors the latent state tightly). Two regimes apply here.
+
+- **Closed-form policy.** $g(x; \beta) = \rho (1-\alpha)^{-1} x + \kappa(\alpha, \sigma_\varepsilon)$ is **globally linear in $x$**, so $H_2 = \rho/(1-\alpha)$ is a constant, the Taylor expansion is exact, and EKF reduces to standard Kalman with zero linearization error. I use this as "ground-truth" for validation.
+- **Neural surrogate policy.** $g$ is the cached neural network $\varphi_\theta$ that is pre-trained and used to approximate the optimal policy function. Linearity holds only approximately; the surrogate's slope against $\log z$ is checked offline via `diagnose_nn_linear_slope` and the residual variance $\sigma_{\xi^k}^2$ absorbs whatever gap survives.
+
+**Linearized state-space form.** Stack the two equations at the linearization point:
+$$
+y_{i,t} \;=\; H_t \, x_{i,t} + d_{i,t} + \epsilon_{i,t}, \qquad \epsilon_{i,t} \sim \mathcal{N}(0, R),
+$$
+with
+$$
+H_t = \begin{pmatrix} 1 \\ H_2(t) \end{pmatrix}, \quad
+d_{i,t} = \begin{pmatrix} \alpha \log k_{i,t} + \mu_\eta \\ g(m_{t|t-1}, k_{i,t}; \beta) - H_2(t)\,m_{t|t-1} + \mu_{\xi^k} \end{pmatrix}, \quad
+R = \begin{pmatrix} \sigma_\eta^2 & 0 \\ 0 & \sigma_{\xi^k}^2 \end{pmatrix},
+$$
+and AR(1) state transition $x_{i,t+1} = \rho \, x_{i,t} + \sigma_\varepsilon \, \nu_{i,t+1}$, $\nu \sim \mathcal{N}(0, 1)$.
+
+**Initialize** $m_{1|0} = 0$, $V_{1|0} = V_0 = 10$.
+
+**For $t = 1, \ldots, T$:**
+
+1. **Predict the state** (AR(1) transition; at $t=1$ use initialization):
+$$
+m_{t|t-1} = \rho \, m_{t-1|t-1}, \qquad V_{t|t-1} = \rho^2 V_{t-1|t-1} + \sigma_\varepsilon^2.
+$$
+
+2. **Evaluate the policy and its Jacobian** at $x = m_{t|t-1}$, $k = k_{i,t}$:
+$$
+g_t := g(m_{t|t-1}, k_{i,t}; \beta), \qquad H_2(t) := \partial g / \partial x \big|_{x = m_{t|t-1}}.
+$$
+Closed-form: $H_2(t) = \rho/(1-\alpha)$ analytically. NN surrogate: $H_2(t)$ via autodiff through the network.
+
+3. **Innovation** (observed minus predicted):
+$$
+\nu_t = \begin{pmatrix} \nu_1 \\ \nu_2 \end{pmatrix} = \begin{pmatrix} y_{i,t}^{(1)} - (m_{t|t-1} + \alpha \log k_{i,t} + \mu_\eta) \\ y_{i,t}^{(2)} - (g_t + \mu_{\xi^k}) \end{pmatrix}.
+$$
+
+4. **Innovation covariance** $S_t = H_t V_{t|t-1} H_t^T + R$ (closed-form $2 \times 2$):
+$$
+S_t = \begin{pmatrix} V_{t|t-1} + \sigma_\eta^2 & H_2(t)\,V_{t|t-1} \\ H_2(t)\,V_{t|t-1} & H_2(t)^2 V_{t|t-1} + \sigma_{\xi^k}^2 \end{pmatrix}.
+$$
+
+5. **Likelihood contribution** (bivariate Gaussian):
+$$
+\log p(y_{i,t} \mid y_{i,1:t-1}, \beta) = -\tfrac{1}{2}\!\left[2 \log(2\pi) + \log |S_t| + \nu_t^T S_t^{-1} \nu_t\right].
+$$
+
+6. **Kalman gain and update.** $K_t = V_{t|t-1} H_t^T S_t^{-1}$ (a $1 \times 2$ row); then
+$$
+m_{t|t} = m_{t|t-1} + K_t \nu_t, \qquad V_{t|t} = V_{t|t-1} (1 - K_t H_t).
+$$
+
+Sum likelihood contributions across $t$ and $i$ to obtain $\log p(Y \mid \beta)$. Cost per evaluation: $O(N \cdot T)$ filter steps, each requiring one $g$ evaluation and one Jacobian.
+
+**Implementation.** TFP's `LinearGaussianStateSpaceModel` does not apply because $g$ is nonlinear in $x$ for the NN surrogate, so the EKF is hand-rolled in `src/v2/estimation/bayesian_basic_investment.py` (`_build_ekf_log_likelihood`). The per-step Jacobian $H_2(t)$ is computed inside `tf.GradientTape` (reverse-mode autodiff; at scalar latent state this matches forward-mode efficiency and is XLA-compatible). The whole filter loop is wrapped in `@tf.function(reduce_retracing=True, jit_compile=True)` so NUTS-HMC obtains $\nabla_\beta \log p(Y \mid \beta)$ end-to-end through one compiled graph, with no hand-coded backward pass. The same `_build_ekf_log_likelihood` factory serves both the closed-form path (§2, with `policy_callable = env.analytical_policy`) and the NN-surrogate path (§3.4, with `policy_callable = policy_nn`); only the policy callable differs.
+
+
+### MCMC Sampler: NUTS and RW-MH
+
+I implemented two main samplers: NUTS-HMC and RW-MH. I also add an adaptive version of RW-MH known as Robust Adaptive Metropolis (RAM) introduced by @vihola2012robust.
+
+**MCMC Sampler Algorithm**
+
+1. Start at $\beta_0$ (drawn from the prior).
+2. At each iteration: 
+   - Propose $\beta'$ from a proposal distribution $q(\cdot \mid \beta)$, 
+   - Accept it with probability $\min\bigl(1,, \tfrac{p(\beta' \mid y)}{p(\beta \mid y)} \cdot \tfrac{q(\beta \mid \beta')}{q(\beta' \mid \beta)}\bigr)$; otherwise stay at $\beta$.
+3. After a warmup phase, the visited $\beta$ values are samples from the posterior $p(\beta \mid y)$.
+
+**Sampler comparison.** I summarize the three samplers by what they do and where each is preferred.
+
+| Sampler | What it does | Use case | Reason |
+|---|---|---|---|
+| **NUTS-HMC** | Uses the log-target's gradient $\nabla L(\beta)$ to simulate informed trajectories through parameter space. Trajectory length, step size, and per-axis scale are auto-tuned during warmup. | Closed-form policy function | Likelihood is differentiable and the gradient is cheap to compute (e.g., closed-form policy). Highest per-iteration efficiency.
+| **RW-MH** | Proposes the next $\beta$ by adding Gaussian random noise to the current value. Uses no gradient or local geometry. Step size is fixed and tuned manually. | NN policy surrogate | Default fallback when the gradient is unavailable or too expensive (e.g., nonlinear NN surrogate). Simple and gradient-free, but needs many more iterations to mix. 
+
+**Why gradient-free is the default for the NN-surrogate pipeline.** NUTS achieves its efficiency by running many small inner steps per iteration, each requiring one gradient of the log-target. With a closed-form policy, this gradient flows through analytical formulas and is cheap to compute. With the NN surrogate, computing the same gradient requires backpropagation through the entire network, which is much more expensive than a single forward evaluation. In our pipeline this gap is dramatic: NUTS with the NN surrogate runs more than 30 hours of wall time on CPU for the basic model, while RW-MH or RAM with the same NN finishes in minutes. The trade-off is that gradient-free samplers need more iterations to reach the same posterior precision, but each iteration is so much cheaper that they remain practical where NUTS+NN does not.
+
+### Implementation Issues
+
+There are several practical issues need to be noted:
+
+- The NN surrogate (SHAC) must be trained over a region that contains the prior's bulk mass. If the prior puts non-negligible probability outside the trained box, MCMC will visit points where the NN extrapolates and the likelihood is junk. At the code level I strictly align the box for parameters between pre-training and inference, and I also let NN training extract the box range of observables (e.g., capital) from the panel data first and align the simulated training data with it.
+- In my notebook demo, I slice the full dataset into smaller sub-samples to better control compute cost and wall time (specified by `n_firms` and `horizon`). For production we should obviously use the full panel dataset.
+- For this specific model, $\mu_\xi$ is weakly identified because it is highly correlated with $\alpha$. I did not patch this to keep the baseline algorithm simple and minimal. For future implementation, weak identification would need to be handled carefully with re-parameterization tricks or other treatment.
+
+
+### Reproducibility
+
+The pipeline reuses the project's existing stateless-seed infrastructure (`src/v2/data/rng.py`, `src/v2/utils/seeding.py`). A single master seed pair `(m0, m1)` controls every RNG-consuming step. Per-replicate child seeds are derived deterministically via `fold_in_seed(master, *tokens)`, where `tokens` are short namespace strings. Two key properties:
+
+- Rerunning with the same `master` reproduces every $\beta_0$, every panel, every $\eta$, and every chain trajectory bit-for-bit on the same hardware **and the same TFP version**. The NUTS warmup is delegated to `tfp.experimental.mcmc.windowed_adaptive_nuts`, which derives per-window seeds via `tfp.random.sanitize_seed`. The same stateless-seed model is used throughout TFP / JAX. The per-window split tree can change across TFP releases; posteriors remain statistically equivalent, but individual chain trajectories may differ byte-by-byte.
+- Token-scoped folding means stages are isolated: re-running just MCMC on a fixed panel only changes `mcmc_seed`'s token, not the panel or $\beta_0$ draws.
+
+No global RNG state is used. All randomness enters through explicit seed arguments.
+
+
+## Validation Results
+
+This section reports results by applying Bayesian estimation on simulated panels and verify if it can recover the ground-truth. There are two layers to be validated: 
+
+- Correctness of the inference pipeline itself: MCMC + filtering algorithms
+- Whether integrating the NN surrogate (instead of closed-form policy) into the inference pipeline lead to any bias and issues
+
+For the first layer, I already implemented unit tests and integration tests, and the validation here is an additional replication to confirm that we can recover the true parameters (posteriors) of a toy model with closed-form optimal policy `kp = exp((log α + log E[z] - log(r+δ))/(1-α))`. 
+
+For the second layer, the only difference is one-line code change that inject the pretrained and cached neural network `policy_nn` to replace the closed-form policy formula inside the likelihood `_build_ekf_log_likelihood`.
+
+More specifically, the validation has three steps:
+
+1. Fix a set of ground-truth parameters $(\alpha, \rho, \sigma_\varepsilon, \sigma_\eta, μ_η, μ_{ξ^k}, \sigma_η, \sigma_{ξ^k})$, simulate a panel of firms using the observation equations of the model, drop latent variable $z$, the final data include $(k_{it},\Pi_{it})$
+2. Extract the range of observables $k_{it}$ from panel, simulate new training and validation set on the same support, pre-train the NN surrogate policy using SHAC, save the learned NN $\varphi_\theta$ after convergence
+3. Pass the panel $(k_{it},\Pi_{it})$ and the policy (using either pre-trained $\varphi_\theta$ or closed-form) to MCMC sampler + filtering algorithm. Verify that the posterior median and credible intervals recover the ground-truth.
+
+
+
+###  NUTS + Kalman Filter with closed-form policy
+
+As the first validation exercise, I use the toy basic investment model to verify the code-level correctness of the inference pipeline for NUTS Sampler + Extended Kalman Filter. The implementation follow these steps:
+
+1. Fix a set of ground-truth parameters $(\alpha, \rho, \sigma_\varepsilon, \sigma_\eta, μ_η, μ_{ξ^k}, \sigma_η, \sigma_{ξ^k})$, simulate a panel of firms using the observation equations of the model, drop latent variable $z$, the final data include $(k_{it},\Pi_{it})$
+2. Use closed-form optimal policy to form the LGSSM.
+3. Run NUTS-HMC with Kalman filtering on the panel data $(k_{it},\Pi_{it})$, store and verify that the posteriors recover the ground-truth
+
+By default, I use 4 chains, 1000 warmup steps, 500 post-warmup sample, and 0.9 MH test acceptance rate. I slice the panel to a small sample with 50 firms over 20 periods so that the estimation finished in one hour on Apple M1 (2020). 
+
+**Table 1: Posterior summary at ground-truth $\beta$ (single run).**
+
+| Parameter            | True  | Median | 95% CI          | $\hat{R}$ | ESS  |
+|----------------------|-------|--------|-----------------|-----------|------|
+| $\alpha$             |  0.50 |  0.495 | [0.479, 0.511]  | 1.005     |  404 |
+| $\rho$               |  0.50 |  0.507 | [0.494, 0.520]  | 1.002     |  832 |
+| $\sigma_\varepsilon$ |  0.24 |  0.232 | [0.221, 0.244]  | 1.002     | 1240 |
+| $\mu_\eta$           |  0.00 |  0.014 | [-0.032, 0.065] | 1.004     |  480 |
+| $\sigma_\eta$        |  0.05 |  0.051 | [0.032, 0.065]  | 1.000     |  705 |
+| $\mu_{\xi^k}$        | -0.10 | -0.048 | [-0.197, 0.100] | 1.006     |  408 |
+| $\sigma_{\xi^k}$     |  0.05 |  0.048 | [0.025, 0.062]  | 1.001     |  624 |
+
+All 7 parameters recover truth within the 95% credible interval. As rule of thumb, All $\hat{R} < 1.01$ and all ESS exceed 400. The three economic parameters $\alpha, \rho, \sigma_\epsilon$ are tightly identified. Out of the 4 remaining parameters, $\mu_{\xi^k}$ is of interest because it captures firm's deviation from the model-implied optimal policy, in this case the true deviation is set of be -10%. The $\mu_{\xi^k}$ posterior correctly cover the -20% to 10% range with median close to -5%, but the CI is wide due to weak identification as $\mu_{\xi^k}$ is partially collinear with $\alpha$. For future production, we'll need larger sample, more training budget, and re-parameterization to solve the weak identification issue.
+
+Split-$\hat{R}$ is the Gelman-Rubin ratio of between-chain to within-chain variance. $\hat{R}$ near 1 mean the chains have mixed to a common distribution. ESS is the autocorrelation-corrected count of effectively independent samples. For all posteriors, our ESS $\gt 400$ pass the minimal threshold. I interpret that both metrics pass the posterior diagnostic checks.
+
+![Plot Posterior marginals: dashed black = true value, red = posterior median. The x-axis is fixed at the posterior median $\pm 4$ standard deviations, expanded to include the true value if it falls outside, clipped to support.](figures/bonus1-bayesian-basic/validate-closedform/marginals.png){#fig-bayes-marginals}
+
+@fig-bayes-marginals plots the posterior marginals for all parameters, where dashed line is ground-truth and the red line is the estimated posterior median. @fig-bayes-trace plots the trace of post-warmup draws. The visual evidence is clean and suggest that the code-level implementation of the Bayesian inference pipeline does not have major defects and bugs.
+
+
+![Plot Trace: two chains per parameter, overlaid with the truth line. Convergence shows as the two chains exploring the same region with no drift or stuck plateaus.](figures/bonus1-bayesian-basic/validate-closedform/trace.png){#fig-bayes-trace}
+
+
+**Coverage and Sensitivity Checks**.
+To show additional checks, I re-run the estimation and the full post-inference analysis with smaller budget per replication: 2 chains, 500 warmup, 200 post-warmup samples, 15 firms and 10 periods (~90 min on Apple M1). This is obviously not sufficient, so the following results should be interpreted as a *budget-limited demo* under time pressure. Future production will use much larger budget for credible validation results.
+
+![Plot coverage of 95% CI over R=5 replications.](figures/bonus1-bayesian-basic/validate-closedform/coverage_intervals.png){#fig-bayes-coverage}
+
+@fig-bayes-coverage shows whether each replicate's 95% credible interval contains its ground-truth $\beta_0$. A well-calibrated estimator hits truth in roughly 95% of replicates. At the demo budget of $R = 5$ most parameters hit 3 or 4 times out of 5, just below the binomial pass-band and consistent with both small-$R$ noise and modest per-replicate warmup. The pipeline runs end-to-end here. A production calibration claim requires $R \geq 30$ and longer per-rep adaptation.
+
+![Plot coverage of 95% CI over R=5 replications.](figures/bonus1-bayesian-basic/validate-closedform/ppc_distributions.png){#fig-bayes-ppc}
+
+@fig-bayes-ppc compares six summary statistics of the observed panel against their distributions under panels simulated from the posterior. If the model fits the data well, each observed value should sit somewhere in the bulk of its simulated distribution. An extreme tail position flags a feature the model cannot reproduce. All six posterior median estimates sit in the central range. The fitted model reproduces these data features without systematic misspecification.
+
+![Plot coverage of 95% CI over R=5 replications.](figures/bonus1-bayesian-basic/validate-closedform/sensitivity_comparison.png){#fig-bayes-sensitivity}
+
+@fig-bayes-sensitivity overlays the posterior under three variants of the residual standard-deviation priors: tight, baseline, and loose. A posterior that barely moves across variants is data-driven, in contrast, one that tracks the prior is prior-driven. For all seven parameters the medians shift by a fraction of the credible-interval width and the intervals largely overlap. The data carries the identifying information here and the posterior estimates are generally robust.
+
+### RW-MH + Kalman Filter with Neural Surrogate Policy
+
+The second validation exercise switches the gradient-based NUTS for a gradient-free RW-MH sampler, holding the Kalman filter unchanged. I argue that when using a pre-trained NN surrogate, RW-MH sampler is  better than NUTS-HMC because backpropagation through the cached NN is still very slow per leapfrog iteration (>40 hours of wall time on Apple M1).
+
+To make the attribution clean, I run three configurations side-by-side on the same observed panel at the same scalar proposal step size:
+
+- **Closed-form RWMH** (control): RW-MH with the closed-form analytical policy. Isolates the sampler from any NN approximation error.
+- **NN-RWMH** (test): same RW-MH, with the cached SHAC NN as the EKF's policy. Difference vs CF-RWMH attributes to NN approximation error.
+- **NN-RAM** (adaptive variant): same NN spec, but with the proposal covariance adapted during warmup [@vihola2012robust]. Difference vs NN-RWMH attributes to the adaptive proposal.
+
+All three are run at 4 chains $\times$ (20000 warmup + 5000 samples) on a 100 firms $\times$ 15 periods panel slice. CF finishes in about 30 seconds; the two NN methods take roughly 50 minutes each. The per-step NN evaluation accounts for the entire wall-time gap.
+
+
+![Posterior marginal densities under CF-RWMH (green, control with no NN), NN-RWMH (blue, baseline), and NN-RAM (orange, adaptive variant). Dashed black is truth; solid vertical lines are per-method medians.](figures/bonus1-bayesian-basic/rwmh-surrogate/density_overlay.png){#fig-rwmh-density}
+
+![Trace plots: three columns (CF-RWMH, NN-RWMH, NN-RAM), one row per parameter, four chains overlaid in each cell. Well-mixed parameters show overlapping chains; ridge parameters show chains stuck in disjoint regions.](figures/bonus1-bayesian-basic/rwmh-surrogate/trace.png){#fig-rwmh-trace}
+
+**Does the evidence validate the pipeline?** Partially. The results suggest the inference pipeline and the NN surrogate approach worked, but the identification is weak for several parameters which is attributed to the structural model specification.
+
+@fig-rwmh-density overlays the marginal posterior density (instead of histogram) of the three configurations. The vertical lines mark the posterior medina and the dashed line marks the true parameter value. It shows that:
+
+- **Closed-form RWMH** (green) confirms the inference pipeline itself is correct, with posterior median very close to true value and a tight 95% CI
+- **NN-RWMH** (blue) are noisier but the posterior density is still close to **Closed-form-RWMH**. This is important to confirm that the NN surrogate's approximation error does NOT break the inference. It just adds upfront pre-training cost for achieving better precision.
+- **NN-RAM** (adaptive variant) rejects adaptive RW-MH as a usable variant at least for the basic model.
+
+On the other hand, however, both the posterior density and the trace plot show failures in mixing. I view it as part of the model's specification issue. In particular, two parameters ($\rho$ and $\mu_\eta$) actively miss truth at the 95% level, consistent with their broken chains and the inflated $\hat{R}$ and insuffcieint ESS.
+
+The six poorly-mixed parameters all lie along the $\kappa(\alpha) + \mu_{\xi^k}$ ridge already flagged in the identification discussion in previous section: a tightly correlated subspace that a scalar Gaussian random walk cannot traverse efficiently within a practical wall budget. The CF-RWMH control reproduces the same failure pattern, which rules out NN approximation error as the dominant cause and isolates the bottleneck to the sampler class. In other words, **the NN surrogate is validated: it does not inject the mixing failure.** What fails is the gradient-free scalar random walk on a posterior geometry that the previous NUTS+CF baseline (with gradient information) handled cleanly. NN-RAM helps somewhat (max $\hat{R}$ 1670 vs 4138) but does not break the structural ceiling at this budget.
+
+**How to fix weak identification**. Resolving the mixing failure requires two changes, both beyond the scope of the simple baseline reported here. First, the observation equations need to be reparametrized so that the ridge direction aligns with a single sampled quantity. Concretely, $\mu_{\xi^k}$ and $\kappa(\alpha, \sigma_\varepsilon)$ both enter the $\log k$ equation additively as level terms, so sampling the composite offset $\zeta = \mu_{\xi^k} + \kappa(\alpha, \sigma_\varepsilon)$ in place of $\mu_{\xi^k}$ removes the partial collinearity at sampler level; $\mu_{\xi^k}$ is recovered post-hoc as $\zeta - \kappa(\alpha, \sigma_\varepsilon)$ from the joint posterior of $(\alpha, \sigma_\varepsilon, \zeta)$. Second, the MCMC and filtering stack needs either a substantive extension or a replacement, for example particle filter with adaptive Metropolis (PMMH), sequential Monte Carlo with tempering, or full-covariance adaptive proposals that learn the ridge direction during warmup. Both directions are deferred to future implementation and testing.
+
+
+**Table 2: NN-RWMH posterior summary against truth (baseline NN + gradient-free path).**
+
+| Parameter            | True  | Median | 95% CI            | $\hat{R}$ | ESS  |
+|----------------------|-------|--------|-------------------|-----------|------|
+| $\alpha$             |  0.50 |  0.547 | [0.534, 0.846]    | 4138      |  23  |
+| $\rho$               |  0.50 |  0.481 | [0.103, 0.496]    | 2394      |  25  |
+| $\sigma_\varepsilon$ |  0.24 |  0.235 | [0.229, 0.242]    | 1.3       |  65  |
+| $\mu_\eta$           |  0.05 | -0.073 | [-0.824, -0.034]  | 2015      |  270 |
+| $\sigma_\eta$        |  0.05 |  0.036 | [0.015, 0.052]    | 185       |  29  |
+| $\mu_{\xi^k}$        | -0.10 | -0.528 | [-1.219, -0.406]  | 250       |  347 |
+| $\sigma_{\xi^k}$     |  0.05 |  0.060 | [0.048, 0.280]    | 3691      |  142 |
+
+### NUTS + Kalman Filter with Neural Surrogate Policy
+
+
+
+
+
+
+## Future Extensions
+
+I consider the following directions as promising future extensions to better design and implementation of the final commercial product.
+
+- **Neural Likelihood Estimation**. Train a neural network to replace the model-specific likelihood evaluation step, such as the Kalman filter likelihood in a state-space model. The MCMC sampler can remain unchanged, except that each likelihood evaluation inside MCMC is replaced by the neural likelihood surrogate. This is a major extension to our current policy surrogate approach. It shares the same motivation of **amortizing the cost of expensive model solves**: instead of resolving the structural model at every MCMC proposal, we solve/simulate the model many times upfront and train a neural network to approximate the likelihood. Once trained, the surrogate likelihood can be evaluated cheaply inside MCMC, making Bayesian inference feasible for models where repeated likelihood evaluation is computationally prohibitive.
+
+- Benchmark the NN-surrogate inference under alternative filter + sampler pairings, especially **particle filter + Random Walk Metropolis-Hastings (PMMH)**. Although NUTS + Kalman is theoretically more efficient per iteration, the per-leapfrog gradient via autodiff through the NN is a measurable bottleneck on CPU; a gradient-free sampler paired with a non-Gaussian filter trades per-iteration efficiency for cheaper per-evaluation cost and parallelises more naturally on GPU. The cross-comparison would clarify whether the gradient-based pipeline remains the right default for NN-surrogate inference at scale.
+
+- Address **weak-identification via re-parameterisation**. For example, in the current toy model $\mu_{\xi^k}$ (deviation) is weakly identified as it correlate strongly with $\alpha$. Depending on the model and parameters of interest, we may need the re-parameterisation at algorithm level.
+
+- **Hierarchical (multilevel) Bayesian model** for estimating firm-specific posteriors, which is more useful for the commercial product (e.g., firm's deviation from optimal capital structure). In this framework, each firm $i$ has its own parameter vector $\beta_i$, linked through a shared population prior $\beta_i \sim p(\cdot \mid \beta_{\text{pop}})$ with $\beta_{\text{pop}}$ drawn from a hyperprior. This sits between two extremes: full pooling (one $\beta$ shared across all firms in the current setup) and full separation (independent per-firm MCMCs, which discard cross-sectional information). The mechanism is partial pooling: each firm's $\beta_i$ deviates from $\beta_{\text{pop}}$ where its own time series demands, but shrinks toward the population mean for parameters that are weakly identified within a single firm.
+
+
+# Reserved
+
+*Reserved for future material.*
+
+
+# Nikolov, Schmid, and Steri (2021): Three Theoretical Models
+
+## Technology and Notation
+
+This chapter implements linear programming (LP) methods to solve the three structural corporate finance models in @nikolov2021:
+
+- Trade-Off Model (TO)
+- Limited Enforcement Model (LE)
+- Moral Hazard Model (MH)
+
+All three models share the same production technology, capital accumulation rule, and adjustment cost specification.
+
+**Operating profit (pre-tax):**
+$$\pi(k_{it}, z_{it}, \eta_{it}) = (z_{it} + \eta_{it})k_{it}^{\alpha} - f$$
+
+After-tax operating cash flow is $(1-\tau)\pi$. Paper Eq. 1 labels the after-tax expression $(1-\tau)((z+\eta)k^\alpha - f)$ as $\pi$, but every subsequent equation uses $(1-\tau)\pi$, so we treat $\pi$ as pre-tax throughout this doc for consistency.
+
+**Capital accumulation (Eq. 2):**
+$$k_{it+1} = (1-\delta)k_{it} + i_{it}$$
+
+**Adjustment cost (Eq. 3):**
+$$\Psi(k_{it+1}, k_{it}) = \frac{\psi}{2}\left(\frac{i_{it}}{k_{it}}\right)^2 k_{it} = \frac{\psi}{2}\left(\frac{k_{it+1} - (1-\delta)k_{it}}{k_{it}}\right)^2 k_{it}$$
+
+**Variables and parameters:**
+- $k_{it}$: capital stock of firm $i$ at time $t$
+- $i_{it}$: investment at $t$
+- $z_{it} \in [\underline{z}, \overline{z}]$: persistent profitability shock, transition $Q(z'|z)$
+- $\eta_{it} \in \{+\bar\eta, -\bar\eta\}$: i.i.d. disturbance, $P(\eta = +\bar\eta) = \kappa$
+- $\tau \in (0, 1)$: corporate tax rate
+- $\alpha \in (0, 1)$: capital share (decreasing returns)
+- $f > 0$: fixed production cost
+- $\delta \in (0, 1)$: capital depreciation rate
+- $\psi$: adjustment cost parameter
+- $r$: risk-free interest rate
+- $\tau\delta k_{it}$: depreciation tax allowance
+
+**Capital cost convention.** In the paper's Bellman and dividend formulas, the investment-related terms appear as $-k_{it} + (1-\delta)k_{it} - \Psi(k_{it}, k_{it-1}) + \tau\delta k_{it}$, which simplifies to $-(1-\tau)\delta k_{it} - \Psi$. The paper treats capital as continuously maintained at level $k_{it}$ (paying $\delta k_{it}$ per period for depreciation replacement), with adjustment cost paid when changing the level. This is non-standard but internally consistent; the LP follows this convention.
+
+### Firm value $W$ and equity value $V$
+
+All three models maximize **firm value** $W(s_{it}, z_{it})$ at the end of period $t$: the PV of future cash flows to equity AND lenders combined, from $t+1$ onward. In schematic form, $W$ satisfies a Bellman recursion of the form
+$$W(s, z) = \beta \max_{a}\, E\big[d(s, a, s', z', \eta') + W(s', z')\big]$$
+where $s$ is the model-specific state, $a$ is the action, and $d$ is the dividend or cash flow (with adjustments for default in TO).
+
+**Equity value** $V_{it}$ is the PV of dividends to shareholders alone, satisfying
+$$V_{it} = \beta\, E\big[d_{z', \eta'} + V_{z', \eta'}\big]$$
+
+In TO and LE, $V$ is not tracked explicitly; firm value and equity value are linked by $W_{it} = V_{it} + V^{\text{debt}}_{it}$ where $V^{\text{debt}}_{it}$ is the value of outstanding debt. In MH, incentive compatibility requires the firm to commit to a specific continuation equity value going forward, so $V$ becomes a state variable in the MH Bellman.
+
+
+## Timing (common across all three models)
+
+Within and across periods, events unfold sequentially as summarized below, following Figure 1 of the paper. The key convention is that $W(s_{it}, z_{it})$ is evaluated at the **end of period $t$**, after period-$t$ shocks, production, repayments/transfers, and default checks have occurred, but before period-$(t+1)$ shocks are realized. Decisions made at the end of period $t$ determine capital and financing/contract terms for period $t+1$.
+
+**State versus realized transfers.** Persistent recursive states are $s=(k,b)$ in TO and LE and $s=(k,V)$ in MH. State-contingent payments such as $p$ in LE and dividends $d$ in MH are realized transfers chosen as part of the previous period's state-contingent contract; they are not persistent state variables except through the continuation balance $b$ or continuation equity value $V$.
+
+| Point in time | Event(s) | TO | LE | MH |
+|---|---|---|---|---|
+| End of $t-1$ | Firm makes decisions to maximize $W(s_{i,t-1}, z_{i,t-1})$ | Choose capital $k_{it}$ and debt position $b_{it}$ to be carried into period $t$; lender break-even determines the spread attached to this debt contract. | Choose capital $k_{it}$ and a state-contingent contract $\{b_{z_{it},\eta_{it}}, p_{z_{it},\eta_{it}}\}$ for period-$t$ realizations. | Choose capital $k_{it}$ and a state-contingent contract $\{V_{z_{it},\eta_{it}}, d_{z_{it},\eta_{it}}\}$ for period-$t$ realizations. |
+| Start/end of $t$ | Shocks $(z_{it}, \eta_{it})$ realize; production and contractual transfers occur; the next recursive state is formed. | Production uses $k_{it}$; the firm repays the debt obligation carried into period $t$ if solvent, otherwise defaults and is liquidated. The next decision state, conditional on survival, is $(k_{it}, b_{it}, z_{it})$. | The realized contract specifies payment $p_{z_{it},\eta_{it}}$ and continuation balance $b_{z_{it},\eta_{it}}$; no default occurs by design. The next decision state is $(k_{it}, b_{z_{it},\eta_{it}}, z_{it})$. | Shareholders observe $\eta_{it}$, lenders do not; the realized contract specifies dividend $d_{z_{it},\eta_{it}}$ and continuation equity value $V_{z_{it},\eta_{it}}$; no default occurs by design. The next decision state is $(k_{it}, V_{z_{it},\eta_{it}}, z_{it})$. |
+| End of $t$ | Firm makes decisions to maximize $W(s_{it}, z_{it})$ | Choose capital $k_{i,t+1}$ and debt position $b_{i,t+1}$ to be carried into period $t+1$; lender break-even determines the spread attached to this debt contract. | Choose capital $k_{i,t+1}$ and a state-contingent contract $\{b_{z_{i,t+1},\eta_{i,t+1}}, p_{z_{i,t+1},\eta_{i,t+1}}\}$ for period-$(t+1)$ realizations. | Choose capital $k_{i,t+1}$ and a state-contingent contract $\{V_{z_{i,t+1},\eta_{i,t+1}}, d_{z_{i,t+1},\eta_{i,t+1}}\}$ for period-$(t+1)$ realizations. |
+| Start/end of $t+1$ | Shocks $(z_{i,t+1}, \eta_{i,t+1})$ realize; production and contractual transfers occur; the next recursive state is formed. | Production uses $k_{i,t+1}$; the firm repays the debt obligation carried into period $t+1$ if solvent, otherwise defaults and is liquidated. The next decision state, conditional on survival, is $(k_{i,t+1}, b_{i,t+1}, z_{i,t+1})$. | The realized contract specifies payment $p_{z_{i,t+1},\eta_{i,t+1}}$ and continuation balance $b_{z_{i,t+1},\eta_{i,t+1}}$; no default occurs by design. The next decision state is $(k_{i,t+1}, b_{z_{i,t+1},\eta_{i,t+1}}, z_{i,t+1})$. | Shareholders observe $\eta_{i,t+1}$, lenders do not; the realized contract specifies dividend $d_{z_{i,t+1},\eta_{i,t+1}}$ and continuation equity value $V_{z_{i,t+1},\eta_{i,t+1}}$; no default occurs by design. The next decision state is $(k_{i,t+1}, V_{z_{i,t+1},\eta_{i,t+1}}, z_{i,t+1})$. |
+
+The exact TO default condition, LE break-even/collateral constraints, and MH promise-keeping/incentive constraints are defined in the model-specific sections below. The timing table intentionally states the schedule in words rather than duplicating those equations.
+
+
+## Trade-off Model
+
+### Theoretical Model
+
+In this setup, $\eta_{it}$ is **public information**.
+
+#### Financing
+
+- Firms issue one-period bonds: cash inflow $b_{it+1}$ at the beginning of period $t+1$; previously issued bonds $b_{it}$ are due with interest.
+- Default premium $\Delta_{it}$ is charged above $r$, so the effective interest rate is $r + \Delta_{it}$.
+- Interest payments are tax deductible: effective repayment due in period $t+1$ is $(1 + (1 - \tau)(r + \Delta_{it}))b_{it}$.
+- Tax shield: $\tau(r + \Delta_{it})b_{it}$.
+
+**Solvency condition** (firm is solvent iff):
+
+$$(1 - \tau)\pi(k_{it}, z_{it}, \eta_{it}) + (1 - \delta)k_{it} + \tau\delta k_{it} - (1 + (r + \Delta_{it-1})(1 - \tau))b_{it-1} \geq 0 \quad (4)$$
+
+**Default set**:
+
+$$D_{it} \equiv \{(z_{it}, \eta_{it}, k_{it}, \Delta_{it-1}) \in \overline{Z} \times \overline{N} \times \mathbb{R}^+ \times \mathbb{R}^+ : (4) \text{ does not hold}\}$$
+
+- $\overline{D}_{it}$: set of solvency states (where Eq. 4 holds)
+- $\mathcal{I}_{D,it}$: indicator function for default
+
+**Creditor break-even condition** (risk-neutral pricing):
+
+$$E_{t-1}\left[ (1 + r + \Delta_{it-1})(1 - \mathcal{I}_{D,it}) + \frac{\xi(1 - \delta)k_{it}}{b_{it-1}}\mathcal{I}_{D,it} \right] = 1 + r$$
+
+- $\xi$: recovery rate in bankruptcy
+
+**Payouts** (limited liability, seasoned equity precluded):
+
+$$d_{it} \equiv (1 - \tau)\pi(k_{it}, z_{it}, \eta_{it}) - k_{it} + (1 - \delta)k_{it} - \Psi(k_{it}, k_{it-1}) + \tau\delta k_{it} - (1 + (r + \Delta_{it-1})(1 - \tau))b_{it-1} + b_{it} \geq 0$$
+
+#### Firm Problem
+
+State variables: $(k_{it-1}, b_{it-1}, z_{it-1})$. Bellman equation:
+
+$$W(k_{it-1}, b_{it-1}, z_{it-1}) \equiv \frac{1}{1 + r} \max_{k_{it}, b_{it}} \Big\{ -k_{it} + (1 - \delta)k_{it} - \Psi(k_{it}, k_{it-1}) + \tau\delta k_{it}$$
+
+$$+ \tau(r + \Delta_{it-1})b_{it-1}\mathcal{I}_{1-D,it} - ((1 - \xi)(1 - \delta)k_{it} + \tau\delta k_{it})\mathcal{I}_{D,it}$$
+
+$$+ E_{t-1}\big[(1 - \tau)\pi(k_{it}, z_{it}, \eta_{it}) + W(k_{it}, b_{it}, z_{it})\big] \Big\}$$
+
+subject to:
+
+$$(1 - \tau)\pi(k_{it}, z_{it}, \eta_{it}) - k_{it} + (1 - \delta)k_{it} - \Psi(k_{it}, k_{it-1}) + \tau\delta k_{it} - (1 + (r + \Delta_{it-1})(1 - \tau))b_{it-1} + b_{it} \geq 0, \quad \forall z_{it}, \eta_{it}$$
+
+$$E_{t-1}\left[ (1 + r + \Delta_{it-1})(1 - \mathcal{I}_{D,it}) + \frac{\xi(1 - \delta)k_{it}}{b_{it-1}}\mathcal{I}_{D,it} \right] = 1 + r$$
+
+### LP Solution Method
+
+The baseline LP solutions (TO, LE, MH) use **NumPy** for array operations, **SciPy sparse matrices** for constraint assembly, and **`scipy.optimize.linprog` with the `'highs'` backend** for the master LP solve. TensorFlow is not used: there is no neural-net training, no autodiff requirement, and no GPU benefit for the modest finite-grid baseline. The workload is dominated by grid construction, finite-action enumeration or action filtering, sparse matrix assembly, and LP solving, all of which NumPy and SciPy handle with mature, well-tested implementations.
+
+**LP state interpretation.** The LP uses the paper's recursive timing. A state $(k,b,z)$ (or $(k,V,z)$ in MH) is the inherited end-of-period state: $k$ is the capital level from the previous choice, $b$ is the outstanding promised balance (or $V$ is promised equity value), and $z$ is the current public persistent shock. At this state the firm chooses the next capital level and financing contract, denoted $(k',b')$ in TO, state-contingent $(b'_{z',\eta'},p_{z',\eta'})$ in LE, and state-contingent $(V'_{z',\eta'},d_{z',\eta'})$ in MH. The Bellman target then evaluates next-period shocks $(z',\eta')$, operating cash flow with the chosen capital $k'$, repayment/contract constraints, and continuation value at the chosen next state.
+
+**Baseline implementation modules.** A coding agent should keep the implementation modular: (i) `grids` for $K$, $B$, $V$, payment/dividend grids, and shock transition matrices; (ii) `primitives` for $\pi$, $\Psi$, discount factors, and model parameters; (iii) `timing`/index helpers that map current state, action, shock realization, and continuation state; (iv) TO `pricing` for $\Delta(k_{\text{choice}},b_{\text{old}},z_{\text{old}})$ and default indicators; (v) LE/MH `action_enumeration` for fixed finite contract menus and feasibility filtering; (vi) `lp_assembly` for sparse Bellman inequalities; (vii) `lp_solve` for HiGHS; (viii) `policy_recovery` for argmax policies; and (ix) `diagnostics` for feasibility counts, LP residuals, pricing residuals, and boundary-hit warnings.
+
+#### Primitives and grids
+
+State $S = K \times B \times Z$ with discrete grids $K = \{k_1, \dots, k_{n_k}\}$, $B = \{b_1, \dots, b_{n_b}\}$, $Z = \{z_1, \dots, z_{n_z}\}$. Action $A = K \times B$ (choice of next-period $(k', b')$).
+
+State $(k, b, z)$: capital in place, outstanding debt, current persistent shock. I.i.d. shock $\eta \in \{+\bar\eta, -\bar\eta\}$ with $P(\eta = +\bar\eta) = \kappa$. Persistent transition $Q(z' \mid z)$. Discount $\beta = 1/(1+r)$.
+
+Model functions:
+$$\pi(k, z, \eta) = (z + \eta)k^\alpha - f, \qquad \Psi(k', k) = \tfrac{\psi}{2}\big((k' - (1-\delta)k)/k\big)^2 k$$
+
+Parameters: $\tau, \alpha, f, \delta, \psi, \xi, r, \kappa, \bar\eta$.
+
+#### Step 1: Pre-compute lender pricing $\Delta(k_{\text{choice}}, b_{\text{old}}, z_{\text{old}})$
+
+For every candidate chosen capital $k_{\text{choice}} \in K$, inherited debt $b_{\text{old}} \in B$, and inherited persistent shock $z_{\text{old}} \in Z$, compute the risky-debt premium that satisfies the lender break-even condition:
+
+$$\sum_{z'} Q(z' \mid z_{\text{old}}) \sum_{\eta'} P(\eta')\Big[(1+r+\Delta)(1 - \mathcal{I}_D') + \tfrac{\xi(1-\delta)k_{\text{choice}}}{b_{\text{old}}}\mathcal{I}_D'\Big] = 1+r$$
+
+with
+
+$$\mathcal{I}_D' = \mathbf{1}\big\{(1-\tau)\pi(k_{\text{choice}}, z', \eta') + (1-\delta)k_{\text{choice}} + \tau\delta k_{\text{choice}} \;<\; (1+(1-\tau)(r+\Delta))b_{\text{old}}\big\}.$$
+
+**Important timing convention.** In the Bellman constraint for state $(k,b,z)$ and action $(k',b')$, the relevant premium on the outstanding debt $b$ is $\Delta(k',b,z)$, not $\Delta(k,b,z)$. The premium is priced at the time the old debt is issued, using the capital level chosen for the period in which that debt will be repaid.
+
+**Robust finite-shock pricing solver.** Do not rely on naive bisection as the baseline. Because $\mathcal{I}_D'$ changes with $\Delta$ on a discrete shock grid, the lender payoff is piecewise linear with possible jumps. Implement pricing as follows:
+
+1. If $b_{\text{old}}=0$, set $\Delta=0$ and $\mathcal{I}_D'=0$.
+2. If $b_{\text{old}}>0$, compute the default-switch threshold for each future shock realization:
+   $$\Delta^*(z',\eta') = \frac{(1-\tau)\pi(k_{\text{choice}},z',\eta')+(1-\delta)k_{\text{choice}}+\tau\delta k_{\text{choice}}}{(1-\tau)b_{\text{old}}} - \frac{1}{1-\tau} - r.$$
+   A realization defaults when $\Delta > \Delta^*(z',\eta')$.
+3. Sort the finite set of thresholds and examine the intervals over which the default set is fixed.
+4. On each interval, solve the break-even equation analytically because the default set is fixed and the expected lender payoff is linear in $\Delta$.
+5. Keep the lowest nonnegative $\Delta$ whose implied default set is internally consistent and whose expected payoff equals $1+r$ up to tolerance. If discreteness prevents exact equality, use the lowest nonnegative $\Delta$ for which expected lender payoff is weakly at least $1+r$, and record the pricing residual.
+
+**Output:**
+- 3D premium table $\Delta(k_{\text{choice}}, b_{\text{old}}, z_{\text{old}})$ of size $n_k \cdot n_b \cdot n_z$.
+- Optional default indicator table $\mathcal{I}_D(k_{\text{choice}}, b_{\text{old}}, z_{\text{old}}, z', \eta')$, evaluated at the stored premium.
+
+In practice, materialize only the 3D premium table unless debugging. Given the stored $\Delta(k_{\text{choice}}, b_{\text{old}}, z_{\text{old}})$ and the analytic default condition, recompute the indicator on demand to save memory.
+
+#### Step 2: LP
+
+**Variables.** $W(k, b, z)$ for every $(k, b, z) \in S$. Count: $n_k n_b n_z$.
+
+**Objective.**
+$$\min_W \sum_{(k, b, z) \in S} W(k, b, z)$$
+
+**Bellman constraints.** Following the paper's appendix Eq. (22), for every $(k, b, z) \in S$ and every feasible $(k', b') \in A$:
+
+$$W(k, b, z) \geq \tfrac{1}{1+r}\bigg[\underbrace{-k' + (1-\delta)k' - \Psi(k', k) + \tau\delta k'}_{\text{deterministic, paid regardless of default}} + \sum_{z', \eta'} Q(z' \mid z) P(\eta')\bigg(\underbrace{(1-\tau)\pi(k', z', \eta')}_{\text{profit, always realized}} + \underbrace{\tau(r+\Delta(k', b, z))b\, \mathcal{I}_{1-D}}_{\text{tax shield if solvent}} - \underbrace{(1-\xi)\big((1-\delta)k' + \tau\delta k'\big)\mathcal{I}_D}_{\text{deadweight loss if default}} + \underbrace{(1-\mathcal{I}_D)\, W(k', b', z')}_{\text{continuation if solvent}}\bigg)\bigg]$$
+
+where the default indicator $\mathcal{I}_D = \mathcal{I}_D(k', b, z, z', \eta')$ at the next-shock realization is
+
+$$\mathcal{I}_D = \mathbf{1}\big\{(1-\tau)\pi(k', z', \eta') + (1-\delta)k' + \tau\delta k' \;<\; (1+(1-\tau)(r+\Delta(k', b, z)))b\big\}$$
+
+and $\mathcal{I}_{1-D} = 1 - \mathcal{I}_D$. The tax shield is on the OUTSTANDING bond $b$ with its premium $\Delta(k', b, z)$, per the paper's Section 2.2 financing description and the timing convention above.
+
+**Limited liability (feasibility filter).** A pair $(k', b')$ is feasible at $(k, b, z)$ only if shareholder dividend $d \geq 0$ in every solvent realization $(z', \eta')$:
+$$d = (1-\tau)\pi(k', z', \eta') - k' + (1-\delta)k' - \Psi(k', k) + \tau\delta k' - (1+(1-\tau)(r+\Delta(k', b, z)))b + b' \geq 0, \quad \forall (z', \eta') \text{ with } \mathcal{I}_D = 0$$
+
+Drop the Bellman constraint at $(k, b, z, k', b')$ if LL is violated. Default-state dividends are zero by limited liability (firm wiped out, equity holders receive nothing).
+
+Constraint count (post-filter): bounded by $n_k^2 n_b^2 n_z$, sparser after filtering.
+
+#### Step 3: Recover the policy
+
+After the LP returns $W^*$:
+$$(k', b')^*(k, b, z) = \arg\max_{(k', b') \in A \text{ feasible}} \text{RHS}(k, b, z, k', b'; W^*)$$
+where RHS is the same Bellman target as in Step 2, with $W^*$ plugged in for the continuation. Implied premium policy for the chosen next debt is $\Delta^*(k,b,z)=\Delta(k^{\prime *}(k,b,z), b^{\prime *}(k,b,z), z)$; within the Bellman RHS for repayment of inherited debt $b$, use $\Delta(k^{\prime},b,z)$.
+
+#### Implementation notes
+
+- **Step 1:** finite-threshold pricing over the $(k_{\text{choice}}, b_{\text{old}}, z_{\text{old}})$ grid; vectorize threshold construction where possible, but keep explicit consistency checks for default sets and pricing residuals.
+- **Step 2 LP construction:** NumPy broadcasting to build the $(n_k, n_b, n_z, n_k, n_b)$ Bellman RHS coefficient tensor and LL feasibility mask; assemble constraints as `scipy.sparse.csc_matrix`.
+- **Step 2 LP solve:** `scipy.optimize.linprog` with `method='highs'`.
+- **Step 3:** `np.argmax` over the RHS tensor with $W^*$ plugged in.
+
+
+## Limited Enforcement Model
+
+### Theoretical Model
+
+State-contingent payoffs are allowed. In this context, $\eta_{it}$ is **public information**.
+
+#### Financing
+
+- Firms sell a portfolio of securities whose payoffs are contingent on next-period shocks $z_{it+1}$ and $\eta_{it+1}$.
+- Selling the portfolio at time $t$ raises:
+
+$$b_{it} \equiv \frac{1}{1 + r}E_t[p_{z_{it+1}, \eta_{it+1}} + b_{z_{it+1}, \eta_{it+1}}]$$
+
+- $p_{z_{it+1}, \eta_{it+1}}$: cash flow transferred to investors contingent on shocks
+- $b_{z_{it+1}, \eta_{it+1}}$: residual present value of future promised repayments
+
+Intuitively, the contract operates like a flexible credit line: $b_{it}$ is the outstanding balance today; $p_{z_{it+1}, \eta_{it+1}}$ is the payment the firm makes next period contingent on the realized state; and $b_{z_{it+1}, \eta_{it+1}}$ is the new outstanding balance after that payment, carried forward as the firm's debt at $t+1$.
+
+**Collateral constraint** (state-contingent debt must be fully collateralized):
+
+$$p_{z_{it+1}, \eta_{it+1}} + b_{z_{it+1}, \eta_{it+1}} \leq \theta(1 - \delta)k_{it+1}, \quad \forall z_{it+1}, \eta_{it+1}$$
+
+- $\theta$: fraction of capital that can be pledged as collateral
+
+**Limited liability (payouts)**:
+
+$$d_{it} \equiv (1 - \tau)\pi(k_{it}, z_{it}, \eta_{it}) - k_{it} + (1 - \delta)k_{it} - \Psi(k_{it}, k_{it-1}) + \tau\delta k_{it} + \tau r b_{it-1} - p_{z_{it}, \eta_{it}} \geq 0$$
+
+#### Firm Problem
+
+Bellman equation:
+
+$$W(k_{it-1}, b_{it-1}, z_{it-1}) = \frac{1}{1 + r}\max_{k_{it}, b_{z_{it}, \eta_{it}}, p_{z_{it}, \eta_{it}}} \Big\{ -k_{it} + (1 - \delta)k_{it} - \Psi(k_{it}, k_{it-1}) + \tau\delta k_{it}$$
+
+$$+ \tau r b_{it-1} + E_{t-1}\big[(1 - \tau)\pi(k_{it}, z_{it}, \eta_{it}) + W(k_{it}, b_{z_{it}, \eta_{it}}, z_{it})\big] \Big\}$$
+
+subject to:
+
+$$b_{it-1} \equiv \frac{1}{1 + r}E_{t-1}[p_{z_{it}, \eta_{it}} + b_{z_{it}, \eta_{it}}] \quad (5)$$
+
+$$(1 - \tau)\pi(k_{it}, z_{it}, \eta_{it}) - k_{it} + (1 - \delta)k_{it} - \Psi(k_{it}, k_{it-1}) + \tau\delta k_{it} + \tau r b_{it-1} - p_{z_{it}, \eta_{it}} \geq 0, \quad \forall z_{it}, \eta_{it} \quad (6)$$
+
+$$p_{z_{it}, \eta_{it}} + b_{z_{it}, \eta_{it}} \leq \theta(1 - \delta)k_{it}, \quad \forall z_{it}, \eta_{it} \quad (7)$$
+
+### LP Solution Method
+
+#### Primitives and grids
+
+State $S = K \times B \times Z$ with the same $K$ and $Z$ grids as 1.2 and a nonnegative debt grid $B = \{b_1,\dots,b_{n_b}\} \subset \mathbb{R}_+$ with $0 \in B$. Additional parameter: $\theta$ (collateral fraction). Shock $\eta$ and persistent shock $z$ are as in 1.2.
+
+State $(k,b,z)$: inherited capital, inherited promised balance, and current persistent shock. There is no default risk and no premium $\Delta$ in LE. Pricing is imposed by the risk-neutral break-even constraint (5).
+
+#### Minimal finite-action baseline
+
+To keep the baseline a true LP, use a **finite contract-action menu**. For each current state $(k,b,z)$ and candidate next capital $k' \in K$, a contract action is a fixed collection
+
+$$a = \{b'_{z',\eta'}, p_{z',\eta'}\}_{z' \in Z,\eta' \in N}$$
+
+where each $b'_{z',\eta'} \in B$ and each $p_{z',\eta'} \in P$, with $P=\{p_1,\dots,p_{n_p}\}\subset \mathbb{R}_+$ a nonnegative payment grid. Because the contract components are fixed before a Bellman inequality is added, the continuation terms $W(k',b'_{z',\eta'},z')$ enter linearly with known coefficients.
+
+Do **not** include convex-combination weights such as $\lambda_j W(k',b_j,z')$ as free variables in the master LP. That would be bilinear, not linear. Continuous-state interpolation can be added later only through constraint generation, where interpolation weights are fixed constants when each Bellman inequality is added.
+
+#### Step 1: Build feasible contract-action lists
+
+For every $(k,b,z,k')$, enumerate candidate contract actions $a=\{b'_{z',\eta'},p_{z',\eta'}\}$. Keep only actions satisfying all constraints below.
+
+- **Break-even (Eq. 5):**
+$$\frac{1}{1+r}\sum_{z', \eta'} Q(z' \mid z) P(\eta')[p_{z', \eta'} + b'_{z', \eta'}] = b.$$
+
+In code, because $P$ and $B$ are discrete, use a tight tolerance `be_tol`:
+$$\left|\frac{1}{1+r}\sum_{z', \eta'} Q(z' \mid z) P(\eta')[p_{z', \eta'} + b'_{z', \eta'}] - b\right| \leq \texttt{be\_tol}.$$
+
+- **Limited liability (Eq. 6):** for each $(z',\eta')$,
+$$p_{z', \eta'} \leq (1-\tau)\pi(k', z', \eta') - k' + (1-\delta)k' - \Psi(k', k) + \tau\delta k' + \tau r b.$$
+
+- **Collateral (Eq. 7):** for each $(z',\eta')$,
+$$p_{z', \eta'} + b'_{z', \eta'} \leq \theta(1-\delta)k'.$$
+
+- **Sign restrictions:**
+$$p_{z',\eta'} \geq 0, \qquad b'_{z',\eta'} \geq 0.$$
+
+A tuple $(k,b,z,k')$ contributes no Bellman constraint if no feasible contract action exists for that particular $k'$. However, every state $(k,b,z)$ must have at least one feasible action across all $k'$. If a state has no feasible action, treat this as a grid-design failure: enlarge the payment grid $P$, enlarge/shift the debt grid $B$, relax only the numerical tolerance if the miss is purely rounding error, or remove the state from the admissible state grid. Do not solve the LP with states that have an empty feasible action correspondence.
+
+For the minimal baseline, this brute-force enumeration is intended for small grids only. A faster second-stage implementation can replace enumeration with constraint generation or an auxiliary search routine, but the master LP must still receive only fixed actions.
+
+#### Step 2: Master LP
+
+**Variables.** $W(k,b,z)$ for every $(k,b,z)\in S$. Count: $n_k n_b n_z$.
+
+**Objective.**
+$$\min_W \sum_{(k,b,z)\in S} W(k,b,z).$$
+
+**Bellman constraints.** For every state $(k,b,z)$ and every feasible fixed action $(k',a)$:
+
+$$W(k,b,z) \geq \frac{1}{1+r}\bigg[-k' + (1-\delta)k' - \Psi(k',k) + \tau\delta k' + \tau r b + \sum_{z',\eta'} Q(z'\mid z)P(\eta')\Big((1-\tau)\pi(k',z',\eta') + W(k',b'_{z',\eta'},z')\Big)\bigg].$$
+
+The entire deterministic term is inside the discount factor $1/(1+r)$, matching the paper's LE Bellman equation.
+
+Constraint count depends on the number of feasible fixed contract actions. This can grow quickly with $n_z n_\eta$, so the minimal implementation should start with small grids.
+
+#### Step 3: Recover the policy
+
+After the LP returns $W^*$, choose the feasible fixed action that maximizes the RHS at each state:
+
+$$(k',a)^*(k,b,z)=\arg\max_{(k',a)\in\mathcal{A}_{LE}(k,b,z)} \text{RHS}_{LE}(k,b,z,k',a;W^*).$$
+
+The policy consists of $k'^*(k,b,z)$ and the associated state-contingent contract $\{b'^*_{z',\eta'},p^*_{z',\eta'}\}$.
+
+#### Implementation notes
+
+- **Baseline:** enumerate finite contract actions on small $B$ and $P$ grids, filter by break-even, limited liability, collateral, and sign restrictions, then assemble the sparse LP.
+- **Correctness condition:** each Bellman inequality must correspond to a fixed feasible action. The continuation coefficient on each $W(k',b_j,z')$ is therefore a known probability weight, not a decision variable.
+- **Scaling upgrade:** if enumeration becomes too large, use constraint generation. Given a current value vector $W^{(m)}$, solve a separate action-search problem for each state, freeze the selected action, add the corresponding linear Bellman inequality to the master LP, and repeat until no violated constraints remain.
+
+
+## Moral Hazard Model
+
+### Theoretical Model
+
+Asymmetric information setup:
+- $z_{it}$ follows a Markov chain that is **publicly observable** (also by the lender).
+- $\eta_{it}$ is **observable by shareholders but unobservable by lenders**.
+
+A lending contract is a sharing rule splitting firm resources between payments to the lender $p_{it}$ and dividends $d_{it}$, in a fully state-contingent manner.
+
+#### State variable choice
+
+- Use equity value of the firm $V_{it}$ as the state variable; debt value recovered from $b_{it} = W_{it} - V_{it}$.
+- Tax deductability of interest on debt: $\tau r b_{it} = \tau r(W_{it} - V_{it})$, which yields:
+  - Adjusted discount rate for the firm: $1/(1 + (1 - \tau)r)$ instead of $1/(1 + r)$
+  - Penalty for foregone tax deductions on debt: $\tau r V_{it}$
+
+#### Diversion function
+
+$$\mathcal{D}(k_{it}, z_{it}, \eta_{it}, \hat{\eta}_{it})$$
+
+- $\hat{\eta}_{it}$: shareholders' (potentially misreported) report of $\eta_{it}$
+- Most straightforward specification under the pre-tax $\pi$ convention used in this document: $\mathcal{D} = \lambda(1-\tau)\left[\pi(k_{it}, z_{it}, \eta_{it}) - \pi(k_{it}, z_{it}, \hat{\eta}_{it})\right]$.
+- $\lambda$: diversion parameter; $1 - \lambda$ captures potential losses in cash flow diversion
+
+#### Firm value function
+
+$$W(k_{it-1}, V_{it-1}, z_{it-1}) = \max_{k_{it}, V_{z_{it}, \eta_{it}}, d_{z_{it}, \eta_{it}}} \frac{1}{1 + (1 - \tau)r}$$
+
+$$\times \Big[ -k_{it} - \Psi(k_{it}, k_{it-1}) + (1 - \delta)k_{it} + \tau\delta k_{it} - r\tau V_{it-1}$$
+
+$$+ E_{t-1}\big[(1 - \tau)\pi(k_{it}, z_{it}, \eta_{it}) + W(k_{it}, V_{z_{it}, \eta_{it}}, z_{it})\big] \Big]$$
+
+subject to:
+
+**Promise-keeping constraint:**
+
+$$V_{it-1} = \frac{1}{1 + r}E_{t-1}[d_{z_{it}, \eta_{it}} + V_{z_{it}, \eta_{it}}] \quad (8)$$
+
+**Incentive compatibility constraints:**
+
+$$d_{z_{it}, \eta_{it}} + V_{z_{it}, \eta_{it}} \geq d_{z_{it}, \hat{\eta}_{it}} + V_{z_{it}, \hat{\eta}_{it}} + \mathcal{D}(k_{it}, z_{it}, \eta_{it}, \hat{\eta}_{it}), \quad \forall z_t, \forall \hat{\eta}_{it} \quad (9)$$
+
+**Limited liability constraints (non-negativity):**
+
+$$d_{z_{it}, \eta_{it}} \geq 0, \quad \forall z_{it}, \forall \eta_{it} \quad (10)$$
+
+$$V_{z_{it}, \eta_{it}} \geq 0, \quad \forall z_{it}, \forall \eta_{it} \quad (11)$$
+
+#### Payments to the lender (recovered from resource constraint)
+
+$$p_{it} = -k_{it} - \Psi(k_{it}, k_{it-1}) + (1 - \delta)k_{it} + \tau\delta k_{it} + \tau r(W_{it} - V_{it}) + (1-\tau)\pi(k_{it}, z_{it}, \eta_{it}) - d_{it}$$
+
+Variables (moral hazard model):
+
+- $V_{it-1}$: equity value at the end of period $t-1$
+- $d_{z_{it}, \eta_{it}}$: state-contingent dividend payment
+- $V_{z_{it}, \eta_{it}}$: state-contingent continuation equity value
+- $p_{it}$: state-contingent payment to lender
+
+### LP Solution Method
+
+#### Primitives and grids
+
+State $S = K \times \mathcal{V} \times Z$ with discrete grids $K = \{k_1, \dots, k_{n_k}\}$, $\mathcal{V} = \{V_1, \dots, V_{n_V}\}\subset\mathbb{R}_+$ with $V_1 = 0$, and $Z = \{z_1, \dots, z_{n_z}\}$. Shock $\eta \in \{+\bar\eta, -\bar\eta\}$ with $P(\eta = +\bar\eta) = \kappa$. Persistent transition $Q(z' \mid z)$. Additional parameter: $\lambda$ (diversion fraction).
+
+State $(k,V,z)$: inherited capital, promised equity value, and current public persistent shock.
+
+Discount in the firm Bellman: $1/(1 + (1-\tau)r)$ (firm-side, with the tax shield on the debt component already embedded). Discount in promise-keeping: $1/(1+r)$ (equity-holder side, no debt tax shield).
+
+Under the pre-tax $\pi$ convention used in this document, the diversion function is
+
+$$\mathcal{D}(k', z', \eta', \hat\eta') = \lambda(1-\tau)\big[\pi(k', z', \eta') - \pi(k', z', \hat\eta')\big].$$
+
+#### Minimal finite-action baseline
+
+To keep the baseline a true LP, use a **finite contract-action menu**. For each current state $(k,V,z)$ and candidate next capital $k'\in K$, a contract action is a fixed collection
+
+$$a=\{V'_{z',\eta'},d_{z',\eta'}\}_{z'\in Z,\eta'\in N},$$
+
+where each $V'_{z',\eta'}\in\mathcal{V}$ and each $d_{z',\eta'}\in D$, with $D=\{d_1,\dots,d_{n_d}\}\subset\mathbb{R}_+$ a nonnegative dividend grid. Because the contract components are fixed before a Bellman inequality is added, the continuation terms $W(k',V'_{z',\eta'},z')$ enter linearly with known coefficients.
+
+Do **not** include convex-combination weights such as $\mu_j W(k',V_j,z')$ as free variables in the master LP. That would be bilinear, not linear. Continuous interpolation can be added later only through constraint generation, where interpolation weights are fixed constants when each Bellman inequality is added.
+
+#### Step 1: Build feasible contract-action lists
+
+For every $(k,V,z,k')$, enumerate candidate contract actions $a=\{V'_{z',\eta'},d_{z',\eta'}\}$. Keep only actions satisfying all constraints below.
+
+- **Promise keeping (Eq. 8):**
+$$V = \frac{1}{1+r}\sum_{z',\eta'} Q(z'\mid z)P(\eta')\big[d_{z',\eta'}+V'_{z',\eta'}\big].$$
+
+In code, because $D$ and $\mathcal{V}$ are discrete, use a tight tolerance `pk_tol`:
+$$\left|\frac{1}{1+r}\sum_{z',\eta'} Q(z'\mid z)P(\eta')\big[d_{z',\eta'}+V'_{z',\eta'}\big]-V\right|\leq \texttt{pk\_tol}.$$
+
+- **Incentive compatibility (Eq. 9):** for each $z'$ and each pair $(\eta',\hat\eta')$ with $\eta'\neq\hat\eta'$,
+$$d_{z',\eta'}+V'_{z',\eta'} \geq d_{z',\hat\eta'}+V'_{z',\hat\eta'}+\mathcal{D}(k',z',\eta',\hat\eta').$$
+
+With binary $\eta'$, there are two non-trivial IC inequalities per $z'$.
+
+- **Limited liability (Eqs. 10, 11):**
+$$d_{z',\eta'}\geq 0, \qquad V'_{z',\eta'}\geq 0.$$
+
+A tuple $(k,V,z,k')$ contributes no Bellman constraint if no feasible contract action exists for that particular $k'$. However, every state $(k,V,z)$ must have at least one feasible action across all $k'$. If a state has no feasible action, treat this as a grid-design failure: enlarge the dividend grid $D$, enlarge/shift the promised-equity grid $\mathcal{V}$, relax only the numerical tolerance if the miss is purely rounding error, or remove the state from the admissible state grid. Do not solve the LP with states that have an empty feasible action correspondence.
+
+The minimal baseline is intended for small grids only. A faster second-stage implementation can replace enumeration with constraint generation or an auxiliary search routine, but the master LP must still receive only fixed actions.
+
+#### Step 2: Master LP
+
+**Variables.** $W(k,V,z)$ for every $(k,V,z)\in S$. Count: $n_k n_V n_z$.
+
+**Objective.**
+$$\min_W \sum_{(k,V,z)\in S} W(k,V,z).$$
+
+**Bellman constraints.** For every state $(k,V,z)$ and every feasible fixed action $(k',a)$:
+
+$$W(k,V,z) \geq \frac{1}{1+(1-\tau)r}\bigg[-k' - \Psi(k',k) + (1-\delta)k' + \tau\delta k' - r\tau V + \sum_{z',\eta'} Q(z'\mid z)P(\eta')\Big((1-\tau)\pi(k',z',\eta') + W(k',V'_{z',\eta'},z')\Big)\bigg].$$
+
+#### Step 3: Recover the policy
+
+After the LP returns $W^*$, choose the feasible fixed action that maximizes the RHS at each state:
+
+$$(k',a)^*(k,V,z)=\arg\max_{(k',a)\in\mathcal{A}_{MH}(k,V,z)} \text{RHS}_{MH}(k,V,z,k',a;W^*).$$
+
+The policy consists of $k'^*(k,V,z)$ and the associated state-contingent contract $\{V'^*_{z',\eta'},d^*_{z',\eta'}\}$.
+
+Payment to the lender is recovered after the LP solve as the residual from the resource constraint. Under the pre-tax $\pi$ convention, for each realized $(z',\eta')$:
+
+$$p^*_{z', \eta'} = -k'^* - \Psi(k'^*, k) + (1-\delta)k'^* + \tau\delta k'^* + \tau r\big(W^*(k'^*, V'^*_{z', \eta'}, z') - V'^*_{z', \eta'}\big) + (1-\tau)\pi(k'^*, z', \eta') - d^*_{z', \eta'}.$$
+
+This recovered payment is for accounting and simulated policy measurement. It should not be reintroduced into the master LP as an additional constraint involving $W-V$, because the Bellman equation already embeds the tax-shield logic through the adjusted discount factor and the $-r\tau V$ term.
+
+#### Implementation notes
+
+- **Baseline:** enumerate finite contract actions on small $\mathcal{V}$ and $D$ grids, filter by promise keeping, IC, and limited liability, then assemble the sparse LP.
+- **Correctness condition:** each Bellman inequality must correspond to a fixed feasible action. The continuation coefficient on each $W(k',V_j,z')$ is therefore a known probability weight, not a decision variable.
+- **Scaling upgrade:** if enumeration becomes too large, use constraint generation. Given a current value vector $W^{(m)}$, solve a separate action-search problem for each state, freeze the selected action, add the corresponding linear Bellman inequality to the master LP, and repeat until no violated constraints remain.
+
+##### Future scaling path: paper-style constraint generation
+
+The current implementation target is a modest local baseline: TO is solved by full finite-action LP, while LE and MH use small finite menus of complete state-contingent contracts. This is sufficient for a clean conceptual implementation and for verifying timing, feasibility, and policy recovery. It is not intended to be paper-scale for LE/MH.
+
+For larger LE/MH grids, follow the paper's LP plus constraint-generation logic. The master problem contains only an active subset of Bellman inequalities, each corresponding to a fixed feasible action. After solving the relaxed master LP, use a separation oracle to search, state by state, for a feasible contract action whose Bellman RHS violates the current value function by more than tolerance. If such an action is found, freeze that complete action (including any interpolation weights, if used), add the resulting linear Bellman inequality to the master LP, and repeat until no violated constraints remain. The paper implements the action-search/separation step with mixed-integer programming because the state-contingent contracting action space is large. A future scalable implementation can therefore add a `constraint_generation` module and an optional `separation_oracle` module, likely using a stronger optimization backend such as Gurobi or CPLEX for the oracle. At the current baseline stage, these modules are documented but not implemented.
+
+##### Why LP instead of NN based methods?
+
+Models like TO, LE, and MH are complex because they (i) do not have closed-form Euler equations, (ii) featured nested fixed points in equilibrium, and (iii) have different equality and inequality constraints. There is generally no mathematical theorem proving that NN-based training can converge to a *unique fixed point*. 
+
+In contrast, grid-based numerical methods like VFI and LP are guaranteed to converge to the unique fixed point of a finite discounted dynamic programming problem under a set of conditions (e.g., contraction mapping). Practically, we need the problem to satisfy:
+
+1. The state grid is finite.
+2. Every Bellman inequality corresponds to a fixed feasible action with fixed continuation-state indices and fixed probability weights.
+3. The relevant discount factor is strictly below one: $1/(1+r)<1$ for TO/LE and $1/[1+(1-\tau)r]<1$ for MH.
+4. The feasible action set is nonempty at every state.
+5. TO pricing $\Delta(k_{\text{choice}},b_{\text{old}},z_{\text{old}})$ is well-defined for every grid point, including the $b=0$ case.
+6. The resulting LP is feasible and bounded below.
+
+Under these conditions, the Bellman operator for the finite discretized model is a contraction, and the standard LP formulation with objective $\min \sum_s W(s)$ and constraints $W(s)\geq T_a W(s)$ for all feasible state-action pairs recovers the unique fixed point. If continuous interpolation or auxiliary action searches are added later, the master LP remains valid only if each added Bellman inequality freezes the selected action and interpolation weights as constants.
+
+
+## Structural Estimation and Model Comparison
+
+### Policy Functions
+
+The model solutions are the optimal policy function and value function. The **optimal policy function** maps state to  actions and can be written as: 
+$$
+a_t=\varphi(s_t)
+$$
+where the action vector is defined as $a_t \equiv\{ k_{t+1}, b_{t+1}, d_{t+1} \}$ and the state vector is $s_{t}\equiv\{k_t, b_t, z_t \}$. 
+
+Because we use a grid-based LP solution, the theoretical policy function is stored as lookup tables over the discrete state grid. For example, at each grid point $(k_t,b_t,z_t)$, the TO and LE solvers store the optimal next capital $k_{t+1}$. The policy table is therefore a discrete numerical approximation to the model policy function.
+
+For empirical estimation and model comparison, the primitive theoretical variables are transformed into observable counterparts. The **empirical policy function** is written as
+$$
+y_{it}=P(x_{it})+u_{it},
+\qquad
+E[u_{it}\mid x_{it}]=0,
+$$
+where the *observable states* are
+$$
+x_{it}
+=
+\left( \log k_{it}, \frac{\pi(k_{it},z_{it},\eta_{it})}{k_{it}},\frac{b_{it}}{k_{it}}\right)
+$$
+and the *observable actions* are
+$$
+y_{it}
+=
+\left( \frac{i_{it}}{k_{it}}, \frac{b_{i,t+1}}{k_{i,t+1}}, \frac{d_{i,t+1}}{k_{i,t+1}} \right)
+$$
+
+For each action variable $y^n_{it}$ with $n$ indexing each element in vector $y_{it}$, the empirical policy function is estimated semi-parametrically using a series approximation
+$$
+P^n(x_{it}) \approx \sum_{j=1}^J h^n_j p_j(x_{it}),
+$$
+where $p_j(x_{it})$ are basis functions and $h^n_j$ are coefficients estimated from regression:
+$$
+\min_h
+\sum_{i,t}
+\left(
+y^n_{it}
+-
+\sum_{j=1}^J h^n_j p_j(x_{it})
+\right)^2.
+$$
+
+To reproduce the **model comparison figure**, I follow these steps:
+
+- For a given model (e.g., TO), solve the raw policy function $\varphi$, use it to simulate a data of firm-year panel
+- From the simulated data, construct observable states and actions $(y_{it},x_{it})$
+- Fit the series approximation above to obtain empirical policy function $P^n(x_{it})$ and overlay it in twoway plot of $y$ on $x$
+
+For the real-world data, we can directly fit $(y_{it},x_{it})$ to estimate another empirical policy function.
+
+
+I plot the fitted empirical policy functions $P^n(x_{it})$ as twoway slices of observable actions $y_{it}$ against states $x_{it}$. Each slice plot fix other states at sample median. These six panels can be directly compared to the Figure 2 and 3 in @nikolov2021. 
+
+- Investment vs log size
+- Future leverage vs current leverage
+- Investment vs current leverage
+- Payout vs profitability
+- Future leverage vs profitability 
+- Investment vs profitability
+
+![TO fitted empirical policy functions (panel simulated from the solved TO model)](figures/bonus3-model-hk-data/to/to_empirical_policy_slices.png)
+
+The figure shows the empirical policy function fitted on a panel simulated from the solved TO model: each panel plots one observable action against one observable state, with the red line the fitted (partial-dependence) policy and the points the simulated firm-years. The estimated slopes line up with standard theory and with Nikolov21's TO results: investment falls with firm size and is roughly flat-to-declining in leverage, payout and investment both rise with profitability, future leverage is strongly increasing in current leverage (leverage is persistent), and future leverage falls with profitability (more profitable firms lever less). Because these signs match the theoretical mechanisms and the patterns reported for the TO model in @nikolov2021, I treat this as a successful reproduction of the TO model's policy behavior. The figure is shown here as an illustrative example for the TO model; the same fitted coefficients are the auxiliary moments used in the indirect inference below.
+
+
+### Indirect inference
+
+The empirical policy function estimated above serves as the auxiliary model. The structural model is not estimated by matching individual firm outcomes one by one. Instead, for a candidate structural parameter vector $\beta$, we solve the model, simulate firm panels from the model, estimate the same empirical policy functions on the simulated data, and choose $\beta$ so that the simulated policy functions are close to the empirical policy functions estimated from real data.
+
+Let $v_{it}\equiv (y_{it},x_{it})$ denote one observation in the real firm panel, where $i$ indexes firms and $t$ indexes time. The full real-data panel is
+
+$$
+\mathcal D_{\text{data}} \equiv \{v_{it}\}_{i,t}.
+$$
+
+For a candidate structural parameter vector $\beta$, let
+
+$$
+v^{(r)}_{it}(\beta)
+\equiv
+\left(y^{(r)}_{it}(\beta),x^{(r)}_{it}(\beta)\right)
+$$
+
+Denote one observation in simulated panel $r$, where $r=1,\dots,R$ indexes independent simulation replications. The simulated $i,t$ indices are artificial firm and time indices generated by the model. They are used only to construct a simulated panel with the same observable variables as the real data. The full simulated panel in replication $r$ is
+
+$$
+\mathcal D^{(r)}_{\text{sim}}(\beta)
+\equiv
+\{v^{(r)}_{it}(\beta)\}_{i,t}.
+$$
+
+The vector $\beta$ contains the structural parameters estimated by indirect inference, including technology parameters, shock-process parameters, adjustment costs, and the model-specific financial-friction parameter. In the paper, the main estimated parameters include
+
+$$
+(\alpha, f, \rho_z, \sigma_z, \delta, \psi, \eta),
+$$
+
+and the friction parameter is model-specific: $\xi$ (TO), $\theta$ (LE), and  $\lambda$ (MH). Some parameters, such as $r,\tau,\kappa$, are calibrated and fixed outside the inference.
+
+For any panel dataset $\mathcal D$, define $h(\mathcal D)$
+as the vector collecting all estimated coefficients from the empirical policy-function regressions. In our notation, $h(\mathcal D)$ stacks the coefficients $h^n_j$ across all action variables $n$ and all basis functions $j$. Therefore, $h(\mathcal D)$ summarizes the estimated mapping from observable states $x_{it}$ to observable actions $y_{it}$ in that panel.
+
+The real-data auxiliary coefficient vector is $h_{\text{data}}=h(\mathcal D_{\text{data}})$. For candidate parameter vector $\beta$, the simulated auxiliary coefficient vector is the average across simulated panels:
+
+$$
+h_{\text{sim}}(\beta)
+=
+\frac{1}{R}
+\sum_{r=1}^R
+h\left(\mathcal D^{(r)}_{\text{sim}}(\beta)\right).
+$$
+
+The indirect-inference moment is the difference between the empirical auxiliary coefficients and the model-implied auxiliary coefficients:
+
+$$
+g(\beta)
+=
+h_{\text{data}}
+-
+h_{\text{sim}}(\beta).
+$$
+
+The structural estimator chooses $\beta$ to minimize the weighted distance between these two coefficient vectors:
+
+$$
+\beta^*
+=
+\arg\min_{\beta}
+g(\beta)' W g(\beta),
+$$
+
+where $W$ is a positive definite weighting matrix. The paper’s key idea is that a model fits well if, for some $\beta$, its simulated investment, leverage, and payout policies generate auxiliary policy-function coefficients close to those estimated from the real firm panel.
+
+The estimation loop is:
+
+1. Choose a candidate parameter vector $\beta$.
+2. Solve the structural model by LP and recover the policy lookup tables.
+3. Simulate $R$ firm panels using the recovered policy functions and shock processes.
+4. For each simulated panel, transform primitive model variables into the same observable variables $x^{(r)}_{it}(\beta)$ and $y^{(r)}_{it}(\beta)$ used in the real data.
+5. Estimate the same semi-parametric empirical policy-function regressions on each simulated panel.
+6. Compute $h_{\text{sim}}(\beta)$ by averaging the simulated coefficient vectors across $R$ replications.
+7. Compute
+
+$$
+g(\beta)=h_{\text{data}}-h_{\text{sim}}(\beta).
+$$
+
+8. Set $W$ and search over $\beta$ to minimize
+
+$$
+g(\beta)'Wg(\beta).
+$$
+
+The same indirect-inference procedure is applied separately to TO, LE, and MH. Because the three models share the same observable policy variables even though their internal financial frictions differ, their fit can be compared by asking which model generates simulated policy-function coefficients closest to the empirical coefficients.
+
+**Variance estimation**
+To construct 
+
+
+### Data and Sample Construction
+
+I construct a sample of listed companies in Hong Kong between 1999 and 2024 from the [Compustat Global database on Wharton Research Data Services (WRDS)](https://wrds-www.wharton.upenn.edu/pages/grid-items/compustat-global-wrds-basics/) subscribed by UBC library.
+
+**Sample construction.** I drop firms in utilities and financial services sector, and those that are higly unbalanced or with key variables missing. The final sample consists of 2,080 firm-years observations, with 116 firms in a balanced panel. I winsorized the top and bottom 1%. When constructing the moment conditions I fit the empirical policy functions on the raw observables and match only their slope and curvature coefficients, dropping each regression's intercept. I drop the intercept because the model and the data differ in level mainly through the deflator (the model normalizes by capital while the data normalizes by total assets), a gap no structural parameter can close, so leaving the intercept out absorbs that level offset and lets the estimator target the comparable shape of the policy functions. 
+
+The table below summarizes the key observables used to fit the empirical policy function and to construct the moment conditions for inference. Note that leverage and future leverage are measured gross, $(\text{DLTT}+\text{DLC})/\text{AT}$, and are therefore non-negative, which matches the model's $b/k \geq 0$ and is the support the structural policies can reproduce. For Hong Kong firms, market value is not available so I do not use market-to-book for estimation.
+
+| Variable | Role in Policy Function | Theory | Data (Compustat) |
+|---|---|---| ---|
+| Investment rate | Action | $\frac{k_{t+1}-(1-\delta)k_t}{k_t}$ | CAPX/AT 
+| Book leverage (current) | State | $b_t/k_t$. | (DLTT+DLC)/AT
+| Future leverage | Action | $b_{t+1}/k_{t+1}$. | (DLTT+DLC)/AT
+| Profitability | State | $\frac{\pi(k_t,z_t,\eta_t)}{k_t}=\frac{(z_t+\eta_t)k_t^\alpha-f}{k_t}$ | OIBDP/AT
+| Dividends payouts | Action | $\frac{d_t}{k_t}$ | (DVT+PSSTKC-PSTKRV)/AT
+| Firm size (log) | State | $\log k_t$ | log(PPENT)
+| Market-to-book | State | $W_t/k_t$ | (DLTT+DLC+PRCCF $\times$ CHSO)/AT
+
+#### Sample construction summary
+
+| Step | Firm-years | Firms |
+|---|---|---|
+| Raw quarterly records | 21,706 | 312 |
+| Fiscal-Q4 (annual) records | 5,942 | 311 |
+| HKD currency | 4,866 | 242 |
+| Industrial, consolidated, standard format | 2,561 | 131 |
+| Exclude financials and utilities | 2,339 | 122 |
+| Positive assets and PP&E | 2,333 | 122 |
+| Finite flow variables | 2,205 | 122 |
+| Has next-period leverage | 2,083 | 119 |
+| At least 3 firm-years per firm | 2,080 | 116 |
+
+The binding cuts are the annual (fiscal-Q4) filter and the industrial/consolidated/standard-format requirement, which together account for almost all of the attrition from 21,706 raw records; the sector exclusions and the positivity/finiteness screens drop comparatively few observations. The final panel is 2,080 firm-years for 116 firms and is close to balanced (mean 18, median 20 annual observations per firm).
+
+#### Missing data and imputation
+
+Debt and payout items are frequently missing in Compustat Global: long-term debt (DLTT) is missing for about 25% of firm-years, current debt (DLC) for 12%, dividends (DVT) for 46%, and repurchases (PRSTKC) for 88%. These fields are imputed to zero, interpreted as no debt or no payout, and flagged, so the corresponding leverage and payout values for those firm-years are zero by construction. The core fields (assets, PP&E, profitability, investment) are essentially complete.
+
+#### Variable distributions
+
+![Hong Kong Compustat policy-variable distributions](figures/bonus3-model-hk-data/nikolov_hkg_variable_distributions.png)
+
+Investment, payout, and leverage are right-skewed with a large mass at zero: many Hong Kong firms invest little, pay nothing, and carry little or no debt. Profitability is roughly symmetric around a low mean and is occasionally negative. Firm size (log capital) is widely dispersed. Orange lines mark medians; the small bars at the right edges are the 1% winsorization caps.
+
+#### Summary Statistics
+
+| Variable | Mean | SD | p1 | Median | p99 |
+|---|---|---|---|---|---|
+| investment_rate | 0.033 | 0.045 | 0.000 | 0.017 | 0.253 |
+| future_leverage | 0.196 | 0.207 | 0.000 | 0.139 | 1.097 |
+| payout_rate | 0.015 | 0.024 | 0.000 | 0.003 | 0.125 |
+| log_k | 6.258 | 2.463 | 0.052 | 6.253 | 11.850 |
+| profitability | 0.039 | 0.105 | -0.438 | 0.040 | 0.316 |
+| leverage | 0.194 | 0.204 | 0.000 | 0.141 | 1.090 |
+
+A typical firm invests roughly 2 to 3% of capital per year (median 1.7%), holds modest leverage (median 14%), and pays out little (median 0.3%); profitability is low (median 4%) and can be negative.
+
+
+### Estimation Results
+
+I now provide results from solving and estimating the three models. The main purpose is to show end-to-end model solve and estimation pipeline. Limited by the CPU capacity (M1), I use smaller grid density than the paper's specification ($[k,b,z]=[21,17,5]$) so the results should be interpreted as rough preliminary estimates. Future work would require better CPU or improving the efficiency of LP solver by adding features such as constraint generation.
+
+#### Trade-off (TO) Model
+
+The table reports the parameter estimates from indirect inference on the TO Model, solved by LP method on grid with density ($[k,b,z]=[15,12,5]$). To conduct the minimization, I use Nelder-Mead as global method to search for the optimal parameter vector. The system is over-identified with 27 moments and 8 parameters. I use identity weight matrix to construct the standard SMM variance. Unfortunately, because simulated moment covariance is near-singular, I'm unable to conduct a valid over-identification (J) test for this run. The full estimation took about 2 hours on Apple M1. Reference Estimate reported in the second column are the initiation value, calibrated to the estimates on Large US public-listed firms reported by @nikolov2021.
+
+
+One notable estimate is the large capital adjustment cost $\hat \psi = 1.036$, which is not obviously realistic. This is consistent with the fact I show earlier that the Compustat-HK firms on average have much lower investment rate compared with Compustat-US firms. The $i/k$ moments are poorly matched (see appendix) and worth examining whether the current measurement for investment need to be refined if, for example, the variable are defined and constructed differently in Hong Kong due to different regulation.
+
+
+| Parameter | Ref Estimate | Estimate $\hat\beta$ | SE |
+|---|---|---|---|
+| $\alpha$ (capital share) | 0.75 | 0.613 | 0.089 |
+| $f$ (fixed cost) | 0.70 | 0.631 | 0.231 |
+| $\rho_z$ (shock persistence) | 0.80 | 0.604 | 0.029 |
+| $\sigma_z$ (shock volatility) | 0.30 | 0.296 | 0.073 |
+| $\delta$ (depreciation) | 0.15 | 0.175 | 0.072 |
+| $\psi$ (adjustment cost) | 0.15 | 1.036 | 0.024 |
+| $\bar\eta$ (i.i.d. shock size) | 0.30 | 0.265 | 0.116 |
+| $\xi$ (recovery rate) | 0.60 | 0.734 | 0.134 |
+
+The figure below reproduces the empirical policy comparison plot from Nikolov21's Figure 2 and 3. Each panel is a partial-dependence slice: it varies one observable state, holds the others at their sample median, and plots the fitted empirical policy. The black line is fit on the real Hong Kong panel and the red line is fit on a panel simulated from the solved TO model at the estimated parameters. 
+
+![TO indirect-inference policy overlay: the empirical policy fit on the real Hong Kong panel (black) versus the same regressions refit on a panel simulated from the solved TO model at the estimated parameters (red)](figures/bonus3-model-hk-data/to/to_ii_policy_overlay.png)
+
+Because intercepts are dropped, a good match means the two lines share the same slope and curvature, not the same level. Here the lines clearly diverge: the simulated policy sits well above the data in most panels, and the shapes agree only in part (for instance, future leverage rises with current leverage in both, but the model line is much steeper and higher). So the estimator could not bring the model's policy close to the data from the current preliminary results.
+
+
+
+**Why the fit is poor.** I rank the likely causes from most to least actionable.
+
+1. **Model solve quality (most likely the main cause).** The reported run solves the TO model on a coarse grid ($k=15$, $b=12$, $z=5$) for tractability, because indirect inference re-solves the model once per candidate parameter vector, hundreds of times in total. A coarse grid turns the policy into a crude step function over a handful of states, so the simulated panel carries little granular variation and the empirical policy refit on it is shaped by discretization rather than by economics. This is plausibly the dominant problem. The clear next step is to refine the grid (denser capital, debt, and shock points), which lowers grid approximation error and lets the simulation reproduce the smooth policy variation the regressions are trying to recover. Only once the solve is accurate can we trust the simulated moments.
+
+2. **Observable and normalization disagreement.** Even with an accurate solve, the model and the data describe firm flows on different scales. The model normalizes every flow by capital $k$, while the Compustat observables normalize by total assets, so the two policies can differ in level for reasons no structural parameter can fix. I already drop each regression's intercept to absorb this level offset and match only slope and curvature. A more careful version is the firm-fixed-effects adjustment used in @nikolov2021: estimate firm fixed effects from the real panel, drop the intercept of the simulated empirical policy, then add the real-data firm effects back onto the simulated policy. The purpose is to strip out persistent, firm-specific level differences (size, accounting deflator, unmodeled heterogeneity) that the structural model was never meant to explain, so the estimator compares the part of the policy that is actually comparable, its shape. The problem it solves is keeping a nuisance level gap from looking like a structural misfit.
+
+3. **A genuine model rejection (only after 1 and 2 are ruled out).** If the solve is accurate, the observables are aligned, and the simulated policy still cannot approach the data, then the fit is truly poor and the model is rejected on its own terms. Confirming this needs the formal model-fit test from @nikolov2021, the over-identification test on the moment gap. That test is expensive: building its variance requires re-solving the model many times to estimate the moment covariance and the sensitivity of the moments to the parameters. The current run could not even form a valid J statistic (identity weighting plus a near-singular moment covariance), so a formal rejection is not yet warranted. The honest reading is that causes 1 and 2 must be cleared first, and only then is the expensive formal test worth running.
+
+
+```{=latex}
+\appendix
+```
+
+
+# Solution Methods to Dynamic Models {#sec-solve}
+
+*Supporting material for Chapter 1 (Solving Dynamic Models).*
 
 ## Value and Policy Function Iterations {#sec-VFI}
 Value function iteration (VFI) and policy function iteration (PFI) are the most widely used methods to solve discrete-time dynamic programming problems. In their simplest form, these methods discretize the continuous state space into a finite grid $\mathcal{S}_{\text{grid}}$ and iterate on the Bellman equation until convergence.
@@ -965,10 +2223,10 @@ simultaneously moves both sides of the equation.  Consider a gradient
 step that increases investment everywhere:
 
 - **Today** ($a = \pi_\theta(s)$): higher investment raises the marginal
-  cost $\chi$ — the denominator increases.
+  cost $\chi$: the denominator increases.
 - **Tomorrow** ($a' = \pi_\theta(s')$): higher investment also raises
   $\chi' = 1 + \partial\psi'/\partial k''$ via the next-period adjustment
-  cost — the numerator $m$ increases too.
+  cost: the numerator $m$ increases too.
 
 Both sides of the ratio $m / \chi$ shift in response to the same
 parameter update.  The gradient points toward the correct equilibrium, but
@@ -985,8 +2243,8 @@ next-period side has shifted.
 **How the target network resolves this.**  The target network
 $\pi_{\theta^-}$ provides a fixed reference for the next-period action:
 
-- $a = \pi_\theta(s)$ — gradients flow through the current policy.
-- $a' = \pi_{\theta^-}(s')$ — **gradients stopped**; weights are frozen for
+- $a = \pi_\theta(s)$: gradients flow through the current policy.
+- $a' = \pi_{\theta^-}(s')$: **gradients stopped**; weights are frozen for
   this step.
 
 Now the marginal benefit $m$ is computed from $\pi_{\theta^-}$, which
@@ -1250,6 +2508,8 @@ The main cons of this method is computational cost. The object $\tilde{r}^{(n)}(
 
 # Implementation Details {#sec-impl}
 
+*Supporting material for Chapter 1 (Solving Dynamic Models).*
+
 This appendix describes architecture-level implementation choices common to all deep-learning solvers (LRM, ERM, BRM, SHAC) in the codebase. The choices are not method-specific and are unchanged across solver classes.
 
 ## Input Normalization {#sec-impl-norm}
@@ -1276,12 +2536,13 @@ The policy network outputs a continuous action constrained to box bounds $[a_{\m
 
 $$\hat{y} = w^\top \mathbf{a}^L + b, \qquad a = \mathrm{clip}(\hat{y},\, a_{\min},\, a_{\max}).$$
 
-The motivation is gradient quality near the bounds. For $\tanh$ (or any differentiable bijection $\mathbb{R} \to (a_{\min}, a_{\max})$), $\partial a / \partial \hat{y} \to 0$ as $a$ approaches either bound — a topological necessity for a bounded smooth function. In standard RL benchmarks the optimal policy is rarely near the bounds and the saturation is harmless. In economic models the optimal policy is often near the upper bound when productivity is high, and the per-period reward also has diminishing marginal returns in that region. The two effects compound: $\partial \mathcal{L}/\partial \theta$ becomes small in exactly the region where the policy needs the most learning signal, and the trained policy systematically deviates from the analytical benchmark at the boundaries.
+The motivation is gradient quality near the bounds. For $\tanh$ (or any differentiable bijection $\mathbb{R} \to (a_{\min}, a_{\max})$), $\partial a / \partial \hat{y} \to 0$ as $a$ approaches either bound, a topological necessity for a bounded smooth function. In standard RL benchmarks the optimal policy is rarely near the bounds and the saturation is harmless. In economic models the optimal policy is often near the upper bound when productivity is high, and the per-period reward also has diminishing marginal returns in that region. The two effects compound: $\partial \mathcal{L}/\partial \theta$ becomes small in exactly the region where the policy needs the most learning signal, and the trained policy systematically deviates from the analytical benchmark at the boundaries.
 
 The linear-plus-clip head avoids this. Inside the feasible region the output is identity and $\partial a / \partial \hat{y} = 1$ uniformly; outside, the gradient is zero but the action is correctly snapped. The interior gradient is independent of distance to the boundary, so the policy learns boundary-pushing behavior without saturation. The same design is used by TD-MPC2's MPPI planner, PPO with clipped actions, and DDPG with bounded action spaces.
 
----
-# Appendix B. Structural Estimation
+# Structural Estimation Methods
+
+*Supporting material for Chapter 2 (Structural Estimation).*
 
 ## Generalized Method of Moments (GMM) {#sec-gmm-appendix}
 
@@ -1487,3 +2748,46 @@ For Monte Carlo validation, I fix the truth at:
 | $c_{\text{def}}$ | 0.5 | Deadweight default cost |
 | $\rho$ | 0.7 | AR(1) persistence |
 | $\sigma_\varepsilon$ | 0.15 | AR(1) shock std dev |
+
+
+# Moment fit: TO Model
+
+*Supporting material for Chapter 5 (Nikolov, Schmid, and Steri models).*
+
+The moment vector stacks the slope and curvature coefficients of the three policy regressions (intercepts dropped). Actions are written as $i/k$ (investment rate), $b'/k'$ (future leverage), and $d/k$ (payout); regressors are $\log k$, profitability (prof), and current leverage (lev), together with their squares and interactions. The gap is $g = h_{\text{data}} - h_{\text{sim}}$.
+
+| Action | Regressor | Data $h$ | Sim $h$ | Gap $g$ |
+|---|---|---|---|---|
+| $i/k$ | $\log k$ | 0.009 | -0.688 | 0.697 |
+| $i/k$ | prof | 0.007 | 0.170 | -0.163 |
+| $i/k$ | lev | 0.027 | -0.434 | 0.461 |
+| $i/k$ | $(\log k)^2$ | -0.001 | 0.091 | -0.092 |
+| $i/k$ | $\log k\cdot$ prof | 0.019 | -0.089 | 0.108 |
+| $i/k$ | $\log k\cdot$ lev | 0.005 | 0.193 | -0.189 |
+| $i/k$ | prof $^2$ | 0.248 | 0.075 | 0.173 |
+| $i/k$ | prof $\cdot$ lev | -0.066 | -0.095 | 0.028 |
+| $i/k$ | lev $^2$ | -0.042 | 0.236 | -0.278 |
+| $b'/k'$ | $\log k$ | -0.011 | -0.210 | 0.199 |
+| $b'/k'$ | prof | -0.186 | -0.002 | -0.185 |
+| $b'/k'$ | lev | 0.820 | 0.774 | 0.046 |
+| $b'/k'$ | $(\log k)^2$ | 0.000 | -0.010 | 0.010 |
+| $b'/k'$ | $\log k\cdot$ prof | 0.025 | -0.011 | 0.037 |
+| $b'/k'$ | $\log k\cdot$ lev | 0.033 | 0.165 | -0.132 |
+| $b'/k'$ | prof $^2$ | -0.083 | 0.018 | -0.101 |
+| $b'/k'$ | prof $\cdot$ lev | -0.160 | -0.063 | -0.098 |
+| $b'/k'$ | lev $^2$ | -0.227 | -0.245 | 0.017 |
+| $d/k$ | $\log k$ | 0.002 | -0.024 | 0.026 |
+| $d/k$ | prof | 0.073 | 0.358 | -0.285 |
+| $d/k$ | lev | -0.078 | -0.135 | 0.057 |
+| $d/k$ | $\log k^2$ | -0.000 | -0.054 | 0.054 |
+| $d/k$ | $\log k\cdot$ prof | 0.012 | -0.088 | 0.100 |
+| $d/k$ | $\log k\cdot$ lev | 0.003 | 0.091 | -0.088 |
+| $d/k$ | prof $^2$ | 0.128 | 0.080 | 0.048 |
+| $d/k$ | prof $\cdot$ lev | -0.131 | -0.059 | -0.072 |
+| $d/k$ | lev $^2$ | 0.040 | -0.076 | 0.116 |
+
+
+# References {.unnumbered}
+
+::: {#refs}
+:::
