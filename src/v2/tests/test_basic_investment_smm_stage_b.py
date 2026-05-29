@@ -1,4 +1,4 @@
-"""Tests for Stage-B solve-in-loop SMM on BasicInvestmentEnv."""
+"""Tests for frictional-numerical solve-in-loop SMM on BasicInvestmentEnv."""
 
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ from src.v2.trainers.config import ERConfig, NetworkConfig
 from src.v2.utils.seeding import fold_in_seed
 
 
-def _make_stage_b_env(cost_fixed: float = 0.0) -> BasicInvestmentEnv:
+def _make_frictional_numerical_env(cost_fixed: float = 0.0) -> BasicInvestmentEnv:
     return BasicInvestmentEnv(
         econ_params=EconomicParams(
             interest_rate=0.04,
@@ -74,16 +74,16 @@ def _make_pfi_solver_config() -> BasicInvestmentSMMSolverConfig:
 
 
 @pytest.fixture(scope="module")
-def stage_b_env() -> BasicInvestmentEnv:
-    return _make_stage_b_env()
+def frictional_numerical_env() -> BasicInvestmentEnv:
+    return _make_frictional_numerical_env()
 
 
 # ── Fast tests (no model solve) ──────────────────────────────────────
 
 
-def test_stage_b_metadata_switches_to_four_parameters_and_five_moments(stage_b_env):
-    spec = stage_b_env.make_smm_spec(
-        mode="stage_b",
+def test_frictional_numerical_metadata_switches_to_four_parameters_and_five_moments(frictional_numerical_env):
+    spec = frictional_numerical_env.make_smm_spec(
+        mode="frictional_numerical",
         initial_guess=np.array([0.66, 0.18, 0.60, 0.12], dtype=np.float64),
         solver_config=_make_er_solver_config(),
     )
@@ -100,18 +100,18 @@ def test_stage_b_metadata_switches_to_four_parameters_and_five_moments(stage_b_e
     np.testing.assert_allclose(spec.initial_guess, [0.66, 0.18, 0.60, 0.12])
 
 
-def test_stage_b_rejects_fixed_cost_models():
-    env = _make_stage_b_env(cost_fixed=0.05)
+def test_frictional_numerical_rejects_fixed_cost_models():
+    env = _make_frictional_numerical_env(cost_fixed=0.05)
     with pytest.raises(ValueError, match="cost_fixed == 0"):
-        env.make_smm_spec(mode="stage_b", solver_config=_make_er_solver_config())
+        env.make_smm_spec(mode="frictional_numerical", solver_config=_make_er_solver_config())
 
 
 # ── Slow tests (involve model solves) ────────────────────────────────
 
 
 @pytest.mark.slow
-def test_stage_b_pfi_panel_api_is_seeded_and_bundle_reusable(stage_b_env):
-    beta_true = stage_b_env.smm_initial_guess(mode="stage_b")
+def test_frictional_numerical_pfi_panel_api_is_seeded_and_bundle_reusable(frictional_numerical_env):
+    beta_true = frictional_numerical_env.smm_initial_guess(mode="frictional_numerical")
     run_config = SMMRunConfig(
         n_firms=3,
         horizon=4,
@@ -119,37 +119,37 @@ def test_stage_b_pfi_panel_api_is_seeded_and_bundle_reusable(stage_b_env):
         n_sim_panels=2,
     )
     solver_config = _make_pfi_solver_config()
-    seed = fold_in_seed((20, 26), "stage_b", "panel")
-    alt_seed = fold_in_seed((20, 26), "stage_b", "panel_alt")
+    seed = fold_in_seed((20, 26), "frictional_numerical", "panel")
+    alt_seed = fold_in_seed((20, 26), "frictional_numerical", "panel_alt")
 
     # Solve once, reuse bundle for all panels to avoid redundant PFI solves.
-    bundle = stage_b_env.solve_smm_policy_bundle(
+    bundle = frictional_numerical_env.solve_smm_policy_bundle(
         beta_true,
         solver_config,
         seed=fold_in_seed(seed, "solver"),
     )
 
-    panel_a = stage_b_env.simulate_smm_panel_data(
+    panel_a = frictional_numerical_env.simulate_smm_panel_data(
         beta_true,
         run_config,
         seed,
-        mode="stage_b",
+        mode="frictional_numerical",
         solver_config=solver_config,
         policy_bundle=bundle,
     )
-    panel_b = stage_b_env.simulate_smm_panel_data(
+    panel_b = frictional_numerical_env.simulate_smm_panel_data(
         beta_true,
         run_config,
         seed,
-        mode="stage_b",
+        mode="frictional_numerical",
         solver_config=solver_config,
         policy_bundle=bundle,
     )
-    panel_alt = stage_b_env.simulate_smm_panel_data(
+    panel_alt = frictional_numerical_env.simulate_smm_panel_data(
         beta_true,
         run_config,
         alt_seed,
-        mode="stage_b",
+        mode="frictional_numerical",
         solver_config=solver_config,
         policy_bundle=bundle,
     )
@@ -157,22 +157,25 @@ def test_stage_b_pfi_panel_api_is_seeded_and_bundle_reusable(stage_b_env):
     np.testing.assert_allclose(panel_a.k, panel_b.k, atol=1e-10)
     np.testing.assert_allclose(panel_a.z, panel_b.z, atol=1e-10)
     np.testing.assert_allclose(panel_a.k_next, panel_b.k_next, atol=1e-10)
-    assert not np.allclose(panel_a.k_next, panel_alt.k_next)
+    # A different seed must change the simulated shock path. Checked on z (the
+    # stochastic driver), not k_next: on this coarse smoke grid the PFI policy
+    # can be near-constant, so k_next is state-independent and matches across seeds.
+    assert not np.allclose(panel_a.z, panel_alt.z)
 
-    wrapped = stage_b_env.compute_smm_panel_moments(panel_a)
-    assert wrapped["mode"] == "stage_b"
-    assert wrapped["moment_names"] == stage_b_env.smm_moment_names(mode="stage_b")
+    wrapped = frictional_numerical_env.compute_smm_panel_moments(panel_a)
+    assert wrapped["mode"] == "frictional_numerical"
+    assert wrapped["moment_names"] == frictional_numerical_env.smm_moment_names(mode="frictional_numerical")
     assert wrapped["panel_moments"].shape == (2, 5)
 
 
 @pytest.mark.slow
-def test_stage_b_er_bundle_is_deterministic_under_fixed_seed(stage_b_env):
-    beta_true = stage_b_env.smm_initial_guess(mode="stage_b")
+def test_frictional_numerical_er_bundle_is_deterministic_under_fixed_seed(frictional_numerical_env):
+    beta_true = frictional_numerical_env.smm_initial_guess(mode="frictional_numerical")
     solver_config = _make_er_solver_config()
-    seed = fold_in_seed((20, 26), "stage_b", "er_bundle")
+    seed = fold_in_seed((20, 26), "frictional_numerical", "er_bundle")
 
-    bundle_a = stage_b_env.solve_smm_policy_bundle(beta_true, solver_config, seed)
-    bundle_b = stage_b_env.solve_smm_policy_bundle(beta_true, solver_config, seed)
+    bundle_a = frictional_numerical_env.solve_smm_policy_bundle(beta_true, solver_config, seed)
+    bundle_b = frictional_numerical_env.solve_smm_policy_bundle(beta_true, solver_config, seed)
 
     assert isinstance(bundle_a, BasicInvestmentSMMSolverBundle)
     assert bundle_a.method == "ER"
@@ -187,19 +190,19 @@ def test_stage_b_er_bundle_is_deterministic_under_fixed_seed(stage_b_env):
         burn_in=1,
         n_sim_panels=1,
     )
-    panel_a = stage_b_env.simulate_smm_panel_data(
+    panel_a = frictional_numerical_env.simulate_smm_panel_data(
         beta_true,
         run_config,
         seed=(11, 17),
-        mode="stage_b",
+        mode="frictional_numerical",
         solver_config=solver_config,
         policy_bundle=bundle_a,
     )
-    panel_b = stage_b_env.simulate_smm_panel_data(
+    panel_b = frictional_numerical_env.simulate_smm_panel_data(
         beta_true,
         run_config,
         seed=(11, 17),
-        mode="stage_b",
+        mode="frictional_numerical",
         solver_config=solver_config,
         policy_bundle=bundle_b,
     )
@@ -207,38 +210,38 @@ def test_stage_b_er_bundle_is_deterministic_under_fixed_seed(stage_b_env):
 
 
 @pytest.mark.slow
-def test_stage_b_pfi_bundle_returns_finite_panel_moments(stage_b_env):
-    beta_true = stage_b_env.smm_initial_guess(mode="stage_b")
+def test_frictional_numerical_pfi_bundle_returns_finite_panel_moments(frictional_numerical_env):
+    beta_true = frictional_numerical_env.smm_initial_guess(mode="frictional_numerical")
     solver_config = _make_pfi_solver_config()
-    bundle = stage_b_env.solve_smm_policy_bundle(
+    bundle = frictional_numerical_env.solve_smm_policy_bundle(
         beta_true,
         solver_config,
-        seed=fold_in_seed((20, 26), "stage_b", "pfi_bundle"),
+        seed=fold_in_seed((20, 26), "frictional_numerical", "pfi_bundle"),
     )
 
     assert bundle.method == "PFI"
     assert bundle.converged
     assert bundle.stop_reason == "converged"
 
-    panel = stage_b_env.simulate_smm_panel_data(
+    panel = frictional_numerical_env.simulate_smm_panel_data(
         beta_true,
         SMMRunConfig(n_firms=3, horizon=4, burn_in=1, n_sim_panels=1),
         seed=(3, 5),
-        mode="stage_b",
+        mode="frictional_numerical",
         solver_config=solver_config,
         policy_bundle=bundle,
     )
-    wrapped = stage_b_env.compute_smm_panel_moments(panel)
+    wrapped = frictional_numerical_env.compute_smm_panel_moments(panel)
     assert wrapped["panel_moments"].shape == (1, 5)
     assert np.all(np.isfinite(wrapped["panel_moments"]))
 
 
 @pytest.mark.slow
-def test_stage_b_er_spec_simulates_finite_panel_moments(stage_b_env):
-    beta_true = stage_b_env.smm_initial_guess(mode="stage_b")
+def test_frictional_numerical_er_spec_simulates_finite_panel_moments(frictional_numerical_env):
+    beta_true = frictional_numerical_env.smm_initial_guess(mode="frictional_numerical")
     solver_config = _make_er_solver_config()
-    spec = stage_b_env.make_smm_spec(
-        mode="stage_b",
+    spec = frictional_numerical_env.make_smm_spec(
+        mode="frictional_numerical",
         initial_guess=beta_true,
         solver_config=solver_config,
     )
@@ -253,7 +256,7 @@ def test_stage_b_er_spec_simulates_finite_panel_moments(stage_b_env):
     panel_result = spec.simulate_panel_moments(
         beta_true,
         run_config,
-        fold_in_seed(run_config.master_seed, "stage_b", "ER", "panel"),
+        fold_in_seed(run_config.master_seed, "frictional_numerical", "ER", "panel"),
     )
 
     assert panel_result.panel_moments.shape == (6, 5)
@@ -263,12 +266,12 @@ def test_stage_b_er_spec_simulates_finite_panel_moments(stage_b_env):
 
 
 @pytest.mark.slow
-def test_stage_b_pfi_solve_smm_smoke_returns_finite_results(stage_b_env):
-    beta_true = stage_b_env.smm_initial_guess(mode="stage_b")
+def test_frictional_numerical_pfi_solve_smm_smoke_returns_finite_results(frictional_numerical_env):
+    beta_true = frictional_numerical_env.smm_initial_guess(mode="frictional_numerical")
     initial_guess = np.array([0.66, 0.16, 0.60, 0.12], dtype=np.float64)
     solver_config = _make_pfi_solver_config()
-    spec = stage_b_env.make_smm_spec(
-        mode="stage_b",
+    spec = frictional_numerical_env.make_smm_spec(
+        mode="frictional_numerical",
         initial_guess=initial_guess,
         solver_config=solver_config,
     )
@@ -282,11 +285,11 @@ def test_stage_b_pfi_solve_smm_smoke_returns_finite_results(stage_b_env):
         optimizer_maxiter=1,
         master_seed=(30, 40),
     )
-    target = stage_b_env.simulate_smm_target_moments(
+    target = frictional_numerical_env.simulate_smm_target_moments(
         beta_true,
         run_config,
-        seed=fold_in_seed(run_config.master_seed, "stage_b", "PFI", "target"),
-        mode="stage_b",
+        seed=fold_in_seed(run_config.master_seed, "frictional_numerical", "PFI", "target"),
+        mode="frictional_numerical",
         solver_config=solver_config,
     )
 
@@ -295,7 +298,7 @@ def test_stage_b_pfi_solve_smm_smoke_returns_finite_results(stage_b_env):
         target=target,
         config=run_config,
         simulation_seed=fold_in_seed(
-            run_config.master_seed, "stage_b", "PFI", "crn",
+            run_config.master_seed, "frictional_numerical", "PFI", "crn",
         ),
     )
 

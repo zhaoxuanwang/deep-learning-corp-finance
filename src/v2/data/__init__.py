@@ -14,6 +14,11 @@ Public API:
 
 from src.v2.data.rng import SeedSchedule, SeedScheduleConfig, VariableID
 from src.v2.data.generator import DataGenerator, DataGeneratorConfig
+from src.v2.data.nikolov_compustat import (
+    NikolovCompustatConfig,
+    build_nikolov_policy_panel,
+    load_compustat_hkg_raw,
+)
 from src.v2.data.pipeline import build_iterator, validate_dataset_keys
 
 __all__ = [
@@ -22,6 +27,9 @@ __all__ = [
     "VariableID",
     "DataGenerator",
     "DataGeneratorConfig",
+    "NikolovCompustatConfig",
+    "build_nikolov_policy_panel",
+    "load_compustat_hkg_raw",
     "build_iterator",
     "validate_dataset_keys",
 ]

@@ -585,20 +585,20 @@ class BasicInvestmentEnv(MDPEnvironment):
 
     def smm_parameter_names(
         self,
-        mode: Literal["stage_a", "stage_b"] = "stage_a",
+        mode: Literal["frictionless_analytical", "frictional_numerical"] = "frictionless_analytical",
     ) -> tuple[str, ...]:
-        mode = _resolve_basic_investment_stage(mode)
-        if mode == "stage_a":
+        mode = _resolve_basic_investment_mode(mode)
+        if mode == "frictionless_analytical":
             return ("alpha", "rho", "sigma_epsilon")
         return ("alpha", "psi1", "rho", "sigma_epsilon")
 
     def smm_moment_names(
         self,
-        mode: Literal["stage_a", "stage_b"] = "stage_a",
+        mode: Literal["frictionless_analytical", "frictional_numerical"] = "frictionless_analytical",
     ) -> tuple[str, ...]:
-        mode = _resolve_basic_investment_stage(mode)
-        if mode == "stage_a":
-            # income_ar1_beta is NOT included for Stage A: in the frictionless
+        mode = _resolve_basic_investment_mode(mode)
+        if mode == "frictionless_analytical":
+            # income_ar1_beta is NOT included for frictionless-analytical: in the frictionless
             # model, log(income_ratio) = sigma*eps + const (white noise) because
             # instant capital adjustment absorbs all z persistence.  AR1_beta
             # is identically zero regardless of rho and cannot identify it.
@@ -619,10 +619,10 @@ class BasicInvestmentEnv(MDPEnvironment):
 
     def smm_default_bounds(
         self,
-        mode: Literal["stage_a", "stage_b"] = "stage_a",
+        mode: Literal["frictionless_analytical", "frictional_numerical"] = "frictionless_analytical",
     ) -> tuple[tuple[float, float], ...]:
-        mode = _resolve_basic_investment_stage(mode)
-        if mode == "stage_a":
+        mode = _resolve_basic_investment_mode(mode)
+        if mode == "frictionless_analytical":
             return (
                 (0.10, 0.95),   # alpha
                 (-0.95, 0.95),  # rho
@@ -637,10 +637,10 @@ class BasicInvestmentEnv(MDPEnvironment):
 
     def smm_initial_guess(
         self,
-        mode: Literal["stage_a", "stage_b"] = "stage_a",
+        mode: Literal["frictionless_analytical", "frictional_numerical"] = "frictionless_analytical",
     ) -> np.ndarray:
-        mode = _resolve_basic_investment_stage(mode)
-        if mode == "stage_a":
+        mode = _resolve_basic_investment_mode(mode)
+        if mode == "frictionless_analytical":
             return np.array(
                 [
                     self.econ.production_elasticity,
@@ -661,7 +661,7 @@ class BasicInvestmentEnv(MDPEnvironment):
 
     def smm_true_beta(
         self,
-        mode: Literal["stage_a", "stage_b"] = "stage_a",
+        mode: Literal["frictionless_analytical", "frictional_numerical"] = "frictionless_analytical",
     ) -> np.ndarray:
         """Return the env's current structural parameters as the ground-truth β.
 
@@ -679,10 +679,10 @@ class BasicInvestmentEnv(MDPEnvironment):
         self,
         initial_guess: Sequence[float] | None = None,
         bounds: Sequence[Sequence[float]] | None = None,
-        mode: Literal["stage_a", "stage_b"] = "stage_a",
+        mode: Literal["frictionless_analytical", "frictional_numerical"] = "frictionless_analytical",
         solver_config: BasicInvestmentSMMSolverConfig | None = None,
     ) -> SMMSpec:
-        """Build an env-owned SMM spec for the requested Stage A/B mode.
+        """Build an env-owned SMM spec for the requested frictionless-analytical / frictional-numerical mode.
 
         Args:
             initial_guess: Starting point for the optimizer.  Defaults to
@@ -695,15 +695,15 @@ class BasicInvestmentEnv(MDPEnvironment):
             bounds:        Search region for each parameter.  Defaults to
                            ``smm_default_bounds()``.  Tighten if you have
                            economically motivated prior ranges.
-            mode:          ``'stage_a'`` (analytical/frictionless policy)
-                           or ``'stage_b'`` (numerical solver in the loop).
-            solver_config: Stage-B solver settings.  Ignored for stage_a.
+            mode:          ``'frictionless_analytical'`` (analytical/frictionless policy)
+                           or ``'frictional_numerical'`` (numerical solver in the loop).
+            solver_config: frictional-numerical solver settings.  Ignored when mode is frictionless-analytical.
         """
-        mode = _resolve_basic_investment_stage(mode)
-        if mode == "stage_a":
-            _validate_basic_investment_stage_a_support(self)
+        mode = _resolve_basic_investment_mode(mode)
+        if mode == "frictionless_analytical":
+            _validate_frictionless_analytical_support(self)
         else:
-            _validate_basic_investment_stage_b_support(self)
+            _validate_frictional_numerical_support(self)
             solver_config = solver_config or BasicInvestmentSMMSolverConfig()
 
         resolved_bounds = (
@@ -721,7 +721,7 @@ class BasicInvestmentEnv(MDPEnvironment):
             guess = np.asarray(initial_guess, dtype=np.float64)
         def _simulate_panel_moments(beta, run_config, seed):
             bundle = None
-            if mode == "stage_b":
+            if mode == "frictional_numerical":
                 bundle = self.solve_smm_policy_bundle(
                     beta=beta,
                     solver_config=solver_config,
@@ -763,7 +763,7 @@ class BasicInvestmentEnv(MDPEnvironment):
         seed: tuple[int, int],
         value_init=None,
     ) -> BasicInvestmentSMMSolverBundle:
-        """Solve/train one candidate Stage-B policy bundle for SMM rollout.
+        """Solve/train one candidate frictional-numerical policy bundle for SMM rollout.
 
         Args:
             value_init: Optional warm-start value function from a previous
@@ -771,12 +771,12 @@ class BasicInvestmentEnv(MDPEnvironment):
                         PFI/VFI solver.  Ignored for ER method.
         """
 
-        _validate_basic_investment_stage_b_support(self)
+        _validate_frictional_numerical_support(self)
         solver_config = solver_config or BasicInvestmentSMMSolverConfig()
         candidate_env = _basic_investment_env_from_beta(
             self,
             beta,
-            mode="stage_b",
+            mode="frictional_numerical",
         )
         if solver_config.method == "ER":
             return _solve_basic_investment_er_bundle(
@@ -794,7 +794,7 @@ class BasicInvestmentEnv(MDPEnvironment):
                 value_init=value_init,
             )
         raise ValueError(
-            "Unsupported BasicInvestment Stage-B solver method "
+            "Unsupported BasicInvestment frictional-numerical solver method "
             f"{solver_config.method!r}."
         )
 
@@ -804,21 +804,21 @@ class BasicInvestmentEnv(MDPEnvironment):
         run_config: SMMRunConfig,
         seed: tuple[int, int],
         *,
-        mode: Literal["stage_a", "stage_b"] = "stage_a",
+        mode: Literal["frictionless_analytical", "frictional_numerical"] = "frictionless_analytical",
         solver_config: BasicInvestmentSMMSolverConfig | None = None,
         policy_bundle: BasicInvestmentSMMSolverBundle | None = None,
     ) -> BasicInvestmentSMMPanelData:
         """Simulate raw panel data for either the analytical or solve-in-loop path."""
 
-        mode = _resolve_basic_investment_stage(mode)
+        mode = _resolve_basic_investment_mode(mode)
         candidate_env = _basic_investment_env_from_beta(self, beta, mode=mode)
         panel_seed = tuple(map(int, seed))
 
-        if mode == "stage_a":
-            _validate_basic_investment_stage_a_support(candidate_env)
+        if mode == "frictionless_analytical":
+            _validate_frictionless_analytical_support(candidate_env)
             if policy_bundle is not None:
                 raise ValueError(
-                    "policy_bundle is only supported for BasicInvestment Stage-B SMM."
+                    "policy_bundle is only supported for BasicInvestment frictional-numerical SMM."
                 )
             next_capital_policy = _build_analytical_next_capital_policy(candidate_env)
             extra_metadata = {
@@ -826,7 +826,7 @@ class BasicInvestmentEnv(MDPEnvironment):
                 "seed": panel_seed,
             }
         else:
-            _validate_basic_investment_stage_b_support(candidate_env)
+            _validate_frictional_numerical_support(candidate_env)
             if solver_config is None and policy_bundle is not None:
                 solver_config = BasicInvestmentSMMSolverConfig(
                     method=policy_bundle.method
@@ -862,10 +862,10 @@ class BasicInvestmentEnv(MDPEnvironment):
         self,
         panel_data: "BasicInvestmentSMMPanelData",
     ) -> dict[str, Any]:
-        """Compute env-owned Stage A/B SMM moments from raw panel data."""
+        """Compute env-owned frictionless-analytical / frictional-numerical SMM moments from raw panel data."""
 
-        mode = _resolve_basic_investment_stage(
-            panel_data.metadata.get("mode", "stage_a")
+        mode = _resolve_basic_investment_mode(
+            panel_data.metadata.get("mode", "frictionless_analytical")
         )
         panel_moments, diagnostics = _compute_basic_smm_panel_moments(
             self,
@@ -887,11 +887,11 @@ class BasicInvestmentEnv(MDPEnvironment):
         run_config: SMMRunConfig,
         seed: tuple[int, int],
         *,
-        mode: Literal["stage_a", "stage_b"] = "stage_a",
+        mode: Literal["frictionless_analytical", "frictional_numerical"] = "frictionless_analytical",
         solver_config: BasicInvestmentSMMSolverConfig | None = None,
         policy_bundle: BasicInvestmentSMMSolverBundle | None = None,
     ) -> SMMPanelMoments:
-        """Simulate per-panel SMM moments under the requested Stage A/B path."""
+        """Simulate per-panel SMM moments under the requested frictionless-analytical / frictional-numerical path."""
 
         panel_data = self.simulate_smm_panel_data(
             beta=beta,
@@ -901,7 +901,7 @@ class BasicInvestmentEnv(MDPEnvironment):
             solver_config=solver_config,
             policy_bundle=policy_bundle,
         )
-        resolved_mode = _resolve_basic_investment_stage(mode)
+        resolved_mode = _resolve_basic_investment_mode(mode)
         panel_moments, diagnostics = _compute_basic_smm_panel_moments(
             self,
             panel_data,
@@ -925,20 +925,20 @@ class BasicInvestmentEnv(MDPEnvironment):
         run_config: SMMRunConfig,
         seed: tuple[int, int],
         *,
-        mode: Literal["stage_a", "stage_b"] = "stage_a",
+        mode: Literal["frictionless_analytical", "frictional_numerical"] = "frictionless_analytical",
         solver_config: BasicInvestmentSMMSolverConfig | None = None,
         policy_bundle: BasicInvestmentSMMSolverBundle | None = None,
     ) -> SMMTargetMoments:
-        """Simulate one fake-real Stage A/B target-moment vector."""
+        """Simulate one fake-real frictionless-analytical / frictional-numerical target-moment vector."""
 
-        mode = _resolve_basic_investment_stage(mode)
+        mode = _resolve_basic_investment_mode(mode)
         candidate_env = _basic_investment_env_from_beta(self, beta, mode=mode)
 
-        if mode == "stage_a":
-            _validate_basic_investment_stage_a_support(candidate_env)
+        if mode == "frictionless_analytical":
+            _validate_frictionless_analytical_support(candidate_env)
             if policy_bundle is not None:
                 raise ValueError(
-                    "policy_bundle is only supported for BasicInvestment Stage-B SMM."
+                    "policy_bundle is only supported for BasicInvestment frictional-numerical SMM."
                 )
             next_capital_policy = _build_analytical_next_capital_policy(candidate_env)
             panel_seed = tuple(map(int, seed))
@@ -947,7 +947,7 @@ class BasicInvestmentEnv(MDPEnvironment):
                 "seed": panel_seed,
             }
         else:
-            _validate_basic_investment_stage_b_support(candidate_env)
+            _validate_frictional_numerical_support(candidate_env)
             if solver_config is None and policy_bundle is not None:
                 solver_config = BasicInvestmentSMMSolverConfig(
                     method=policy_bundle.method
@@ -1046,12 +1046,12 @@ class BasicInvestmentEnv(MDPEnvironment):
     ) -> "BasicInvestmentGMMPanelData":
         """Simulate a fake-real observed panel for GMM.
 
-        Solves the model at current parameters (Stage B) to obtain the
+        Solves the model at current parameters (frictional-numerical) to obtain the
         optimal policy, then simulates one panel of (pi, k, I).  This
         solve happens once per panel, NOT inside the GMM optimizer loop.
         """
 
-        _validate_basic_investment_stage_b_support(self)
+        _validate_frictional_numerical_support(self)
         solver_config = solver_config or BasicInvestmentSMMSolverConfig()
         beta = self.gmm_true_beta()
 
@@ -1137,7 +1137,7 @@ class BasicInvestmentEnv(MDPEnvironment):
             seed: tuple[int, int],
         ) -> GMMSpec:
             candidate_env = _basic_investment_env_from_beta(
-                base_env, beta_true, mode="stage_b",
+                base_env, beta_true, mode="frictional_numerical",
             )
             new_panel = candidate_env.simulate_gmm_panel(
                 seed=seed,
@@ -1326,7 +1326,7 @@ class BasicInvestmentSMMPanelData:
 
 @dataclass(frozen=True)
 class BasicInvestmentSMMSolverConfig:
-    """Notebook-facing Stage-B solver settings for solve-in-loop SMM."""
+    """Notebook-facing frictional-numerical solver settings for solve-in-loop SMM."""
 
     method: Literal["ER", "PFI"] = "ER"
     dataset_config: DataGeneratorConfig = field(
@@ -1364,7 +1364,7 @@ class BasicInvestmentSMMSolverConfig:
 
 @dataclass(frozen=True)
 class BasicInvestmentSMMSolverBundle:
-    """Unified Stage-B policy bundle returned by the env-owned solver resolver."""
+    """Unified frictional-numerical policy bundle returned by the env-owned solver resolver."""
 
     method: Literal["ER", "PFI"]
     beta: np.ndarray
@@ -1383,30 +1383,30 @@ class BasicInvestmentSMMSolverBundle:
         object.__setattr__(self, "beta", np.asarray(self.beta, dtype=np.float64))
 
 
-BasicInvestmentSMMMode = Literal["stage_a", "stage_b"]
+BasicInvestmentSMMMode = Literal["frictionless_analytical", "frictional_numerical"]
 
 
-def _resolve_basic_investment_stage(mode: BasicInvestmentSMMMode) -> BasicInvestmentSMMMode:
-    if mode not in {"stage_a", "stage_b"}:
+def _resolve_basic_investment_mode(mode: BasicInvestmentSMMMode) -> BasicInvestmentSMMMode:
+    if mode not in {"frictionless_analytical", "frictional_numerical"}:
         raise ValueError(
-            "BasicInvestment SMM mode must be 'stage_a' or 'stage_b'. "
+            "BasicInvestment SMM mode must be 'frictionless_analytical' or 'frictional_numerical'. "
             f"Got {mode!r}."
         )
     return mode
 
 
-def _validate_basic_investment_stage_a_support(env: BasicInvestmentEnv) -> None:
+def _validate_frictionless_analytical_support(env: BasicInvestmentEnv) -> None:
     if abs(float(env.econ.cost_convex)) > 1e-12 or abs(float(env.econ.cost_fixed)) > 1e-12:
         raise ValueError(
-            "BasicInvestmentEnv Stage-A analytical SMM requires the frictionless "
+            "BasicInvestmentEnv frictionless-analytical SMM requires the frictionless "
             "case with cost_convex == 0 and cost_fixed == 0."
         )
 
 
-def _validate_basic_investment_stage_b_support(env: BasicInvestmentEnv) -> None:
+def _validate_frictional_numerical_support(env: BasicInvestmentEnv) -> None:
     if abs(float(env.econ.cost_fixed)) > 1e-12:
         raise ValueError(
-            "BasicInvestmentEnv Stage-B SMM currently requires cost_fixed == 0 "
+            "BasicInvestmentEnv frictional-numerical SMM currently requires cost_fixed == 0 "
             "because the ER backend does not support fixed adjustment costs."
         )
 
@@ -1414,14 +1414,14 @@ def _validate_basic_investment_stage_b_support(env: BasicInvestmentEnv) -> None:
 def _basic_investment_env_from_beta(
     base_env: BasicInvestmentEnv,
     beta: Sequence[float],
-    mode: BasicInvestmentSMMMode = "stage_a",
+    mode: BasicInvestmentSMMMode = "frictionless_analytical",
 ) -> BasicInvestmentEnv:
-    mode = _resolve_basic_investment_stage(mode)
+    mode = _resolve_basic_investment_mode(mode)
     beta = np.asarray(beta, dtype=np.float64)
-    if mode == "stage_a":
+    if mode == "frictionless_analytical":
         if beta.shape != (3,):
             raise ValueError(
-                "BasicInvestmentEnv Stage-A SMM expects a 3-parameter vector "
+                "BasicInvestmentEnv frictionless-analytical SMM expects a 3-parameter vector "
                 "(alpha, rho, sigma_epsilon). "
                 f"Got shape {beta.shape}."
             )
@@ -1432,7 +1432,7 @@ def _basic_investment_env_from_beta(
     else:
         if beta.shape != (4,):
             raise ValueError(
-                "BasicInvestmentEnv Stage-B SMM expects a 4-parameter vector "
+                "BasicInvestmentEnv frictional-numerical SMM expects a 4-parameter vector "
                 "(alpha, psi1, rho, sigma_epsilon). "
                 f"Got shape {beta.shape}."
             )
@@ -1576,7 +1576,7 @@ def _validate_basic_investment_policy_bundle(
 ) -> None:
     if bundle.method != solver_config.method:
         raise ValueError(
-            "BasicInvestment Stage-B policy_bundle.method does not match "
+            "BasicInvestment frictional-numerical policy_bundle.method does not match "
             f"solver_config.method: {bundle.method!r} vs {solver_config.method!r}."
         )
     if bundle.beta.shape != np.asarray(beta, dtype=np.float64).shape or not np.allclose(
@@ -1585,7 +1585,7 @@ def _validate_basic_investment_policy_bundle(
         atol=1e-12,
     ):
         raise ValueError(
-            "BasicInvestment Stage-B policy_bundle.beta does not match the "
+            "BasicInvestment frictional-numerical policy_bundle.beta does not match the "
             "requested beta."
         )
 
@@ -1782,9 +1782,9 @@ def _exogenous_transition_np(
 def _compute_basic_smm_panel_moments(
     env: BasicInvestmentEnv,
     panel_data: BasicInvestmentSMMPanelData,
-    mode: BasicInvestmentSMMMode = "stage_a",
+    mode: BasicInvestmentSMMMode = "frictionless_analytical",
 ) -> tuple[np.ndarray, dict[str, Any]]:
-    mode = _resolve_basic_investment_stage(mode)
+    mode = _resolve_basic_investment_mode(mode)
     safe_k = np.maximum(panel_data.k, 1e-12)
     investment = (
         panel_data.k_next
@@ -1801,7 +1801,7 @@ def _compute_basic_smm_panel_moments(
     )
 
     n_panels = panel_data.k.shape[0]
-    n_moments = 4 if mode == "stage_a" else 5
+    n_moments = 4 if mode == "frictionless_analytical" else 5
     panel_moments = np.zeros((n_panels, n_moments), dtype=np.float64)
     mean_investment_assets = np.zeros(n_panels, dtype=np.float64)
     serial_corr_investment = np.zeros(n_panels, dtype=np.float64)
@@ -1816,7 +1816,7 @@ def _compute_basic_smm_panel_moments(
             float(np.var(invest_panel)),
             serial_corr,
         ]
-        if mode == "stage_b":
+        if mode == "frictional_numerical":
             base_moments.append(ar_beta)
         base_moments.append(ar_sigma)
         panel_moments[idx, :] = np.array(

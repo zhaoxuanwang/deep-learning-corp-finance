@@ -88,11 +88,11 @@ def test_gmm_notebook_path_smoke_returns_finite_schema():
     assert np.all(np.isfinite(result.beta_hat))
 
 
-def test_stage_a_smm_notebook_validation_smoke_returns_summary():
+def test_frictionless_analytical_smm_notebook_validation_smoke_returns_summary():
     env = _make_basic_env(cost_convex=0.0)
-    beta_true = env.smm_true_beta(mode="stage_a")
+    beta_true = env.smm_true_beta(mode="frictionless_analytical")
     spec = env.make_smm_spec(
-        mode="stage_a",
+        mode="frictionless_analytical",
         initial_guess=np.array([0.64, 0.58, 0.14], dtype=np.float64),
     )
     run_config = SMMRunConfig(
