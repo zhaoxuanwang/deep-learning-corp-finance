@@ -47,6 +47,8 @@ checkpoints/
 *.fls
 *.fdb_latexmk
 *.synctex.gz
+*.bak
+*.xdv
 *.bbl
 *.blg
 *.nav

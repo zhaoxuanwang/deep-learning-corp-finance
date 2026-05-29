@@ -11,7 +11,7 @@ policy-function plug-ins) lives in per-env factory modules such as
 ``src/v2/estimation/bayesian_basic_investment.py``.  Those factories return
 a ``BayesianSpec`` consumable by ``run_mcmc`` and ``run_coverage_check``.
 
-Design (matches docs/paper/Bayesian.md Sections 1.2, 2.4, 2.6, 2.8, 2.9):
+Design (matches docs/models/Bayesian.md Sections 1.2, 2.4, 2.6, 2.8, 2.9):
 
   - Filter and sampler are orthogonal:
       filter ∈ {kalman, particle}    — owns the likelihood

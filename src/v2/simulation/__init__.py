@@ -1,5 +1,9 @@
 """Simulation helpers for v2 structural model outputs."""
 
+from src.v2.simulation.ceo_contract import (
+    CEOContractSimulationConfig,
+    simulate_ceo_contract_panel,
+)
 from src.v2.simulation.nikolov_le import (
     NikolovLESimulationConfig,
     construct_le_observables,
@@ -17,6 +21,8 @@ from src.v2.simulation.nikolov_to import (
 )
 
 __all__ = [
+    "CEOContractSimulationConfig",
+    "simulate_ceo_contract_panel",
     "NikolovTOSimulationConfig",
     "construct_to_observables",
     "simulate_nikolov_to_panel",

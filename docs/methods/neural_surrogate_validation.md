@@ -7,7 +7,7 @@
 
 ## Context
 
-[`docs/paper/Bayesian.md`](../paper/Bayesian.md) §3 (lines 259–316) proposes a **neural surrogate policy** `φ_NN(k, z, β; θ)` — a single network trained once across the prior support of β so that any candidate β inside MCMC becomes a forward pass, not a full model re-solve. This replaces the current per-iteration solver bottleneck.
+[`docs/models/Bayesian.md`](../models/Bayesian.md) §3 (lines 259–316) proposes a **neural surrogate policy** `φ_NN(k, z, β; θ)` — a single network trained once across the prior support of β so that any candidate β inside MCMC becomes a forward pass, not a full model re-solve. This replaces the current per-iteration solver bottleneck.
 
 **The eventual production target is the frictional basic investment model** (Bayesian.md §1.3 model #2), which has no closed-form policy. The frictionless model is used here only as a validation special case — at φ_quad = φ_prop = 0 the analytical policy is known in closed form (Strebulaev & Whited 2012 §3.1), so we can test whether the surrogate recovers it.
 

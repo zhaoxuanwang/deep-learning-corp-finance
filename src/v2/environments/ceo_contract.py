@@ -1,7 +1,7 @@
 """Primitives and grids for the CEO short-termism contract (Marinovic-Varas 2019).
 
 Continuous-time dynamic principal-agent model summarised in
-``docs/paper/ceo_contract.md``.  The contract reduces to a single state ``z``
+``docs/models/ceo_contract.md``.  The contract reduces to a single state ``z``
 (duration of deferred pay) governed by an HJB equation on ``[0, T]``.  This
 module holds the economic primitives (flow payoff and the semi-explicit optimal
 policies ``a``, ``m``, ``sigma_z``) plus the ``(z, t)`` grid builder.  It is the
@@ -19,6 +19,7 @@ Sign conventions (verified against the value function ``F``, concave with
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 import numpy as np
@@ -28,21 +29,24 @@ import numpy as np
 class CEOContractParams:
     """Economic parameters of the Marinovic-Varas CEO contract model.
 
-    NOTE: the defaults are PLACEHOLDERS chosen only to yield a well-behaved HJB
-    for smoke-testing the pipeline.  Replace with the calibrated values before
-    drawing economic conclusions.  ``__post_init__`` enforces sign/range
+    Defaults are the ``docs/models/ceo_contract.md`` baseline calibration.  The
+    terminal cost coefficient ``C`` is *not* a free hyperparameter: it is the
+    closed-form cost of providing post-retirement incentives over the clawback
+    window ``[T, T+tau]`` (Marinovic-Varas 2019, Eq. 10), exposed as the derived
+    property ``C``.  ``C_override`` is provided only for sensitivity analysis and
+    bypasses the formula when set.  ``__post_init__`` enforces sign/range
     constraints regardless of the numbers supplied.
     """
 
     r: float = 0.10        # risk-free rate / discount rate
-    gamma: float = 5.0     # CARA risk aversion
-    sigma: float = 1.0     # exogenous cash-flow volatility
+    gamma: float = 1.0     # CARA risk aversion
+    sigma: float = 2.0     # exogenous cash-flow volatility
     kappa: float = 0.30    # manipulation-stock depreciation rate
-    theta: float = 0.50    # marginal effect of manipulation on current cash flow
+    theta: float = 0.40    # marginal effect of manipulation on current cash flow
     g: float = 1.0         # manipulation cost coefficient g(m) = g m^2 / 2
     T: float = 10.0        # deterministic retirement date
-    tau: float = 2.0       # clawback horizon (post-retirement); informational
-    C: float = 1.0         # terminal cost coefficient: F(z, T) = -1/2 C z^2
+    tau: float = 5.0       # clawback horizon (post-retirement); drives C
+    C_override: float | None = None  # bypass the closed-form C (sensitivity only)
 
     def __post_init__(self) -> None:
         if self.r <= 0.0:
@@ -59,10 +63,34 @@ class CEOContractParams:
             raise ValueError(f"g must be > 0. Got {self.g}")
         if self.T <= 0.0:
             raise ValueError(f"T must be > 0. Got {self.T}")
-        if self.tau < 0.0:
-            raise ValueError(f"tau must be >= 0. Got {self.tau}")
-        if self.C < 0.0:
-            raise ValueError(f"C must be >= 0. Got {self.C}")
+        if self.tau <= 0.0:
+            raise ValueError(f"tau must be > 0 (it sets the terminal cost C). Got {self.tau}")
+        if self.C_override is not None and self.C_override < 0.0:
+            raise ValueError(f"C_override must be >= 0. Got {self.C_override}")
+
+    @property
+    def C(self) -> float:
+        """Terminal cost coefficient ``F(z, T) = -1/2 C z^2``.
+
+        Closed form (Marinovic-Varas 2019, Eq. 10), the cost of carrying
+        post-retirement incentives until ``T + tau``:
+
+            C = sigma^2 (r + 2 kappa) / [ r gamma (1 - exp(-(r + 2 kappa) tau)) ].
+
+        The ``(r + 2 kappa)`` rate is the discounted growth rate of ``z^2`` under
+        the post-retirement law of motion (drift ``(r + kappa) z`` with no effort,
+        discounted at ``r``).  ``tau -> 0`` gives ``C -> infinity`` (no clawback
+        window, so any deferral is infinitely costly); ``tau -> infinity`` gives
+        the finite floor ``sigma^2 (r + 2 kappa) / (r gamma)``.  Returns
+        ``C_override`` when set.
+        """
+
+        if self.C_override is not None:
+            return self.C_override
+        rate = self.r + 2.0 * self.kappa
+        return self.sigma ** 2 * rate / (
+            self.r * self.gamma * (1.0 - math.exp(-rate * self.tau))
+        )
 
     @property
     def lambda_(self) -> float:
@@ -79,24 +107,55 @@ class CEOContractParams:
 
 @dataclass(frozen=True)
 class CEOContractGridConfig:
-    """Finite-difference grid and numerical-guard configuration."""
+    """Finite-difference grid and control-grid configuration (Marinovic-Varas IA).
 
-    z_bounds: tuple[float, float] = (0.0, 2.0)
-    n_z: int = 201
+    The solver follows the paper's Internet Appendix: an implicit upwind FD scheme
+    whose per-node maximisation over the controls ``(a, sigma_z)`` is done by
+    *grid search* over bounded control grids (uniform ``a in [0, a_max]``, and a
+    ``sigma_z`` grid on ``[-sigma_z_max, sigma_z_max]`` refined near 0).  Both ends
+    are Dirichlet: ``F(0, t) = 0`` and the absorbing-boundary value at ``z_max``.
+    The current implementation supports only this natural lower-bound
+    convention, so ``z_bounds[0]`` must be exactly zero.
+
+    Defaults follow the Figure-1 baseline: domain ``z in [0, 0.30]`` (slightly
+    wider than the 0.25 plotting window).
+    """
+
+    z_bounds: tuple[float, float] = (0.0, 0.30)
+    n_z: int = 161
     n_t: int = 201
 
-    vzz_floor: float = -1e-6     # enforce strict concavity for matrix stability
-    a_max: float = 1.0e3         # safety cap on effort magnitude
-    sigma_z_max: float = 50.0    # safety cap on |sigma_z| (bounds the diffusion)
+    n_a: int = 41                # effort control-grid points (uniform on [0, a_max])
+    n_sigma: int = 81            # sigma_z control-grid points (refined near 0)
+    a_max: float = 2.0           # effort control upper bound (paper's bar a)
+    sigma_z_max: float = 1.0     # sigma_z control half-range
+
+    f0_dirichlet: bool = True    # only supported lower boundary: F(0, t) = 0
+    vzz_floor: float = -1e-6     # concavity floor for closed-form policy extraction
 
     def __post_init__(self) -> None:
         low, high = map(float, self.z_bounds)
         if not (low < high):
             raise ValueError(f"z_bounds must satisfy low < high. Got {self.z_bounds}")
+        if not self.f0_dirichlet:
+            raise ValueError(
+                "f0_dirichlet=False is not implemented; the CEO contract "
+                "solver currently supports only the model boundary F(0, t) = 0."
+            )
+        if low != 0.0:
+            raise ValueError(
+                "CEO contract solver enforces F(0, t) = 0 and requires "
+                "z_bounds[0] == 0. "
+                f"Got z_bounds={self.z_bounds}"
+            )
         if self.n_z < 3:
             raise ValueError(f"n_z must be >= 3. Got {self.n_z}")
         if self.n_t < 2:
             raise ValueError(f"n_t must be >= 2. Got {self.n_t}")
+        if self.n_a < 2:
+            raise ValueError(f"n_a must be >= 2. Got {self.n_a}")
+        if self.n_sigma < 2:
+            raise ValueError(f"n_sigma must be >= 2. Got {self.n_sigma}")
         if self.vzz_floor >= 0.0:
             raise ValueError(f"vzz_floor must be < 0. Got {self.vzz_floor}")
         if self.a_max <= 0.0:
