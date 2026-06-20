@@ -4,7 +4,7 @@ This project solves and estimates dynamic structural corporate finance models wi
 
 It implements the Maliar, Maliar, and Winant (2021) deep learning solvers: Lifetime Reward Maximization (LRM), Euler Residual Minimization (ERM), and Bellman Residual Minimization (BRM). It also adds a Short-Horizon Actor-Critic (SHAC) solver based on Xu et al. (2022), Value and Policy Function Iteration benchmarks, nested VFI for risky debt, Nikolov-Schmid-Steri LP solvers, and a finite-difference CEO-contract solver. For estimation, it provides GMM, SMM, Bayesian EKF/NUTS and RW-MH validation, neural surrogate validation, and empirical-policy indirect inference.
 
-The full methodology, algorithms, and results are in [docs/paper/report.pdf](docs/paper/report.pdf).
+The full methodology, algorithms, and results are in [docs/v2/paper/report.pdf](docs/v2/paper/report.pdf).
 
 ## Quick Start
 
@@ -25,26 +25,26 @@ When using the repository-local virtual environment, prefer:
 
 ## Reproducing the Results
 
-Every figure and table in the report is produced by one of the notebooks in `docs/`. Run them in order. Some later notebooks support profile flags for smoke, baseline, and full runs.
+Every figure and table in the report is produced by one of the notebooks in `docs/v2/`. Run them in order. Some later notebooks support profile flags for smoke, baseline, and full runs.
 
 | Notebook | Reproduces | Approx. runtime |
 | --- | --- | --- |
-| [docs/01_basic_investment_benchmark.ipynb](docs/01_basic_investment_benchmark.ipynb) | Part I, basic investment model. Trains VFI, PFI, LRM, ERM, and SHAC. Reproduces Figures 1 to 5. | 30 min on CPU |
-| [docs/02_basic_investment_ablation.ipynb](docs/02_basic_investment_ablation.ipynb) | Original Maliar21 variants and ablation benchmarks. | 20 min |
-| [docs/03_risky_debt_vfi_interp.ipynb](docs/03_risky_debt_vfi_interp.ipynb) | Part I, risky debt model. Runs the nested VFI solve. Reproduces Figures 6 to 8. | 5 min |
-| [docs/04_gmm_validation.ipynb](docs/04_gmm_validation.ipynb) | Part II, GMM Monte Carlo validation on the basic model. Reproduces Tables 5 to 7. | 10 min |
-| [docs/05_smm_validation.ipynb](docs/05_smm_validation.ipynb) | Part II, SMM Monte Carlo validation on the frictionless basic model. Reproduces Tables 8 to 10. | 30 min |
-| [docs/06_risky_debt_smm_calibrated.ipynb](docs/06_risky_debt_smm_calibrated.ipynb) | Part II, SMM applied to the Hennessy and Whited (2007) risky debt model. Reproduces Tables 11 and 12. | 40 hr on M1 |
-| [docs/07_bayesian_validation.ipynb](docs/07_bayesian_validation.ipynb) | Bayesian basic-investment validation with the closed-form policy, EKF likelihood, NUTS sampling, posterior diagnostics, and coverage checks. | Profile-dependent; SMOKE about 3 min |
-| [docs/08a_pretrain_nn_surrogate.ipynb](docs/08a_pretrain_nn_surrogate.ipynb) | Neural surrogate pretraining for the parameterized basic-investment policy. | Cached; retrain about 60 to 90 min CPU |
-| [docs/08b_rwmh_three_way_baseline.ipynb](docs/08b_rwmh_three_way_baseline.ipynb) | RW-MH comparison across neural surrogate, closed-form, and diagnostic Bayesian paths. | Profile-dependent |
-| [docs/08c_nuts_closedform_validation.ipynb](docs/08c_nuts_closedform_validation.ipynb) | Closed-form NUTS posterior diagnostics, posterior predictive checks, coverage, and sensitivity analysis. | About 7 min CPU_SMOKE; about 27 min CPU_LARGE |
-| [docs/09_nikolov_models.ipynb](docs/09_nikolov_models.ipynb) | Nikolov-Schmid-Steri TO, LE, and MH linear-programming model solves. | Profile-dependent |
-| [docs/10_nikolov_to_policy_pipeline.ipynb](docs/10_nikolov_to_policy_pipeline.ipynb) | Empirical policy construction and indirect inference for the Nikolov TO model on Hong Kong data. | Profile-dependent |
-| [docs/11_nikolov_compustat_cleaning.ipynb](docs/11_nikolov_compustat_cleaning.ipynb) | Compustat cleaning pipeline for Hong Kong listed firms. | Data-dependent |
-| [docs/12_nikolov_le_policy_pipeline.ipynb](docs/12_nikolov_le_policy_pipeline.ipynb) | Nikolov LE simulation and policy diagnostics. | Profile-dependent |
-| [docs/13_nikolov_mh_policy_pipeline.ipynb](docs/13_nikolov_mh_policy_pipeline.ipynb) | Nikolov MH simulation and policy diagnostics. | Profile-dependent |
-| [docs/14_ceo_contract_pipeline.ipynb](docs/14_ceo_contract_pipeline.ipynb) | Marinovic-Varas CEO contract finite-difference solve, SDE simulation, and value reconciliation. | About 10 min |
+| [docs/v2/01_basic_investment_benchmark.ipynb](docs/v2/01_basic_investment_benchmark.ipynb) | Part I, basic investment model. Trains VFI, PFI, LRM, ERM, and SHAC. Reproduces Figures 1 to 5. | 30 min on CPU |
+| [docs/v2/02_basic_investment_ablation.ipynb](docs/v2/02_basic_investment_ablation.ipynb) | Original Maliar21 variants and ablation benchmarks. | 20 min |
+| [docs/v2/03_risky_debt_vfi_interp.ipynb](docs/v2/03_risky_debt_vfi_interp.ipynb) | Part I, risky debt model. Runs the nested VFI solve. Reproduces Figures 6 to 8. | 5 min |
+| [docs/v2/04_gmm_validation.ipynb](docs/v2/04_gmm_validation.ipynb) | Part II, GMM Monte Carlo validation on the basic model. Reproduces Tables 5 to 7. | 10 min |
+| [docs/v2/05_smm_validation.ipynb](docs/v2/05_smm_validation.ipynb) | Part II, SMM Monte Carlo validation on the frictionless basic model. Reproduces Tables 8 to 10. | 30 min |
+| [docs/v2/06_risky_debt_smm_calibrated.ipynb](docs/v2/06_risky_debt_smm_calibrated.ipynb) | Part II, SMM applied to the Hennessy and Whited (2007) risky debt model. Reproduces Tables 11 and 12. | 40 hr on M1 |
+| [docs/v2/07_bayesian_validation.ipynb](docs/v2/07_bayesian_validation.ipynb) | Bayesian basic-investment validation with the closed-form policy, EKF likelihood, NUTS sampling, posterior diagnostics, and coverage checks. | Profile-dependent; SMOKE about 3 min |
+| [docs/v2/08a_pretrain_nn_surrogate.ipynb](docs/v2/08a_pretrain_nn_surrogate.ipynb) | Neural surrogate pretraining for the parameterized basic-investment policy. | Cached; retrain about 60 to 90 min CPU |
+| [docs/v2/08b_rwmh_three_way_baseline.ipynb](docs/v2/08b_rwmh_three_way_baseline.ipynb) | RW-MH comparison across neural surrogate, closed-form, and diagnostic Bayesian paths. | Profile-dependent |
+| [docs/v2/08c_nuts_closedform_validation.ipynb](docs/v2/08c_nuts_closedform_validation.ipynb) | Closed-form NUTS posterior diagnostics, posterior predictive checks, coverage, and sensitivity analysis. | About 7 min CPU_SMOKE; about 27 min CPU_LARGE |
+| [docs/v2/09_nikolov_models.ipynb](docs/v2/09_nikolov_models.ipynb) | Nikolov-Schmid-Steri TO, LE, and MH linear-programming model solves. | Profile-dependent |
+| [docs/v2/10_nikolov_to_policy_pipeline.ipynb](docs/v2/10_nikolov_to_policy_pipeline.ipynb) | Empirical policy construction and indirect inference for the Nikolov TO model on Hong Kong data. | Profile-dependent |
+| [docs/v2/11_nikolov_compustat_cleaning.ipynb](docs/v2/11_nikolov_compustat_cleaning.ipynb) | Compustat cleaning pipeline for Hong Kong listed firms. | Data-dependent |
+| [docs/v2/12_nikolov_le_policy_pipeline.ipynb](docs/v2/12_nikolov_le_policy_pipeline.ipynb) | Nikolov LE simulation and policy diagnostics. | Profile-dependent |
+| [docs/v2/13_nikolov_mh_policy_pipeline.ipynb](docs/v2/13_nikolov_mh_policy_pipeline.ipynb) | Nikolov MH simulation and policy diagnostics. | Profile-dependent |
+| [docs/v2/14_ceo_contract_pipeline.ipynb](docs/v2/14_ceo_contract_pipeline.ipynb) | Marinovic-Varas CEO contract finite-difference solve, SDE simulation, and value reconciliation. | About 10 min |
 
 Each notebook writes its outputs to `outputs/notebooks/<notebook-name>/`. Every run is fully reproducible from a single master seed. See `src/v2/data/rng.py` and `src/v2/utils/seeding.py` for details.
 

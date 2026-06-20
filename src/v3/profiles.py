@@ -90,7 +90,11 @@ _FULL = Profile(
     controller=ControllerConfig(),  # spec default 31 pts, 30 restarts, 10 folds, warm-up 200
     train_epochs=1000,
     n_firms=5000, T=300, burn_in=200, refine_rounds=6,
-    collect_rows=10000, collect_batch_size=64,
+    # collect_batch_size is memory-bound at the FULL state grid: the batched dense
+    # policy-evaluation solve is [B, S, S] with S = n_z*n_k*n_b = 5775, i.e. ~266 MB
+    # per batch element in float64, and the batched panel records [B, n_firms, T]. B=8
+    # fits a 40 GB A100 with headroom; raise toward 16 on an A100 only (see notebook).
+    collect_rows=10000, collect_batch_size=8,
     surrogate_passes=200, n_restarts=30,
     recovery_draws=40, controller_every=1,
 )

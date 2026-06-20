@@ -3,7 +3,6 @@ title: "Quantitative Methods for Structural Corporate Finance Models"
 author: Zhaoxuan Wang
 number-sections: true
 top-level-division: chapter
-colorlinks: true
 date: 2026-05-29
 bibliography: ../references.bib
 thanks:  Email me at [wxuan.econ@gmail.com](mailto:wxuan.econ@gmail.com)
@@ -503,7 +502,7 @@ where every trajectory uses the same pre-simulated exogenous shock path from the
 
 ## Results: Basic Investment Model
 
-This section present results from solving the basic model using different methods. To validate the correctness and effectiveness of solution, I set capital adjustment costs to zero (frictionless) $\psi_0=\psi_1=0$ so that we can benchmark the solution against a ground-truth optimal policy $k^*$. This experiment can be reproduced by running `docs/01_basic_investment_benchmark.ipynb`.
+This section present results from solving the basic model using different methods. To validate the correctness and effectiveness of solution, I set capital adjustment costs to zero (frictionless) $\psi_0=\psi_1=0$ so that we can benchmark the solution against a ground-truth optimal policy $k^*$. This experiment can be reproduced by running `docs/v2/01_basic_investment_benchmark.ipynb`.
 
 ### Convergence Curve
 
@@ -592,7 +591,7 @@ The architecture-level choices in this table are documented in detail in [Implem
 
 ## Results: Risky Debt Model
 
-This section can be reproduced by running `docs/03_risky_debt_vfi_interp.ipynb`.
+This section can be reproduced by running `docs/v2/03_risky_debt_vfi_interp.ipynb`.
 
 ### Solution method: Nested VFI
 
@@ -702,7 +701,7 @@ There are several important implementation issues:
 
 ### GMM Validation on the Basic Investment Model {#sec-gmm-validation}
 
-I validate the GMM implementation on the basic investment model with smooth (convex) capital adjustment cost, where the Euler equation has a closed form. The Euler conditions provide moment restrictions that are evaluated directly from the observable panel $(\pi, k, I)$, so each $Q(\beta)$ evaluation in the optimizer is arithmetic on the data and the model is never re-solved inside the optimizer loop. The results can be reproduced by running `docs/04_gmm_validation.ipynb`.
+I validate the GMM implementation on the basic investment model with smooth (convex) capital adjustment cost, where the Euler equation has a closed form. The Euler conditions provide moment restrictions that are evaluated directly from the observable panel $(\pi, k, I)$, so each $Q(\beta)$ evaluation in the optimizer is arithmetic on the data and the model is never re-solved inside the optimizer loop. The results can be reproduced by running `docs/v2/04_gmm_validation.ipynb`.
 
 **Validation design.**
 
@@ -753,7 +752,7 @@ I validate the GMM implementation on the basic investment model with smooth (con
 
 ### SMM Validation on the Frictionless Basic Investment Model {#sec-smm-validation}
 
-I validate the SMM implementation on the frictionless basic investment model, where the analytical policy is exact and there is no model-solve error. Any deviation between the estimated and true parameters in this experiment must come from the SMM machinery itself: the moment construction, the two-step weighting, the global / local optimizer, or the standard-error formula. This isolates SMM correctness from model-solution correctness. The results reported below can be reproduced by running `docs/05_smm_validation.ipynb`.
+I validate the SMM implementation on the frictionless basic investment model, where the analytical policy is exact and there is no model-solve error. Any deviation between the estimated and true parameters in this experiment must come from the SMM machinery itself: the moment construction, the two-step weighting, the global / local optimizer, or the standard-error formula. This isolates SMM correctness from model-solution correctness. The results reported below can be reproduced by running `docs/v2/05_smm_validation.ipynb`.
 
 **Validation design.**
 
@@ -803,7 +802,7 @@ I validate the SMM implementation on the frictionless basic investment model, wh
 
 Applying SMM to the basic investment model identifies four parameters: production-function curvature ($\alpha$), smooth adjustment cost ($\psi_1$), AR(1) persistence ($\rho$), and AR(1) shock variance ($\sigma$). Adding costly equity issuance from section 3.3 of @strebulaev2012 brings two more parameters into scope: the fixed and proportional cost components ($\eta_0$ and $\eta_1$). The full endogenous-default model adds one final parameter, the deadweight bankruptcy cost $c_{\text{def}}$, the fraction of firm value lost when the firm defaults. From a pure estimation perspective, the endogenous-default extension only adds one parameter; the rest can be estimated from the simpler frictional model in section 3.3.
 
-The cost of applying SMM to risky debt model is computational: each candidate $\beta$ in the optimizer's inner loop requires a fresh nested-VFI solve on the discrete $(k, b, z)$ grid. A Monte-Carlo replication study at this scale is infeasible (on my current device), so I report a single representative run rather than MC summary statistics. The full SMM target is $\beta = (\alpha,\, \psi_1,\, \eta_0,\, \eta_1,\, c_{\text{def}},\, \rho,\, \sigma)$ with $K = 7$, matched against $R = 11$ moments following @hennessy2007costly's selection (see [Appendix B](#sec-smm-appendix)). The results can be reproduced from `docs/06_risky_debt_smm_workflow.ipynb`. It took about 40 hours to run the full SMM on my 2020 Macbook Pro (M1).
+The cost of applying SMM to risky debt model is computational: each candidate $\beta$ in the optimizer's inner loop requires a fresh nested-VFI solve on the discrete $(k, b, z)$ grid. A Monte-Carlo replication study at this scale is infeasible (on my current device), so I report a single representative run rather than MC summary statistics. The full SMM target is $\beta = (\alpha,\, \psi_1,\, \eta_0,\, \eta_1,\, c_{\text{def}},\, \rho,\, \sigma)$ with $K = 7$, matched against $R = 11$ moments following @hennessy2007costly's selection (see [Appendix B](#sec-smm-appendix)). The results can be reproduced from `docs/v2/06_risky_debt_smm_workflow.ipynb`. It took about 40 hours to run the full SMM on my 2020 Macbook Pro (M1).
 
 **Result 1: moment fit.** Fitted moments deviate noticeably from their targets. The conditional-issuance, AR(1)-shock-std, and variance-of-investment moments miss by 50%+ of their target value, indicating the optimizer cannot find a $\beta$ that matches all 11 moments simultaneously.
 
@@ -1108,7 +1107,7 @@ Concretely, let $\beta \equiv (\alpha, \rho, \sigma_\varepsilon)$ denote the str
 
 This approach is only feasible with NN-based policy approximator. Traditional numerical methods like VFI, PFI, or Linear Programming are grid-based and cannot be solved once over a high-dimensional parameter space. It would require repeatedly solving the model under different parameters, which is intractable even for toy model of this scale (with 8 parameters to be estimated).
 
-To validate the quality of the pre-trained NN surrogate policy, I use the same set of metrics computed on held-out validation dataset. I also plot the NN solution against true analytical solution over $k$ slices. @fig-nb09a-slices shows that SHAC learned a highly precise NN surrogate (orange) with mean absolute error (MAE) lower than 1% when compared against the true closed-form formula (dash). The pre-trained NN surrogate maps $(z,k, \alpha, \rho, \sigma_\varepsilon)$ to the optimal next-period capital $k'$. SHAC is also efficient as this training took about 30min on a CPU (Apple M1). In future, this can be scale up with GPU and more training budget to learn more complex models and to achieve lower mean absolute error. The results can be reproduced in `docs/08a_pretrain_nn_surrogate.ipynb`.
+To validate the quality of the pre-trained NN surrogate policy, I use the same set of metrics computed on held-out validation dataset. I also plot the NN solution against true analytical solution over $k$ slices. @fig-nb09a-slices shows that SHAC learned a highly precise NN surrogate (orange) with mean absolute error (MAE) lower than 1% when compared against the true closed-form formula (dash). The pre-trained NN surrogate maps $(z,k, \alpha, \rho, \sigma_\varepsilon)$ to the optimal next-period capital $k'$. SHAC is also efficient as this training took about 30min on a CPU (Apple M1). In future, this can be scale up with GPU and more training budget to learn more complex models and to achieve lower mean absolute error. The results can be reproduced in `docs/v2/08a_pretrain_nn_surrogate.ipynb`.
 
 ![Training curves: held-out MAE vs SHAC/ER step. Red dashed line marks the best-checkpoint restore; the gap to final-step weights illustrates why best-step restoration matters.](figures/paramNN-validate/training_curve_full.png){#fig-training-curve}
 
@@ -1200,7 +1199,7 @@ More specifically, the validation has three steps:
 
 ###  NUTS + Kalman Filter with closed-form policy
 
-This section can be reproduced by running `docs/08c_nuts_closedform_validation.ipynb`.
+This section can be reproduced by running `docs/v2/08c_nuts_closedform_validation.ipynb`.
 
 As the first validation exercise, I use the toy basic investment model to verify the code-level correctness of the inference pipeline for NUTS Sampler + Extended Kalman Filter. The implementation follows these steps:
 
@@ -1251,7 +1250,7 @@ To show additional checks, I re-run the estimation and the full post-inference a
 
 ### RW-MH + Kalman Filter with Neural Surrogate Policy
 
-This section can be reproduced by running `docs/08b_rwmh_three_way_baseline.ipynb`.
+This section can be reproduced by running `docs/v2/08b_rwmh_three_way_baseline.ipynb`.
 
 The second validation exercise switches the gradient-based NUTS for a gradient-free RW-MH sampler, holding the Kalman filter unchanged. I argue that when using a pre-trained NN surrogate, RW-MH sampler is better than NUTS-HMC because backpropagation through the cached NN is still very slow per leapfrog iteration (>40 hours of wall time on Apple M1).
 
@@ -1321,7 +1320,7 @@ This chapter summarizes the canonical model of CEO compensation and short-termis
 
 I choose to implement the @marinovic2019ceo variant because it provides a clean baseline and is applicable to generic empirical settings. This is useful because when applying to APAC market, we may not have quasi-experiments like FAS 123-R to identify the additional limited attention channel.
 
-*Replication: all results in this chapter are produced by the notebook* `docs/14_ceo_contract_pipeline.ipynb`.
+*Replication: all results in this chapter are produced by the notebook* `docs/v2/14_ceo_contract_pipeline.ipynb`.
 
 **What are the key problems that the authors try to illustrate with the model?**
 
@@ -1646,7 +1645,7 @@ This chapter implements linear programming (LP) methods to solve the three struc
 - Limited Enforcement Model (LE)
 - Moral Hazard Model (MH)
 
-*Replication: the model solves are in `docs/09_nikolov_models.ipynb`; data cleaning in `docs/11_nikolov_compustat_cleaning.ipynb`; and the TO, LE, and MH estimation pipelines in `docs/10_nikolov_to_policy_pipeline.ipynb`, `docs/12_nikolov_le_policy_pipeline.ipynb`, and `docs/13_nikolov_mh_policy_pipeline.ipynb`.*
+*Replication: the model solves are in `docs/v2/09_nikolov_models.ipynb`; data cleaning in `docs/v2/11_nikolov_compustat_cleaning.ipynb`; and the TO, LE, and MH estimation pipelines in `docs/v2/10_nikolov_to_policy_pipeline.ipynb`, `docs/v2/12_nikolov_le_policy_pipeline.ipynb`, and `docs/v2/13_nikolov_mh_policy_pipeline.ipynb`.*
 
 All three models share the same production technology, capital accumulation rule, and adjustment cost specification.
 
