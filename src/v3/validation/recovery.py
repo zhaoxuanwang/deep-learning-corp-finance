@@ -45,7 +45,7 @@ def r2(true, fitted):
 
 def run_recovery(bundle, bounds, ext, grid_cfg, master_seed, n_draws, *,
                  collect_rows=200, collect_batch_size=16, surrogate_passes=200,
-                 n_firms=2000, T=120, burn_in=60,
+                 surrogate_hidden=32, n_firms=2000, T=120, burn_in=60,
                  refine_rounds=6, n_restarts=30, max_redraws=200, verbose=False):
     dtype = TF_FLOAT_NUM
     lo = tf.constant(bounds.lower_array(), dtype)
@@ -67,7 +67,7 @@ def run_recovery(bundle, bounds, ext, grid_cfg, master_seed, n_draws, *,
                                         collect_rows, **collect_kw)
     t_collect = time.perf_counter() - _t
     _t = time.perf_counter()
-    surr = SurrogateEnsemble(master_seed)
+    surr = SurrogateEnsemble(master_seed, hidden=surrogate_hidden)
     surr.train(beta_ds, m_ds, bounds, master_seed, passes=surrogate_passes)
     t_surrogate = time.perf_counter() - _t
 

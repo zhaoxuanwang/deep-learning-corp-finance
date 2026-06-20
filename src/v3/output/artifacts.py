@@ -70,6 +70,54 @@ def save_summary(ctx: Dict, rows, name: str = "summary.csv") -> None:
         writer.writerows(rows)
 
 
+def summary_tables(out):
+    """Build the per-parameter and per-moment summary rows (true, estimate, SE, 95% CI, R^2).
+
+    Parameter SE = mean across-fold SD of the estimate; moment SE = mean firm-clustered SE.
+    Returns ``(param_rows, moment_rows)`` as lists of dicts ready for :func:`save_summary`.
+    """
+    import numpy as np
+    from src.v3.validation import figures
+    pr, mr = np.asarray(out["param_r2"]), np.asarray(out["moment_r2"])
+    tb, eb = np.asarray(out["true_beta"]), np.asarray(out["est_beta"])
+    tm, fm = np.asarray(out["true_m"]), np.asarray(out["fit_m"])
+    folds, m_se = out.get("est_beta_folds"), out.get("fit_m_se")
+    p_se = (np.std(np.asarray(folds), axis=1).mean(axis=0)
+            if folds is not None and np.size(folds) else np.full(eb.shape[1], np.nan))
+    m_se_mean = (np.asarray(m_se).mean(axis=0)
+                 if m_se is not None and np.size(m_se) else np.full(fm.shape[1], np.nan))
+    r5 = lambda x: round(float(x), 5)
+    param_rows = [
+        {"param": n, "true_mean": r5(tb[:, j].mean()), "est_mean": r5(eb[:, j].mean()),
+         "bias": r5((eb[:, j] - tb[:, j]).mean()),
+         "rmse": r5(np.sqrt(((eb[:, j] - tb[:, j]) ** 2).mean())), "se": r5(p_se[j]),
+         "ci95_lo": r5(eb[:, j].mean() - 1.96 * p_se[j]),
+         "ci95_hi": r5(eb[:, j].mean() + 1.96 * p_se[j]), "r2": round(float(pr[j]), 4)}
+        for j, n in enumerate(figures.PARAM_NAMES)]
+    moment_rows = [
+        {"moment": n, "true_mean": r5(tm[:, j].mean()), "fit_mean": r5(fm[:, j].mean()),
+         "se": r5(m_se_mean[j]), "ci95_lo": r5(fm[:, j].mean() - 1.96 * m_se_mean[j]),
+         "ci95_hi": r5(fm[:, j].mean() + 1.96 * m_se_mean[j]), "r2": round(float(mr[j]), 4)}
+        for j, n in enumerate(figures.MOMENT_NAMES)]
+    return param_rows, moment_rows
+
+
+def write_summary_tables(run_dir, *, param_name="param_summary.csv",
+                         moment_name="moment_summary.csv"):
+    """Regenerate the enriched summary CSVs from a SAVED run, no re-run needed.
+
+    Loads ``<run_dir>/arrays/recovery.npz`` and writes the per-parameter and per-moment tables
+    (true, estimate, SE, 95% CI, R^2) into ``run_dir``. Use to backfill runs saved before the
+    enriched-CSV format existed. Returns the two written paths.
+    """
+    out = load_recovery(run_dir)
+    param_rows, moment_rows = summary_tables(out)
+    ctx = {"run_dir": Path(run_dir), "save": True}
+    save_summary(ctx, param_rows, param_name)
+    save_summary(ctx, moment_rows, moment_name)
+    return Path(run_dir) / param_name, Path(run_dir) / moment_name
+
+
 def _recovery_markdown(out, gates) -> str:
     import numpy as np
     from src.v3.validation import figures
@@ -130,12 +178,10 @@ def save_recovery(out, bundle=None, *, experiment="df26_recovery",
         save_figure(ctx, fig, name + ".pdf")
         plt.close(fig)
 
-    pr, mr = out["param_r2"], out["moment_r2"]
-    save_summary(ctx, [{"param": n, "true_mean": float(out["true_beta"][:, j].mean()),
-                        "est_mean": float(out["est_beta"][:, j].mean()), "r2": float(pr[j])}
-                       for j, n in enumerate(figures.PARAM_NAMES)], "param_r2.csv")
-    save_summary(ctx, [{"moment": n, "r2": float(mr[j])}
-                       for j, n in enumerate(figures.MOMENT_NAMES)], "moment_r2.csv")
+    # Per-parameter and per-moment summary tables: true vs estimated, SE, 95% CI, R^2.
+    param_rows, moment_rows = summary_tables(out)
+    save_summary(ctx, param_rows, "param_summary.csv")
+    save_summary(ctx, moment_rows, "moment_summary.csv")
     if ctx.get("save"):
         (ctx["run_dir"] / "summary.md").write_text(_recovery_markdown(out, gates))
 

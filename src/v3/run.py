@@ -54,7 +54,8 @@ def train_and_recover(profile="MEDIUM", master_seed=20260619, device="auto", *,
     if verbose:
         print(f"[v3] recover | profile={prof.name} device={mode} states={prof.grid.n_states} "
               f"train_epochs={prof.train_epochs} collect_rows={prof.collect_rows} "
-              f"batch={prof.collect_batch_size} draws={prof.recovery_draws}")
+              f"batch={prof.collect_batch_size} draws={prof.recovery_draws} "
+              f"surrogate={prof.surrogate_passes}x{prof.surrogate_hidden} restarts={prof.n_restarts}")
     _t = time.perf_counter()
     trainer.train_block1(bundle, bounds, ext, prof.grid, prof.train,
                          master_seed=master_seed, n_epochs=prof.train_epochs, compile_step=True)
@@ -62,9 +63,9 @@ def train_and_recover(profile="MEDIUM", master_seed=20260619, device="auto", *,
     out = run_recovery(
         bundle, bounds, ext, prof.grid, master_seed, n_draws=prof.recovery_draws,
         collect_rows=prof.collect_rows, collect_batch_size=prof.collect_batch_size,
-        surrogate_passes=prof.surrogate_passes, n_firms=prof.n_firms, T=prof.T,
-        burn_in=prof.burn_in, refine_rounds=prof.refine_rounds, n_restarts=prof.n_restarts,
-        verbose=verbose)
+        surrogate_passes=prof.surrogate_passes, surrogate_hidden=prof.surrogate_hidden,
+        n_firms=prof.n_firms, T=prof.T, burn_in=prof.burn_in, refine_rounds=prof.refine_rounds,
+        n_restarts=prof.n_restarts, verbose=verbose)
     out["profile"], out["device"] = prof.name, mode
     out["bundle"], out["grid"] = bundle, prof.grid   # for in-session Block-1 diagnostics (slices, etc.)
     out["timings"]["train_s"] = t_train               # per-phase wall times (s), to calibrate scale

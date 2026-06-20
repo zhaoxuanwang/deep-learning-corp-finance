@@ -44,7 +44,8 @@ class Profile:
     collect_rows: int
     collect_batch_size: int
     # Block-3 surrogate + estimation.
-    surrogate_passes: int
+    surrogate_passes: int   # SGD epochs over the collected rows (total training = passes x rows)
+    surrogate_hidden: int   # width of each of the surrogate's 3 hidden layers (capacity)
     n_restarts: int
     # Recovery (Sec 12.2) and controller cadence.
     recovery_draws: int
@@ -67,7 +68,7 @@ _SMOKE = Profile(
     train_epochs=6,
     n_firms=300, T=50, burn_in=15, refine_rounds=6,
     collect_rows=32, collect_batch_size=8,
-    surrogate_passes=40, n_restarts=6,
+    surrogate_passes=40, surrogate_hidden=32, n_restarts=6,
     recovery_draws=4, controller_every=1,
 )
 
@@ -82,7 +83,7 @@ _MEDIUM = Profile(
     train_epochs=30,
     n_firms=2000, T=120, burn_in=60, refine_rounds=6,
     collect_rows=400, collect_batch_size=16,
-    surrogate_passes=200, n_restarts=30,
+    surrogate_passes=200, surrogate_hidden=32, n_restarts=30,
     recovery_draws=20, controller_every=5,
 )
 
@@ -99,9 +100,18 @@ _LARGE = Profile(
                                 surrogate_max_obs=10000),
     train_epochs=120,
     n_firms=4000, T=250, burn_in=100, refine_rounds=6,
-    collect_rows=2500, collect_batch_size=16,
-    surrogate_passes=200, n_restarts=30,
-    recovery_draws=40, controller_every=5,
+    # collect_batch_size=64: LARGE's state grid (S=2376) needs ~6x less memory per batch element
+    # than FULL (S=5775), so an 80 GB A100 has ample headroom (~45 MB solve + ~8 MB panel per
+    # element; 64 ~ a few GB). Bigger batch speeds up the collection bottleneck. Lower it if you
+    # run on a smaller card.
+    collect_rows=2500, collect_batch_size=64,
+    # 800 passes over 2500 rows matches FULL's surrogate training effort (200 passes x 10000
+    # rows): both are ~2M row-presentations, so LARGE's surrogate is as well-trained as FULL's.
+    # (Validated by the post-estimation sweep: median moment OOS R^2 rose 0.48 -> 0.72.)
+    surrogate_passes=800, surrogate_hidden=32, n_restarts=30,
+    # 80 draws (was 40) for tighter Fig V1/V2 R^2 estimates; the faster collection above roughly
+    # offsets the extra recovery-loop time, so total wall time stays near ~3 h on an A100.
+    recovery_draws=80, controller_every=5,
 )
 
 _FULL = Profile(
@@ -116,7 +126,7 @@ _FULL = Profile(
     # per batch element in float64, and the batched panel records [B, n_firms, T]. B=16
     # fits a 40 GB A100 (~4.3 GB solve + ~9.6 GB panel); raise toward 24-32 on an 80 GB A100.
     collect_rows=10000, collect_batch_size=16,
-    surrogate_passes=200, n_restarts=30,
+    surrogate_passes=200, surrogate_hidden=32, n_restarts=30,   # 200 x 10000 = ~2M row-presentations
     recovery_draws=40, controller_every=1,
 )
 
