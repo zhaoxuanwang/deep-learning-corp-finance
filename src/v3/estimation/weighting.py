@@ -11,8 +11,8 @@ normalization rescales the objective but not the argmin. float64.
 from __future__ import annotations
 
 import tensorflow as tf
-import tensorflow_probability as tfp
 
+from src.v3.common.stats import median
 from src.v3.simulation.moments import observations
 
 _EPS = 1e-12
@@ -82,7 +82,7 @@ def weighting_matrix(panel, jitter=1e-10):
     W = tf.linalg.inv(Sigma)
     W = 0.5 * (W + tf.transpose(W))
     w_half = tf.transpose(tf.linalg.cholesky(W))              # W = w_half' w_half
-    med = tfp.stats.percentile(tf.norm(w_half, axis=0), 50.0)
+    med = median(tf.norm(w_half, axis=0))
     w_half = w_half / med
     return tf.matmul(w_half, w_half, transpose_a=True), w_half
 

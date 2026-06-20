@@ -14,16 +14,13 @@ refinement computes P_def exactly over the Tauchen nodes.
 from __future__ import annotations
 
 import tensorflow as tf
-import tensorflow_probability as tfp
 
-tfd = tfp.distributions
+from src.v3.common.stats import normal_cdf as phi
 
 
 def default_probability(V0, a, c, c_tol=1e-6, a_tol=1e-12):
     """P_def = Pr(0.5 c eps^2 + a eps + V0 < 0), eps ~ N(0,1). Differentiable, in [0,1]."""
     dtype = V0.dtype
-    normal = tfd.Normal(tf.zeros([], dtype), tf.ones([], dtype))
-    phi = normal.cdf
     zero = tf.zeros_like(V0)
     one = tf.ones_like(V0)
 

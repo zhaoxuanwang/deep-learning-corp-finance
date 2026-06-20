@@ -8,11 +8,11 @@ estimates and all restart estimates (for the controller's containment guard). fl
 from __future__ import annotations
 
 import tensorflow as tf
-import tensorflow_probability as tfp
 
 from src.v3.common import seeding
 from src.v3.common.normalization import ParamScaler
 from src.v3.common.precision import TF_FLOAT_NUM
+from src.v3.common.stats import median
 from src.v3.estimation import reparam
 from src.v3.estimation.lm import levenberg_marquardt
 
@@ -40,7 +40,7 @@ def estimate(surrogate, target_m, W, bounds, master_seed, *, n_restarts=30, max_
 
     fold_best = tf.stack(fold_best)                            # [F, 8]
     return {
-        "beta_hat": tfp.stats.percentile(fold_best, 50.0, axis=0),   # median across folds
+        "beta_hat": median(fold_best, axis=0),                       # median across folds
         "fold_betas": fold_best,
         "all_betas": tf.stack(all_betas),                     # [F, n_restarts, 8]
     }

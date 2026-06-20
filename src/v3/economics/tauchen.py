@@ -8,15 +8,9 @@ the grid is symmetric about 0 and matches the Sec 3.2 log z bounds.
 from __future__ import annotations
 
 import tensorflow as tf
-import tensorflow_probability as tfp
 
 from src.v3.common.precision import TF_FLOAT_NUM, as_float
-
-tfd = tfp.distributions
-
-
-def _normal_cdf(x):
-    return tfd.Normal(loc=tf.zeros([], x.dtype), scale=tf.ones([], x.dtype)).cdf(x)
+from src.v3.common.stats import normal_cdf as _normal_cdf
 
 
 def tauchen(rho, sigma, n_z, m=2.5, dtype=TF_FLOAT_NUM):

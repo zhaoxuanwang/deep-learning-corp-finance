@@ -24,7 +24,6 @@ from typing import NamedTuple
 
 import numpy as np
 import tensorflow as tf
-import tensorflow_probability as tfp
 
 from src.v3.common import seeding
 from src.v3.common.normalization import ParamScaler
@@ -92,7 +91,7 @@ def minimum_loss_profile(surrogate, target_m, W, bounds, master_seed, ctrl,
             L_folds[j, k] = _profile_param(surrogate, scaler, target, W, lo, hi, j, grid_j, k,
                                            master_seed, ctrl.n_restarts, max_iter=20).numpy()
 
-    L = np.asarray(tfp.stats.percentile(L_folds, 50.0, axis=1))   # [P, npts] median over folds
+    L = np.median(L_folds, axis=1)                                # [P, npts] median over folds
     centered = L_folds - L_folds.min(axis=2, keepdims=True)        # recenter each fold by its min
     L_sd = centered.std(axis=1)                                    # [P, npts]
     argmin = grids[np.arange(P), L.argmin(axis=1)]                 # [P] beta^{j*}

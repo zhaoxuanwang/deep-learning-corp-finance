@@ -1,30 +1,31 @@
 """Central precision, Keras, and device policy for v3.
 
-Import this module before any heavy TensorFlow use so the legacy-Keras flag is
-pinned. v3 runs on a stack where Keras 3 is installed alongside TensorFlow 2.16;
-TensorFlow-Probability needs Keras 2 semantics, so ``TF_USE_LEGACY_KERAS=1`` is
-forced here (and in ``src/v3/__init__.py``) before TensorFlow is imported.
+Import this module before any heavy TensorFlow use. v3 depends only on TensorFlow +
+NumPy (no TensorFlow-Probability), so it runs on a modern stack (recent TF, NumPy 2,
+e.g. CUDA / Colab) without pinning. Legacy Keras is used ONLY as an Apple-Silicon
+performance choice (the legacy Adam optimizer is faster on M-series, review OPT-4), so
+``TF_USE_LEGACY_KERAS=1`` is set before importing TF on Apple Silicon only; elsewhere
+the native Keras is used and :func:`make_adam` falls back to the standard Adam.
 
 Two-tier precision policy (see the v3 plan):
 
-* Network / surrogate training runs in float32 (:data:`TF_FLOAT_NET`) on the GPU
-  (Apple Metal).
+* Network / surrogate training runs in float32 (:data:`TF_FLOAT_NET`).
 * The numerically sensitive parts (VFI, grid-refinement linear solve,
   Levenberg-Marquardt, weighting-matrix Cholesky) run in float64
-  (:data:`TF_FLOAT_NUM`) on the CPU, because Apple Metal has no float64 GPU
-  kernels.
+  (:data:`TF_FLOAT_NUM`); on Apple Metal these stay on the CPU (no float64 GPU
+  kernels), on CUDA they run on the GPU (see :func:`configure_devices`).
 
 Cast at every boundary; never let the two tiers mix silently (review ENV-2).
 """
 from __future__ import annotations
 
 import os
+import platform
 
-# Pin legacy Keras BEFORE TensorFlow is imported (TFP + Keras 3 are incompatible,
-# review ENV-1). ``setdefault`` so an explicit caller choice is respected.
-os.environ.setdefault("TF_USE_LEGACY_KERAS", "1")
-
-import platform  # noqa: E402
+# Legacy Keras is an Apple-Silicon-only performance path (legacy Adam, OPT-4); it requires
+# tf-keras. On other platforms use native Keras so no old pinned stack is needed.
+if platform.system() == "Darwin" and platform.machine() == "arm64":
+    os.environ.setdefault("TF_USE_LEGACY_KERAS", "1")
 
 import numpy as np  # noqa: E402
 import tensorflow as tf  # noqa: E402
