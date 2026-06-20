@@ -7,6 +7,9 @@ surrogate/LM settings, and the Section-6 controller resolution. Three presets:
 * ``SMOKE`` -- tiny; the pytest/CI scale (seconds), grids and counts kept minimal.
 * ``MEDIUM`` -- CPU-affordable demo scale; runs end-to-end on an M-series Mac in minutes
   and lands the recovery in the right region without paper-grade precision.
+* ``LARGE`` -- "first precise findings" tier between MEDIUM and FULL, sized for ~8 h on an
+  A100 (preliminary; tune from the per-phase timings train_and_recover prints). Not
+  spec-replication (reduced grid/training); use FULL for that.
 * ``FULL`` -- the DF26 paper scale (Table A2): 11x15x35 / 81x91x71 grids, 5000x300
   panels, 10k-row collections, 31-point minimum-loss curves. Built for a CUDA GPU
   (float64 on device); affordable on M1 only as an overnight/rented-GPU run.
@@ -20,7 +23,7 @@ from dataclasses import dataclass
 
 from src.v3.config import ControllerConfig, GridConfig, TrainConfig
 
-PROFILE_NAMES = ("SMOKE", "MEDIUM", "FULL")
+PROFILE_NAMES = ("SMOKE", "MEDIUM", "LARGE", "FULL")
 
 
 @dataclass(frozen=True)
@@ -83,6 +86,24 @@ _MEDIUM = Profile(
     recovery_draws=20, controller_every=5,
 )
 
+# LARGE: a "first precise findings" tier between MEDIUM and the spec-faithful FULL, sized to run in
+# roughly ~8 h on an A100. PRELIMINARY: tune the sizes from the per-phase timings printed by
+# train_and_recover on a first run. Not spec-replication (the grid/training are reduced); FULL is.
+_LARGE = Profile(
+    name="LARGE",
+    grid=GridConfig(n_z=9, n_k=12, n_b=22, n_kp=41, n_bp=45, n_cp=31),  # S = 2376
+    train=TrainConfig(batch_size=4096, steps_per_epoch=300),
+    controller=ControllerConfig(n_loss_points=21, n_restarts=20, n_folds=10,
+                                warmup_epochs=4, n_volume_steps=16,
+                                containment_recent=300, containment_closest=30,
+                                surrogate_max_obs=10000),
+    train_epochs=120,
+    n_firms=4000, T=250, burn_in=100, refine_rounds=6,
+    collect_rows=2500, collect_batch_size=16,
+    surrogate_passes=200, n_restarts=30,
+    recovery_draws=40, controller_every=5,
+)
+
 _FULL = Profile(
     name="FULL",
     grid=GridConfig(),  # spec default 11x15x35 / 81x91x71
@@ -92,14 +113,14 @@ _FULL = Profile(
     n_firms=5000, T=300, burn_in=200, refine_rounds=6,
     # collect_batch_size is memory-bound at the FULL state grid: the batched dense
     # policy-evaluation solve is [B, S, S] with S = n_z*n_k*n_b = 5775, i.e. ~266 MB
-    # per batch element in float64, and the batched panel records [B, n_firms, T]. B=8
-    # fits a 40 GB A100 with headroom; raise toward 16 on an A100 only (see notebook).
-    collect_rows=10000, collect_batch_size=8,
+    # per batch element in float64, and the batched panel records [B, n_firms, T]. B=16
+    # fits a 40 GB A100 (~4.3 GB solve + ~9.6 GB panel); raise toward 24-32 on an 80 GB A100.
+    collect_rows=10000, collect_batch_size=16,
     surrogate_passes=200, n_restarts=30,
     recovery_draws=40, controller_every=1,
 )
 
-_PROFILES = {"SMOKE": _SMOKE, "MEDIUM": _MEDIUM, "FULL": _FULL}
+_PROFILES = {"SMOKE": _SMOKE, "MEDIUM": _MEDIUM, "LARGE": _LARGE, "FULL": _FULL}
 
 
 def get_profile(name: str) -> Profile:

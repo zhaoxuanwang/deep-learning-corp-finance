@@ -13,6 +13,8 @@ Produces, across draws, the data for Fig V1 (true vs fitted moments) and Fig V2
 """
 from __future__ import annotations
 
+import time
+
 import numpy as np
 import tensorflow as tf
 
@@ -55,6 +57,7 @@ def run_recovery(bundle, bounds, ext, grid_cfg, master_seed, n_draws, *,
     # serial path. (Device chosen by precision.configure_devices: GPU on CUDA, CPU on Metal.)
     collect_seed = int(seeding.key(master_seed, seeding.Purpose.COLLECT, 7)[0])
     collect_kw = dict(refine_rounds=refine_rounds, n_firms=n_firms, T=T, burn_in=burn_in)
+    _t = time.perf_counter()
     if collect_batch_size > 1:
         beta_ds, m_ds = collect_dataset_batch(bundle, bounds, ext, grid_cfg, collect_seed,
                                               collect_rows, batch_size=collect_batch_size,
@@ -62,11 +65,15 @@ def run_recovery(bundle, bounds, ext, grid_cfg, master_seed, n_draws, *,
     else:
         beta_ds, m_ds = collect_dataset(bundle, bounds, ext, grid_cfg, collect_seed,
                                         collect_rows, **collect_kw)
+    t_collect = time.perf_counter() - _t
+    _t = time.perf_counter()
     surr = SurrogateEnsemble(master_seed)
     surr.train(beta_ds, m_ds, bounds, master_seed, passes=surrogate_passes)
+    t_surrogate = time.perf_counter() - _t
 
     true_beta, est_beta, true_m, fit_m = [], [], [], []
     est_beta_folds, fit_m_se = [], []   # per-draw across-fold estimates + fitted-moment SEs (CIs)
+    _t = time.perf_counter()
     draw = 0
     while len(true_beta) < n_draws and draw < n_draws + max_redraws:
         u = seeding.uniform([8], master_seed, seeding.Purpose.COLLECT, 9, draw, dtype=dtype)
@@ -106,6 +113,7 @@ def run_recovery(bundle, bounds, ext, grid_cfg, master_seed, n_draws, *,
         if verbose:
             print(f"  recovery draw {len(true_beta)}/{n_draws} (attempt {draw})")
 
+    t_loop = time.perf_counter() - _t
     out = {k: np.array(v) for k, v in
            dict(true_beta=true_beta, est_beta=est_beta, true_m=true_m, fit_m=fit_m,
                 est_beta_folds=est_beta_folds, fit_m_se=fit_m_se).items()}
@@ -116,4 +124,8 @@ def run_recovery(bundle, bounds, ext, grid_cfg, master_seed, n_draws, *,
     out["surrogate"] = surr
     out["dataset_beta"] = beta_ds.numpy()
     out["dataset_moments"] = m_ds.numpy()
+    out["timings"] = {"collect_s": t_collect, "surrogate_s": t_surrogate, "recovery_loop_s": t_loop}
+    if verbose:
+        print(f"  [timings] collect={t_collect:.0f}s surrogate={t_surrogate:.0f}s "
+              f"recovery_loop={t_loop:.0f}s")
     return out

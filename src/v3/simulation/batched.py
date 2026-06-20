@@ -21,17 +21,41 @@ import tensorflow as tf
 from src.v3.common import seeding
 from src.v3.common.precision import TF_FLOAT_NUM
 from src.v3.economics import production as _prod
-from src.v3.solver.batched import interp_batch
 
 _EPS = 1e-12
 _P = seeding.Purpose
 
 
-def _interp_firms(grid_vals, logk, b_grid, k, b, zi, n_z):
-    """Interpolate a [B,n_z,n_k,n_b] grid at each firm's (k,b) and own z-node -> [B,n_f]."""
-    allz = interp_batch(grid_vals, logk, b_grid, k, b)         # [B, n_z, n_f]
-    oh = tf.one_hot(zi, n_z, dtype=allz.dtype)                 # [B, n_f, n_z]
-    return tf.einsum("bfz,bzf->bf", oh, allz)
+def _interp_firms_multi(grids, logk, b_grid, k, b, zi, n_z):
+    """Interpolate several [B,n_z,n_k,n_b] grids at each firm's (k,b) and own z-node -> list of [B,n_f].
+
+    The bilinear corner indices, weights, and the z-selection one-hot depend only on the firm
+    state (k, b, zi), not on the grid values, so they are computed ONCE and reused across all
+    grids (the four per-step policy/value interpolations share them). Bit-identical to calling
+    the single-grid interpolation per grid, without the redundant index/weight/one-hot work."""
+    B, _, n_k, n_b = grids[0].shape
+    dtype = grids[0].dtype
+    lk0, dlk = logk[:, :1], logk[:, 1:2] - logk[:, :1]
+    fk = (tf.math.log(k) - lk0) / dlk
+    lo_k = tf.clip_by_value(tf.cast(tf.floor(fk), tf.int32), 0, n_k - 2)
+    wk = tf.clip_by_value(fk - tf.cast(lo_k, dtype), 0.0, 1.0)
+    fb = (b - b_grid[0]) / (b_grid[1] - b_grid[0])
+    lo_b = tf.clip_by_value(tf.cast(tf.floor(fb), tf.int32), 0, n_b - 2)
+    wb = tf.clip_by_value(fb - tf.cast(lo_b, dtype), 0.0, 1.0)
+    c00, c10 = lo_k * n_b + lo_b, (lo_k + 1) * n_b + lo_b
+    c01, c11 = lo_k * n_b + (lo_b + 1), (lo_k + 1) * n_b + (lo_b + 1)
+    w00 = ((1.0 - wk) * (1.0 - wb))[:, None, :]
+    w10 = (wk * (1.0 - wb))[:, None, :]
+    w01 = ((1.0 - wk) * wb)[:, None, :]
+    w11 = (wk * wb)[:, None, :]
+    oh = tf.one_hot(zi, n_z, dtype=dtype)                      # [B, n_f, n_z]
+    out = []
+    for vals in grids:
+        vflat = tf.reshape(vals, [B, n_z, n_k * n_b])
+        g = lambda c: tf.gather(vflat, c, axis=2, batch_dims=1)   # [B, n_z, n_f]
+        allz = w00 * g(c00) + w10 * g(c10) + w01 * g(c01) + w11 * g(c11)
+        out.append(tf.einsum("bfz,bzf->bf", oh, allz))
+    return out
 
 
 def _categorical(cdf, u):
@@ -76,10 +100,8 @@ def simulate_panel_batch(solution, beta_raw, ext, grid_cfg, seeds,
     rec_z, rec_k, rec_b, rec_c, rec_V = [], [], [], [], []
     for t in range(T):
         z = tf.gather(g.z, zi, batch_dims=1)
-        Vf = _interp_firms(V_grid, logk, g.b, k, b_net, zi, n_z)
-        i_f = _interp_firms(i_grid, logk, g.b, k, b_net, zi, n_z)
-        bp_f = _interp_firms(bp_grid, logk, g.b, k, b_net, zi, n_z)
-        cp_f = _interp_firms(cp_grid, logk, g.b, k, b_net, zi, n_z)
+        Vf, i_f, bp_f, cp_f = _interp_firms_multi(
+            [V_grid, i_grid, bp_grid, cp_grid], logk, g.b, k, b_net, zi, n_z)
 
         rec_z.append(z); rec_k.append(k); rec_b.append(b_net); rec_c.append(c); rec_V.append(Vf)
         default = Vf < 0.0

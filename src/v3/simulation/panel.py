@@ -21,7 +21,7 @@ import tensorflow as tf
 from src.v3.common import seeding
 from src.v3.common.precision import TF_FLOAT_NUM
 from src.v3.economics import production as _prod
-from src.v3.solver.interp import interp_grid
+from src.v3.solver.interp import _axis_weights
 
 
 def _categorical(probs_cdf, u):
@@ -29,11 +29,26 @@ def _categorical(probs_cdf, u):
     return tf.reduce_sum(tf.cast(probs_cdf < u[..., None], tf.int32), axis=-1)
 
 
-def _interp_at_firms(grid_vals, logk, b_grid, k, b, firm_zi, n_firms):
-    """Interpolate a [n_z, n_k, n_b] grid at each firm's (k, b) and own z-node."""
-    allz = interp_grid(grid_vals, logk, b_grid, k, b)            # [n_z, n_firms]
-    idx = tf.stack([firm_zi, tf.range(n_firms)], axis=-1)
-    return tf.gather_nd(allz, idx)                               # [n_firms]
+def _interp_at_firms_multi(grids, logk, b_grid, k, b, firm_zi, n_firms):
+    """Interpolate several [n_z, n_k, n_b] grids at each firm's (k, b) and own z-node -> list of
+    [n_firms]. The bilinear indices/weights and the z-selection indices depend only on the firm
+    state, so they are computed ONCE and reused across grids (the four per-step value/policy
+    interpolations share them). Bit-identical to per-grid interp_grid + z-select."""
+    n_z, n_k, n_b = grids[0].shape
+    lo_k, wk = _axis_weights(tf.math.log(k), logk[0], logk[1] - logk[0], n_k)
+    lo_b, wb = _axis_weights(b, b_grid[0], b_grid[1] - b_grid[0], n_b)
+    wk_, wb_ = wk[None, :], wb[None, :]
+    zsel = tf.stack([firm_zi, tf.range(n_firms)], axis=-1)
+    out = []
+    for vals in grids:
+        vflat = tf.reshape(vals, [n_z, n_k * n_b])
+        corner = lambda ki, bi: tf.gather(vflat, ki * n_b + bi, axis=1)   # [n_z, n_firms]
+        allz = ((1.0 - wk_) * (1.0 - wb_) * corner(lo_k, lo_b)
+                + wk_ * (1.0 - wb_) * corner(lo_k + 1, lo_b)
+                + (1.0 - wk_) * wb_ * corner(lo_k, lo_b + 1)
+                + wk_ * wb_ * corner(lo_k + 1, lo_b + 1))
+        out.append(tf.gather_nd(allz, zsel))
+    return out
 
 
 def simulate_panel(solution, params, ext, grid_cfg, master_seed,
@@ -61,10 +76,8 @@ def simulate_panel(solution, params, ext, grid_cfg, master_seed,
     rec_z, rec_k, rec_b, rec_c, rec_V = [], [], [], [], []
     for t in range(T):
         z = tf.gather(g.z, zi)
-        Vf = _interp_at_firms(V_grid, logk, g.b, k, b_net, zi, n_firms)
-        i_f = _interp_at_firms(i_grid, logk, g.b, k, b_net, zi, n_firms)
-        bp_f = _interp_at_firms(bp_grid, logk, g.b, k, b_net, zi, n_firms)
-        cp_f = _interp_at_firms(cp_grid, logk, g.b, k, b_net, zi, n_firms)
+        Vf, i_f, bp_f, cp_f = _interp_at_firms_multi(
+            [V_grid, i_grid, bp_grid, cp_grid], logk, g.b, k, b_net, zi, n_firms)
 
         rec_z.append(z); rec_k.append(k); rec_b.append(b_net); rec_c.append(c); rec_V.append(Vf)
         default = Vf < 0.0

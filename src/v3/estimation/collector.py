@@ -75,9 +75,9 @@ def collect_dataset_batch(bundle, bounds, ext, grid_cfg, master_seed, n_rows, *,
         panel = simulate_panel_batch(refined, beta_batch, ext, grid_cfg, seeds,
                                      n_firms=n_firms, T=T, burn_in=burn_in)
         m = compute_moments_batch(panel)                              # [b, 11]
-        finite = tf.reduce_all(tf.math.is_finite(m), axis=1)
+        finite = tf.reduce_all(tf.math.is_finite(m), axis=1).numpy()  # one host sync, not per row
         for j in range(len(idx)):
-            if len(betas) < n_rows and bool(finite[j]):
+            if len(betas) < n_rows and finite[j]:
                 betas.append(beta_batch[j])
                 moments.append(m[j])
         r += len(idx)

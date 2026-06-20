@@ -16,6 +16,8 @@ Typical use::
 """
 from __future__ import annotations
 
+import time
+
 from src.v3.common.precision import configure_devices, silence_logging
 from src.v3.config import ExternalParams, NetworkConfig, ParamBounds
 from src.v3.networks.bundle import NetworkBundle
@@ -53,8 +55,10 @@ def train_and_recover(profile="MEDIUM", master_seed=20260619, device="auto", *,
         print(f"[v3] recover | profile={prof.name} device={mode} states={prof.grid.n_states} "
               f"train_epochs={prof.train_epochs} collect_rows={prof.collect_rows} "
               f"batch={prof.collect_batch_size} draws={prof.recovery_draws}")
+    _t = time.perf_counter()
     trainer.train_block1(bundle, bounds, ext, prof.grid, prof.train,
                          master_seed=master_seed, n_epochs=prof.train_epochs, compile_step=True)
+    t_train = time.perf_counter() - _t
     out = run_recovery(
         bundle, bounds, ext, prof.grid, master_seed, n_draws=prof.recovery_draws,
         collect_rows=prof.collect_rows, collect_batch_size=prof.collect_batch_size,
@@ -63,6 +67,12 @@ def train_and_recover(profile="MEDIUM", master_seed=20260619, device="auto", *,
         verbose=verbose)
     out["profile"], out["device"] = prof.name, mode
     out["bundle"], out["grid"] = bundle, prof.grid   # for in-session Block-1 diagnostics (slices, etc.)
+    out["timings"]["train_s"] = t_train               # per-phase wall times (s), to calibrate scale
+    if verbose:
+        ti = out["timings"]
+        print(f"[v3] timings (s): train={ti['train_s']:.0f} collect={ti['collect_s']:.0f} "
+              f"surrogate={ti['surrogate_s']:.0f} recovery_loop={ti['recovery_loop_s']:.0f} "
+              f"| total={sum(ti.values()):.0f} ({sum(ti.values())/3600:.2f} h)")
     if save:
         from src.v3.output.artifacts import save_recovery
         out["run_dir"] = str(save_recovery(out, bundle, results_root=results_root, run_tag=run_tag))
