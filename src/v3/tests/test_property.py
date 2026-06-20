@@ -67,6 +67,22 @@ def test_group3_weighting_spd(solved):
 
 
 @pytest.mark.slow
+def test_slices_and_comparative_shapes(solved):
+    # Policy slices vs k/b/z and comparative statics produce the expected complete shapes.
+    from src.v3.validation import comparative, evaluate, policy_slices
+    net = evaluate.network_on_grid(solved["bundle"], solved["params"], EXT, GRID, BOUNDS)
+    for ax, n in (("k", GRID.n_k), ("b", GRID.n_b), ("z", GRID.n_z)):
+        sl = policy_slices.slices(solved["vfi"], net, solved["refined"], axis=ax)
+        assert sl["coord"].shape[0] == n
+        assert {"V", "i", "bp", "cp"} <= set(sl)
+        assert len(sl["i"]["refined"]) == n and len(sl["i"]["vfi"]) == n
+    cs = comparative.comparative_statics(solved["bundle"], "delta", BOUNDS, EXT, GRID, n_points=8)
+    assert cs["values"].shape[0] == 8
+    for key in ("i", "bp", "cp"):
+        assert len(cs[key]["network"]) == 8 and len(cs[key]["refined"]) == 8
+
+
+@pytest.mark.slow
 def test_group6_comparative_statics(solved):
     checks = props.check_comparative_statics(solved["bundle"], BOUNDS, EXT, GRID)
     # q non-decreasing in chi is pure economics (no network) -> always hard.

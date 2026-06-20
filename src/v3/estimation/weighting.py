@@ -55,7 +55,8 @@ def _reg_psi(y, x1, x2):
     return tf.einsum("jk,nk->nj", tf.linalg.inv(XtX / n), X) * eps[:, None]    # [N, 2]
 
 
-def weighting_matrix(panel, jitter=1e-10):
+def _moment_covariance(panel, jitter=1e-10):
+    """Firm-clustered moment variance-covariance Sigma (Eq 43, common N). Returns [11, 11]."""
     o = observations(panel)
     inc = o["inc"]
     reg = _reg_psi(o["dcash"], o["net"], inc)
@@ -73,11 +74,19 @@ def weighting_matrix(panel, jitter=1e-10):
     n_clusters = tf.reduce_max(o["firm"]) + 1
     cluster = tf.math.unsorted_segment_sum(Psi, o["firm"], n_clusters)  # [G, 11]
     Sigma = tf.matmul(cluster, cluster, transpose_a=True) / (n * n)     # Eq 43 (common N)
-    Sigma = 0.5 * (Sigma + tf.transpose(Sigma)) + jitter * tf.eye(11, dtype=dtype)
+    return 0.5 * (Sigma + tf.transpose(Sigma)) + jitter * tf.eye(11, dtype=dtype)
 
+
+def weighting_matrix(panel, jitter=1e-10):
+    Sigma = _moment_covariance(panel, jitter)
     W = tf.linalg.inv(Sigma)
     W = 0.5 * (W + tf.transpose(W))
     w_half = tf.transpose(tf.linalg.cholesky(W))              # W = w_half' w_half
     med = tfp.stats.percentile(tf.norm(w_half, axis=0), 50.0)
     w_half = w_half / med
     return tf.matmul(w_half, w_half, transpose_a=True), w_half
+
+
+def moment_se(panel):
+    """Per-moment firm-clustered standard errors sqrt(diag(Sigma)) [11] (for confidence bands)."""
+    return tf.sqrt(tf.maximum(tf.linalg.diag_part(_moment_covariance(panel)), 0.0))

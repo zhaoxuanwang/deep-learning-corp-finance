@@ -37,9 +37,15 @@ def _setup(profile, device, master_seed, overrides):
 
 
 def train_and_recover(profile="MEDIUM", master_seed=20260619, device="auto", *,
-                      train_epochs=None, recovery_draws=None, verbose=True):
+                      train_epochs=None, recovery_draws=None, verbose=True,
+                      save=True, results_root="outputs/v3", run_tag=None):
     """Train Block 1 at the profile's scale, then run the recovery (Sec 12.2). Returns the
-    recovery dict (true/est params + moments, R^2s) with ``profile`` and ``device`` added."""
+    recovery dict (true/est params + moments, R^2s) with ``profile``/``device``/``run_dir`` added.
+
+    When ``save`` (default), every output is persisted under ``results_root`` (arrays, Figs
+    V1/V2, R^2 tables, summary.md, manifest, and the network + surrogate checkpoints) so the
+    expensive run never has to be repeated just to recover its outputs. On Colab set
+    ``results_root`` to a Google Drive path so it survives the runtime."""
     mode, prof, bounds, ext, bundle = _setup(
         profile, device, master_seed,
         {"train_epochs": train_epochs, "recovery_draws": recovery_draws})
@@ -56,6 +62,12 @@ def train_and_recover(profile="MEDIUM", master_seed=20260619, device="auto", *,
         burn_in=prof.burn_in, refine_rounds=prof.refine_rounds, n_restarts=prof.n_restarts,
         verbose=verbose)
     out["profile"], out["device"] = prof.name, mode
+    out["bundle"], out["grid"] = bundle, prof.grid   # for in-session Block-1 diagnostics (slices, etc.)
+    if save:
+        from src.v3.output.artifacts import save_recovery
+        out["run_dir"] = str(save_recovery(out, bundle, results_root=results_root, run_tag=run_tag))
+        if verbose:
+            print(f"[v3] artifacts saved to {out['run_dir']}")
     return out
 
 

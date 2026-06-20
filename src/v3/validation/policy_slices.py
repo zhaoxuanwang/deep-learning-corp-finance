@@ -31,6 +31,32 @@ def k_slices(vfi_res, net_grid, refined, z_index=None, b_value=-0.03):
     return out
 
 
+_AXES = {"k": "capital k", "b": "net debt b", "z": "productivity z"}
+
+
+def slices(vfi_res, net_grid, refined, axis="k", *, z_index=None, k_index=None, b_index=None):
+    """On-grid slices of V/i/b'/c' along ``axis`` ('k', 'b', or 'z'), the other two states held
+    at central (or given) grid nodes. Returns VFI / network / refined series for each field."""
+    g = vfi_res.grids
+    nz, nk, nb = g.z.shape[0], g.k.shape[0], g.b.shape[0]
+    zi = nz // 2 if z_index is None else z_index
+    ki = nk // 2 if k_index is None else k_index
+    bi = nb // 2 if b_index is None else b_index
+    coord = {"k": g.k, "b": g.b, "z": g.z}[axis].numpy()
+
+    def sl(arr):
+        a = arr.numpy()
+        return a[zi, :, bi] if axis == "k" else a[zi, ki, :] if axis == "b" else a[:, ki, bi]
+
+    out = {"axis": axis, "axis_label": _AXES[axis], "coord": coord,
+           "fixed": {"z": float(g.z[zi]), "k": float(g.k[ki]), "b": float(g.b[bi])}}
+    for key, attr in _FIELDS:
+        out[key] = {"vfi": sl(getattr(vfi_res, attr)),
+                    "network": sl(getattr(net_grid, attr)),
+                    "refined": sl(getattr(refined, attr))}
+    return out
+
+
 def deviation_report(vfi_res, refined, net_grid):
     """Per-quantity max relative / mean absolute deviation in the good region."""
     good = vfi_res.value.numpy() > 1e-6

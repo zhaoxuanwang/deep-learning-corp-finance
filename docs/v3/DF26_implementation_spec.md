@@ -404,6 +404,18 @@ the standard normal CDF $\Phi$ to get $P_{\text{def}} = \Pr(V'<0)$ in closed for
 then multiplies this by the deterministic gate $g = \mathbf{1}\{R<b'k'\}$ (Section 1.5). Use this
 approximation only during network training; grid refinement (Section 4.1) computes $q$ exactly.
 
+**Gradient management in policy improvement.** In Eq 29 the bond price enters the dividend as a
+function of the controls, $q = q(k', b', c')$, through the recovery, the gate, and the default
+probability. Let the policy gradient flow through $q$ with respect to the controls: the firm prices
+its own default risk, so riskier choices fetch a lower $q$, and the policy must internalize this
+exactly as the grid solver does when it prices each candidate control (Section 4.1); treating $q$ as
+a detached constant would drop this price-impact channel and bias the policy toward over-issuing
+risky debt. The only thing detached here is the target network's weights, which are frozen for the
+epoch anyway; that freeze does not detach $q$'s dependence on the controls. Compute the
+Taylor coefficients $a$ and $c$ with nested forward-mode automatic differentiation (forward
+accumulators) rather than nested reverse-mode tapes, so this second derivative stays well-defined and
+stable when the outer policy gradient differentiates through it.
+
 ### 3.6 Conditional expectation: Gauss-Hermite quadrature
 
 The conditional expectation in the Bellman equation is an integral against the standard normal:
@@ -1132,16 +1144,25 @@ Repeat steps 1 to 7 for all $N$ kept draws, then produce two figures.
 
 Figure V1 (true versus fitted moments, reproduces DF26 Figure 1). Eleven panels, one per moment in
 the Section 4.3 order. In each panel the x-axis is the true target moment $m^*_j$ across draws and
-the y-axis is the fitted moment $\hat{m}_j$; plot one point per draw and a solid 45-degree line.
-Title each panel with the moment name and annotate its $R^2$. Pass if $R^2_j \ge 0.99$ for all 11
-moments (DF26 reports 1.00).
+the y-axis is the fitted moment $\hat{m}_j$; draw each draw as a marker with a same-colour capped
+vertical spike for its 95% confidence interval ($1.96$ times the moment's firm-clustered standard
+error, Section 5.7), over a dashed 45-degree line. Fix both axes to a common range with a square box,
+so the 45-degree line is exactly diagonal and coverage is read off the full range, not an auto-zoom.
+Title each panel with the moment name and annotate its $R^2$, the standard linear-regression
+coefficient of determination (the squared correlation between true and fitted, in $[0,1]$). Pass if
+$R^2_j \ge 0.99$ for all 11 moments (DF26 reports 1.00).
 
 Figure V2 (true versus fitted parameters, reproduces DF26 Figure 2). Eight panels, one per parameter
 ($\theta, \rho, \sigma, \delta, \gamma_1, \gamma_0, \chi, c_f$). In each panel the x-axis is the true
-$\beta^*_j$ and the y-axis is the estimate $\hat{\beta}_j$; one point per draw and a solid 45-degree
-line. Annotate each panel's $R^2$, and also report the per-parameter bias (mean of
-$\hat{\beta}_j - \beta^*_j$) and RMSE. Pass if $R^2_j \ge 0.95$ for at least seven of the eight
-parameters (DF26 reports $\ge 0.97$ for seven of eight). $\chi$ is the expected weak one.
+$\beta^*_j$ and the y-axis is the estimate $\hat{\beta}_j$; draw each estimate as a marker with a
+same-colour capped vertical spike for its 95% confidence interval ($1.96$ times the across-fold
+standard deviation of the estimate), over a dashed 45-degree line. Fix both axes to the parameter's
+Table A1 range with a square box, so the 45-degree line is exactly diagonal and coverage and bias are
+visible across the full range. Annotate each panel's $R^2$ (the squared correlation between true and
+fitted, in $[0,1]$, same definition as Figure V1), and also report the per-parameter bias (mean of
+$\hat{\beta}_j - \beta^*_j$) and RMSE, which capture the offset and scale that $R^2$ alone does not.
+Pass if $R^2_j \ge 0.95$ for at least seven of the eight parameters (DF26 reports $\ge 0.97$ for seven
+of eight). $\chi$ is the expected weak one; a low $R^2$ there signals weak identification, not a bug.
 
 Repeat the whole exercise under several seeds and report the spread of $R^2$ across seeds, since the
 draws and the simulation noise vary. A correctly specified data-generating process should give near
@@ -1168,10 +1189,13 @@ panel, vary that one argument over its range (state ranges from Section 3.2; par
 Table A1) on about 50 points, hold every other state and parameter at the reference point, and plot
 the policy.
 
-- State-argument panels (columns $k$, $b$, $z$): overlay three curves, VFI (solid), Block 1 network
-  (solid), and refined network (dashed), matching the DF26 legend "VFI / Network / Network Refined."
-- Parameter-argument panels (the eight parameter columns): overlay two curves, Block 1 network and
-  refined network. VFI is omitted by default, because a single VFI solve fixes $\boldsymbol{\beta}$
+- State-argument panels (columns $k$, $b$, $z$): produce one figure per state axis, each a 1x4 panel
+  over $V, i, b', c'$, so the (policy, state) combinations are complete. Overlay three curves: raw VFI
+  as a thick dashed grey line, the Block 1 network in blue, and the refined network in bold red. Keep
+  the refined curve the most visible, since it is the policy actually used.
+- Parameter-argument panels (the eight parameters): produce one 1x3 figure per parameter (columns $i$,
+  $b'$, $c'$), saved separately per parameter. Overlay two curves only, the Block 1 network (blue) and
+  the refined network (red); raw VFI is omitted, because a single VFI solve fixes $\boldsymbol{\beta}$
   and so cannot trace a parameter axis (see the optional extension).
 
 The $k$ column for rows $i$, $b'$, $c'$ at $z = 1$ and $b = -0.03$ is exactly DF26 Appendix Figure

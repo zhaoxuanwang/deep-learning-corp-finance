@@ -22,7 +22,7 @@ from src.v3.config import ModelParams
 from src.v3.estimation.collector import collect_dataset, collect_dataset_batch
 from src.v3.estimation.estimate import estimate
 from src.v3.estimation.surrogate import SurrogateEnsemble
-from src.v3.estimation.weighting import weighting_matrix
+from src.v3.estimation.weighting import moment_se, weighting_matrix
 from src.v3.simulation.moments import compute_moments
 from src.v3.simulation.panel import simulate_panel
 from src.v3.solver import refine as _refine
@@ -30,11 +30,15 @@ from src.v3.validation import vfi as _vfi
 
 
 def r2(true, fitted):
-    """Per-column R^2 of fitted against true on the 45-degree line."""
+    """Per-column R^2: the standard linear-regression coefficient of determination, i.e. the
+    squared Pearson correlation between true and fitted, in [0, 1]. (Bias and scale are read
+    off the fixed-range 45-degree plots and the reported bias/RMSE, not from R^2.)"""
     true, fitted = np.asarray(true), np.asarray(fitted)
-    ss_res = np.sum((fitted - true) ** 2, axis=0)
-    ss_tot = np.sum((true - true.mean(axis=0)) ** 2, axis=0)
-    return 1.0 - ss_res / (ss_tot + 1e-12)
+    tc = true - true.mean(axis=0)
+    fc = fitted - fitted.mean(axis=0)
+    cov = np.sum(tc * fc, axis=0)
+    den = np.sqrt(np.sum(tc ** 2, axis=0) * np.sum(fc ** 2, axis=0))
+    return (cov / (den + 1e-12)) ** 2
 
 
 def run_recovery(bundle, bounds, ext, grid_cfg, master_seed, n_draws, *,
@@ -62,6 +66,7 @@ def run_recovery(bundle, bounds, ext, grid_cfg, master_seed, n_draws, *,
     surr.train(beta_ds, m_ds, bounds, master_seed, passes=surrogate_passes)
 
     true_beta, est_beta, true_m, fit_m = [], [], [], []
+    est_beta_folds, fit_m_se = [], []   # per-draw across-fold estimates + fitted-moment SEs (CIs)
     draw = 0
     while len(true_beta) < n_draws and draw < n_draws + max_redraws:
         u = seeding.uniform([8], master_seed, seeding.Purpose.COLLECT, 9, draw, dtype=dtype)
@@ -81,7 +86,8 @@ def run_recovery(bundle, bounds, ext, grid_cfg, master_seed, n_draws, *,
             continue  # degenerate panel (no good observations); discard
 
         W, _ = weighting_matrix(panel)
-        beta_hat = estimate(surr, m_star, W, bounds, master_seed, n_restarts=n_restarts)["beta_hat"]
+        est = estimate(surr, m_star, W, bounds, master_seed, n_restarts=n_restarts)
+        beta_hat = est["beta_hat"]
 
         fit_params = ModelParams.from_array(beta_hat.numpy())
         refined = _refine.refine(bundle, fit_params, ext, grid_cfg, bounds, n_rounds=refine_rounds)
@@ -95,12 +101,19 @@ def run_recovery(bundle, bounds, ext, grid_cfg, master_seed, n_draws, *,
         est_beta.append(beta_hat.numpy())
         true_m.append(m_star.numpy())
         fit_m.append(m_fit.numpy())
+        est_beta_folds.append(est["fold_betas"].numpy())   # [F, 8] estimator dispersion
+        fit_m_se.append(moment_se(panel_fit).numpy())       # [11] fitted-moment clustered SE
         if verbose:
             print(f"  recovery draw {len(true_beta)}/{n_draws} (attempt {draw})")
 
     out = {k: np.array(v) for k, v in
-           dict(true_beta=true_beta, est_beta=est_beta, true_m=true_m, fit_m=fit_m).items()}
+           dict(true_beta=true_beta, est_beta=est_beta, true_m=true_m, fit_m=fit_m,
+                est_beta_folds=est_beta_folds, fit_m_se=fit_m_se).items()}
     out["moment_r2"] = r2(out["true_m"], out["fit_m"])
     out["param_r2"] = r2(out["true_beta"], out["est_beta"])
     out["surrogate_oos_r2"] = surr.oos_r2().numpy()   # on the trained-on (capped) rows
+    # Expensive intermediates, exposed so they can be checkpointed (avoid re-collecting).
+    out["surrogate"] = surr
+    out["dataset_beta"] = beta_ds.numpy()
+    out["dataset_moments"] = m_ds.numpy()
     return out

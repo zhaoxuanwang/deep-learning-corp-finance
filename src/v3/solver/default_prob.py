@@ -56,19 +56,21 @@ def taylor_coeffs(target_net, logz, kprime, bpp, param_norm, rho, sigma, normali
     """Return ``(V0, a, c)`` for the Taylor expansion of V'(eps) at eps = 0.
 
     ``normalize_next(logz_p, kprime, bpp)`` maps the next-period raw state to the
-    network's normalized input. Uses nested gradient tapes (Sec 11).
+    network's normalized input. Uses nested FORWARD-mode accumulators (Sec 11): eps is
+    per-sample, so the all-ones tangent yields the per-sample directional derivatives
+    dV'/deps and d2V'/deps2 (off-diagonal cross terms are zero). Forward mode avoids the
+    reverse-over-reverse gradient accumulation that nested ``GradientTape``s build; under
+    the outer training tape that reverse-over-reverse can hit an empty-gradient ``AddN``
+    shape mismatch on degenerate batches, whereas reverse-over-forward here is robust.
     """
     eps = tf.zeros_like(logz)
-    with tf.GradientTape() as tape2:
-        tape2.watch(eps)
-        with tf.GradientTape() as tape1:
-            tape1.watch(eps)
+    tangent = tf.ones_like(eps)
+    with tf.autodiff.ForwardAccumulator(eps, tangent) as acc2:
+        with tf.autodiff.ForwardAccumulator(eps, tangent) as acc1:
             logz_p = rho * logz + sigma * eps
-            state_norm = normalize_next(logz_p, kprime, bpp)
-            vprime = target_net(state_norm, param_norm)          # V'(eps)  [N]
-        # gradient() of a vector target sums over its elements; per-sample
-        # independence makes the cross-derivatives zero, so this is the
-        # per-sample dV'/deps. (Reductions must stay inside the recording tape.)
-        a = tape1.gradient(vprime, eps)                          # dV'/deps  [N]
-    c = tape2.gradient(a, eps)                                   # d2V'/deps2 [N]
+            vprime = target_net(normalize_next(logz_p, kprime, bpp), param_norm)  # V'(eps) [N]
+        a = acc1.jvp(vprime)                                     # dV'/deps  [N]
+    a = tf.zeros_like(eps) if a is None else a
+    c = acc2.jvp(a)                                              # d2V'/deps2 [N]
+    c = tf.zeros_like(eps) if c is None else c
     return vprime, a, c
