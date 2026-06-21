@@ -28,6 +28,7 @@ __pycache__/
 *.csv
 *.csv.gz
 *.png
+*.svg
 outputs/
 
 # --- Model Checkpoints ---
