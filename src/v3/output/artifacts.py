@@ -186,6 +186,7 @@ def save_recovery(out, bundle=None, *, experiment="df26_recovery",
         (ctx["run_dir"] / "summary.md").write_text(_recovery_markdown(out, gates))
 
     mg, pg = gates
+    pr, mr = np.asarray(out["param_r2"]), np.asarray(out["moment_r2"])
     save_manifest(ctx, profile=out.get("profile"), device=out.get("device"),
                   draws=int(out["true_beta"].shape[0]),
                   moment_r2_mean=float(np.mean(mr)),

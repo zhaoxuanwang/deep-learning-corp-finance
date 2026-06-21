@@ -46,7 +46,11 @@ def r2(true, fitted):
 def run_recovery(bundle, bounds, ext, grid_cfg, master_seed, n_draws, *,
                  collect_rows=200, collect_batch_size=16, surrogate_passes=200,
                  surrogate_hidden=32, n_firms=2000, T=120, burn_in=60,
-                 refine_rounds=6, n_restarts=30, max_redraws=200, verbose=False):
+                 refine_rounds=6, n_restarts=30, max_redraws=200,
+                 dataset=None, on_dataset_ready=None, verbose=False):
+    # ``dataset`` (beta_ds, m_ds), if given, replaces the collection (resume path). After the
+    # dataset is ready, ``on_dataset_ready(beta_ds, m_ds)`` is called once (crash-insurance
+    # checkpoint), before the surrogate is trained and the per-draw loop runs.
     dtype = TF_FLOAT_NUM
     lo = tf.constant(bounds.lower_array(), dtype)
     hi = tf.constant(bounds.upper_array(), dtype)
@@ -55,17 +59,22 @@ def run_recovery(bundle, bounds, ext, grid_cfg, master_seed, n_draws, *,
     # bottleneck (per-draw refine + simulate); the batched (GPU-default) collector
     # processes ``collect_batch_size`` draws at once. ``collect_batch_size=1`` is the
     # serial path. (Device chosen by precision.configure_devices: GPU on CUDA, CPU on Metal.)
-    collect_seed = int(seeding.key(master_seed, seeding.Purpose.COLLECT, 7)[0])
-    collect_kw = dict(refine_rounds=refine_rounds, n_firms=n_firms, T=T, burn_in=burn_in)
     _t = time.perf_counter()
-    if collect_batch_size > 1:
-        beta_ds, m_ds = collect_dataset_batch(bundle, bounds, ext, grid_cfg, collect_seed,
-                                              collect_rows, batch_size=collect_batch_size,
-                                              **collect_kw)
+    if dataset is not None:
+        beta_ds, m_ds = dataset                       # resumed: collection reloaded from checkpoint
     else:
-        beta_ds, m_ds = collect_dataset(bundle, bounds, ext, grid_cfg, collect_seed,
-                                        collect_rows, **collect_kw)
+        collect_seed = int(seeding.key(master_seed, seeding.Purpose.COLLECT, 7)[0])
+        collect_kw = dict(refine_rounds=refine_rounds, n_firms=n_firms, T=T, burn_in=burn_in)
+        if collect_batch_size > 1:
+            beta_ds, m_ds = collect_dataset_batch(bundle, bounds, ext, grid_cfg, collect_seed,
+                                                  collect_rows, batch_size=collect_batch_size,
+                                                  **collect_kw)
+        else:
+            beta_ds, m_ds = collect_dataset(bundle, bounds, ext, grid_cfg, collect_seed,
+                                            collect_rows, **collect_kw)
     t_collect = time.perf_counter() - _t
+    if on_dataset_ready is not None:                  # crash-insurance checkpoint, before the loop
+        on_dataset_ready(beta_ds, m_ds)
     _t = time.perf_counter()
     surr = SurrogateEnsemble(master_seed, hidden=surrogate_hidden)
     surr.train(beta_ds, m_ds, bounds, master_seed, passes=surrogate_passes)
