@@ -1,7 +1,8 @@
-# DF26 — "AI for Structural Estimation": Implementation Specification
+# Implementation Plan
 
-Version: 2026-06-19
-Duarte and Fonseca (2026), NBER Working Paper 35283.
+Version: 2026-06-23
+
+DF26: Duarte and Fonseca (2026), NBER Working Paper 35283.
 
 ## 0. Purpose, scope, and conventions
 
@@ -16,8 +17,7 @@ recorded in Appendix A (Resolved design decisions).
 written in **TensorFlow (TF) and TensorFlow Probability (TFP)**. NumPy is allowed only where it
 is the clearly better tool for a one-time setup computation (for example, fixed quadrature
 nodes), and even then the result must be converted to a `tf.constant` and consumed natively in
-TF. Implementation notes on the JAX-to-TF mapping are in Section 11. No code appears in this
-document; code is produced by a separate agent.
+TF. Implementation notes on the JAX-to-TF mapping are in Section 11. Code appears in this document must be strictly aligned with the actual codebase.
 
 **Notation.** $\boldsymbol{\beta}$ is the **estimated parameter vector**. The firm's discount
 factor is the fixed constant $1/(1+r_f)$ and is written out explicitly wherever it appears;

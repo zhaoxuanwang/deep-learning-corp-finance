@@ -1,0 +1,8 @@
+eps     = tf.zeros_like(logz)   # evaluate at eps = 0, one shock per sampled state
+tangent = tf.ones_like(eps)
+with tf.autodiff.ForwardAccumulator(eps, tangent) as acc2:
+    with tf.autodiff.ForwardAccumulator(eps, tangent) as acc1:
+        logz_p = rho * logz + sigma * eps
+        vprime = target_net(normalize_next(logz_p, kprime, bpp), param_norm)
+    a = acc1.jvp(vprime)   # dV'/deps
+c = acc2.jvp(a)            # d2V'/deps2

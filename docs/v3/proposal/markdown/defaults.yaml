@@ -1,0 +1,26 @@
+# Pinned Pandoc flags. The Makefile invokes `pandoc -d defaults.yaml`.
+# Output and all intermediates go to build/ so the source tree stays clean.
+from: markdown
+to: pdf
+pdf-engine: xelatex
+standalone: true
+
+number-sections: true
+toc: true
+toc-depth: 1
+
+# figures/ lives one level up (shared with the standalone-tex build), so
+# `figures/foo.png` in a chapter resolves via the parent directory
+resource-path: ['.', '..']
+
+metadata-files: ['metadata.yaml']
+include-in-header: ['tex/preamble.tex']
+include-after-body: ['tex/appendix-divider.tex']
+
+# pandoc-crossref must run before citeproc (when citeproc is enabled below)
+filters: ['pandoc-crossref']
+
+# ---- citations (off until cite keys are added) -----------------------
+# Uncomment both lines when you start using [@bibkey] references:
+# citeproc: true
+# bibliography: references.bib

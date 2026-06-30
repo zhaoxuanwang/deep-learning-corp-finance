@@ -22,7 +22,7 @@ from src.v3.common.precision import configure_devices, silence_logging
 from src.v3.config import ExternalParams, NetworkConfig, ParamBounds
 from src.v3.networks.bundle import NetworkBundle
 from src.v3.profiles import get_profile
-from src.v3.solver import trainer
+from src.v3.solver import channel_diag, trainer
 from src.v3.validation.recovery import run_recovery
 
 
@@ -147,12 +147,17 @@ def train_and_recover(profile="MEDIUM", master_seed=20260619, device="auto", *,
     resume_dir = _resume_dir(results_root, prof, master_seed) if (save and resume) else None
     dataset = _try_load_resume(resume_dir, bundle, prof, master_seed, verbose)
 
+    block1_history = []
     if dataset is not None:
         t_train = 0.0
     else:
         _t = time.perf_counter()
-        trainer.train_block1(bundle, bounds, ext, prof.grid, prof.train,
-                             master_seed=master_seed, n_epochs=prof.train_epochs, compile_step=True)
+        # eval_fn logs the equilibrium-channel monitor (gate fraction, leverage, default
+        # risk) into the per-epoch history so a muted-channel run is visible after training.
+        block1_history = trainer.train_block1(
+            bundle, bounds, ext, prof.grid, prof.train,
+            master_seed=master_seed, n_epochs=prof.train_epochs, compile_step=True,
+            eval_fn=channel_diag.make_eval_fn(bounds, ext, prof.grid, master_seed))
         t_train = time.perf_counter() - _t
 
     # On a fresh run, checkpoint bundle + dataset once collection is done, before the draw loop.
@@ -168,6 +173,7 @@ def train_and_recover(profile="MEDIUM", master_seed=20260619, device="auto", *,
         n_restarts=prof.n_restarts, dataset=dataset, on_dataset_ready=on_ready, verbose=verbose)
     out["profile"], out["device"] = prof.name, mode
     out["bundle"], out["grid"] = bundle, prof.grid   # for in-session Block-1 diagnostics (slices, etc.)
+    out["block1_history"] = block1_history            # per-epoch losses + equilibrium-channel monitor
     out["timings"]["train_s"] = t_train               # per-phase wall times (s), to calibrate scale
     if verbose:
         ti = out["timings"]
@@ -175,8 +181,13 @@ def train_and_recover(profile="MEDIUM", master_seed=20260619, device="auto", *,
               f"surrogate={ti['surrogate_s']:.0f} recovery_loop={ti['recovery_loop_s']:.0f} "
               f"| total={sum(ti.values()):.0f} ({sum(ti.values())/3600:.2f} h)")
     if save:
-        from src.v3.output.artifacts import save_recovery
+        from pathlib import Path
+
+        from src.v3.output.artifacts import save_recovery, save_summary
         out["run_dir"] = str(save_recovery(out, bundle, results_root=results_root, run_tag=run_tag))
+        # Persist the Block-1 monitor so it can be read off after training (no-op if resumed).
+        save_summary({"run_dir": Path(out["run_dir"]), "save": True},
+                     block1_history, "block1_history.csv")
         if verbose:
             print(f"[v3] artifacts saved to {out['run_dir']}")
         if resume_dir is not None:   # finished cleanly -> drop the insurance checkpoint

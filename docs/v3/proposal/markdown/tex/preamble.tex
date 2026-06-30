@@ -1,0 +1,45 @@
+% =====================================================================
+%  Formatting preamble for the Pandoc -> xelatex build.
+%  Consumed via --include-in-header (see defaults.yaml); injected after
+%  Pandoc's own template setup, so it loads on top of it.
+%
+%  Font stack adapted for xelatex. The original pdflatex stack
+%  (libertinus + libertinust1math + the inconsolata package) is replaced by
+%  libertinus-otf (Libertinus Serif text + Libertinus Math via unicode-math)
+%  plus a fontspec monospace, because libertinust1math is incompatible with
+%  xelatex (it breaks \boldsymbol). Document geometry, colored links, the
+%  document class, and section numbering live in metadata.yaml.
+% =====================================================================
+
+% ---- fonts (xelatex) -------------------------------------------------
+\usepackage{libertinus-otf}                              % Libertinus Serif + Libertinus Math
+\setmonofont{Inconsolatazi4-Regular.otf}[Scale=0.96]     % Inconsolata monospace
+\providecommand{\bm}[1]{\boldsymbol{#1}}                 % map \bm to unicode-math \boldsymbol
+
+% ---- pandoc-crossref multi-image figures -----------------------------
+% A `::: {#fig:x}` div holding several images emits a pandoccrossrefsubfigures
+% environment that crossref (0.3.x) expects the document to define. We use no
+% sub-captions, so a plain centered figure float is the correct wrapper.
+\newenvironment{pandoccrossrefsubfigures}{\begin{figure}\centering}{\end{figure}}
+
+% ---- tables ----------------------------------------------------------
+\usepackage{etoolbox}
+\AtBeginEnvironment{longtable}{\small}   % render the converted longtables a touch smaller
+\usepackage{calc}                        % column-width arithmetic used by converted tables
+\usepackage{xurl}                        % allow long URLs to break across lines
+
+% ---- helper macros emitted by Pandoc fragments (providecommand: no clash) ----
+\providecommand{\tightlist}{\setlength{\itemsep}{0pt}\setlength{\parskip}{0pt}}
+\providecommand{\real}[1]{#1}
+\providecommand{\passthrough}[1]{#1}
+
+% ---- framed placeholder for figures to be supplied later (used in Appendix C) ----
+\newcommand{\imgplaceholder}[1]{%
+  \par\medskip
+  \begin{center}%
+  \fbox{\parbox[c][3cm][c]{0.82\linewidth}{\centering\itshape
+  Figure placeholder: image \texttt{#1} to be supplied.}}%
+  \end{center}%
+  \par\medskip}
+
+\emergencystretch=2em   % last-resort stretch to curb overfull prose lines

@@ -1,0 +1,19 @@
+# Build output and any stray TeX intermediates
+build/
+*.aux
+*.log
+*.out
+*.toc
+*.fls
+*.fdb_latexmk
+*.synctex.gz
+.DS_Store
+
+# The repo-root .gitignore ignores *.tex. These are essential build inputs
+# (not output), so re-include them. The archived originals under _legacy/
+# stay ignored, matching their original (untracked) state.
+!tex/preamble.tex
+!tex/appendix-divider.tex
+
+# Likewise *.bib is ignored at the repo root; the bibliography is a source file.
+!references.bib

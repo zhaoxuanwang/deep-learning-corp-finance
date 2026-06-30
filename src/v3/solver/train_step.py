@@ -14,7 +14,15 @@ from src.v3.solver import bellman
 
 def make_step_fn(bundle, ext, grid_cfg, x_nodes, w_nodes, tau, value_opt, policy_opt,
                  compile_step: bool = True):
-    """Build the per-step training function (optionally graph-compiled)."""
+    """Build the per-step training function (optionally graph-compiled).
+
+    ``compile_step=True`` is required for Step 3, not just an optimization. The policy
+    gradient flows through the bond price q into the Taylor default probability, whose
+    coefficients come from forward-mode accumulators (``default_prob.taylor_coeffs``).
+    Differentiating that reverse-over-forward stack works under ``tf.function`` but raises
+    ``InternalError: ... returned too few gradients`` in eager mode, so ``compile_step=False``
+    breaks the policy step (it is useful only for inspecting Step 2 in isolation). The
+    pricing channel itself is guarded by ``tests/test_channel_diag.py``."""
 
     def step(batch):
         # Step 2: policy evaluation (value updated, policy fixed).

@@ -1,0 +1,33 @@
+---
+# Document metadata + pandoc-crossref settings.
+# Build flags live in defaults.yaml; the LaTeX formatting preamble in tex/preamble.tex.
+title: "Structural Estimation in Corporate Finance: Project Plan"
+author: "Zhaoxuan Wang"
+date: "Version: June 21, 2026"
+
+documentclass: report
+classoption:
+  - 11pt
+geometry:
+  - margin=1in
+
+# colored links (replaces the hyperref options from the original preamble)
+colorlinks: true
+linkcolor: blue
+urlcolor: blue
+citecolor: blue
+
+# section numbering depth (report default; matches the original \setcounter)
+secnumdepth: 2
+
+# ---- pandoc-crossref -------------------------------------------------
+# Empty prefixes: a reference renders as just the (nonbreaking-space) number,
+# so the literal "Section"/"Figure"/"Table" word kept in prose is not doubled.
+# This reproduces the original \ref behaviour for singles, pairs, and ranges.
+linkReferences: true
+nameInLink: true
+secPrefix: [""]
+figPrefix: [""]
+tblPrefix: [""]
+eqnPrefix: [""]
+---
